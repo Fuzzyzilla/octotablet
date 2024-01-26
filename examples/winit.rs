@@ -50,6 +50,6 @@ fn main() {
                 _ => (),
             }
         });
-        manager.pump().unwrap();
+        manager.pump().unwrap().for_each(|e| println!("{e:?}"));
     }
 }

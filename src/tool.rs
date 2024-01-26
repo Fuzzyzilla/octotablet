@@ -4,7 +4,11 @@
 //! "Tools" do not correspond with directly with the above concepts, for example a
 //! single stylus with a tip and eraser represents *two* tools, one for each end. These can be re-associated with
 //! each other through [`Tool::id`].
+//!
 //! See [`Type`] for more ideas of what a "tool" may represent.
+//!
+//! Tools can report zero or more [Axes](Axis) - numerical values describing the characteristics of the user's interaction -
+//! which can be used to add greater expression to interactions.
 
 use std::fmt::Debug;
 
@@ -50,7 +54,7 @@ pub enum Axis {
     Distance,
     /// The tool can sense roll angle around it's own axis.
     Roll,
-    /// The tool has an infinite scrollwheel. Additionally, the wheel may have the ability to sense clicks.
+    /// The tool has a scrollwheel. It may report continuous motion as well as discrete steps.
     Wheel,
     /// The tool has a linear slider control, ranging from 0 ("natural" position) to 1.
     Slider,
@@ -111,7 +115,7 @@ pub struct Tool {
     pub(crate) obj_id: ObjectId,
     /// An identifier that is baked into the hardware of the tool.
     /// Likely to remain stable over executions, and will also connect related
-    /// tools together - for example, a pen and it's eraser share the same id.
+    /// tools together - for example, a pen and its eraser will share the same id.
     ///
     /// `None` is unknown and does not imply relationships with other tools of id `None`.
     pub id: Option<u64>,

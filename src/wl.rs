@@ -6,14 +6,15 @@ use wayland_client::{
 use wayland_protocols::wp::tablet::zv2::client as wl_tablet;
 
 use crate::{
-    tablet::Tablet,
+    pad::Pad,
+    tablet::{Tablet, UsbId},
     tool::{AvailableAxes, Tool},
 };
 pub trait HasWlId {
     fn new_default(id: ObjectId) -> Self;
     fn id(&self) -> &ObjectId;
     /// Sent when constructors are done. Use this to
-    /// make everything internally consistend.
+    /// make everything internally consistent.
     fn done(&mut self) {}
 }
 impl HasWlId for Tool {
@@ -37,6 +38,21 @@ impl HasWlId for Tablet {
         Tablet {
             obj_id: id,
             name: String::new(),
+            usb_id: None,
+        }
+    }
+    fn id(&self) -> &ObjectId {
+        &self.obj_id
+    }
+}
+impl HasWlId for Pad {
+    fn new_default(id: ObjectId) -> Self {
+        Pad {
+            obj_id: id,
+            // 0 is the default and what the protocol specifies should be used if
+            // the constructor for this value is never sent.
+            button_count: 0,
+            feedback: None,
         }
     }
     fn id(&self) -> &ObjectId {
@@ -103,6 +119,10 @@ pub(crate) struct WlTablets {
 pub(crate) struct WlTools {
     pub(crate) collection: WlCollection<Tool>,
 }
+#[derive(Default)]
+pub(crate) struct WlPads {
+    pub(crate) collection: WlCollection<Pad>,
+}
 
 #[derive(Default)]
 pub struct TabletState {
@@ -111,19 +131,18 @@ pub struct TabletState {
     pub tablet_seat: Option<wl_tablet::zwp_tablet_seat_v2::ZwpTabletSeatV2>,
     pub(crate) tablets: WlTablets,
     pub(crate) tools: WlTools,
+    pub(crate) pads: WlPads,
     // We use linear scans to store multiple tablets.
     // This simplifies the API at little cost, as we don't expect more than a handful at any given time.
     pub pending_events: Vec<()>,
 }
 impl TabletState {
     fn try_acquire_tablet_seat(&mut self, qh: &QueueHandle<Self>) {
-        if self.tablet_seat.is_none() {
-            if let Some((seat, tablet)) = self.seat.as_ref().zip(self.manager.as_ref()) {
-                println!("Tablet server connected!");
-                self.tablet_seat = Some(tablet.get_tablet_seat(seat, qh, ()));
-            } else {
-                println!("No seat to connect tablet server to.");
-            }
+        if self.tablet_seat.is_some() {
+            return;
+        }
+        if let Some((seat, tablet)) = self.seat.as_ref().zip(self.manager.as_ref()) {
+            self.tablet_seat = Some(tablet.get_tablet_seat(seat, qh, ()));
         }
     }
 }
@@ -235,7 +254,13 @@ impl Dispatch<wl_tablet::zwp_tablet_v2::ZwpTabletV2, ()> for TabletState {
         match event {
             // ======= Constructor databurst =========
             Event::Done => this.tablets.collection.done(&tablet.id()),
-            Event::Id { .. } => (),
+            Event::Id { vid, pid } => {
+                this.tablets
+                    .collection
+                    .get_or_insert_ctor(tablet.id())
+                    .unwrap()
+                    .usb_id = Some(UsbId { vid, pid });
+            }
             Event::Name { name } => {
                 this.tablets
                     .collection
@@ -252,17 +277,36 @@ impl Dispatch<wl_tablet::zwp_tablet_v2::ZwpTabletV2, ()> for TabletState {
 }
 impl Dispatch<wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for TabletState {
     fn event(
-        _: &mut Self,
-        _pad: &wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2,
+        this: &mut Self,
+        pad: &wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2,
         event: wl_tablet::zwp_tablet_pad_v2::Event,
         (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // When receiving events from the wl_registry, we are only interested in the
-        // `global` event, which signals a new available global.
-        // When receiving this event, we just print its characteristics in this example.
-        println!("pad {event:?}");
+        use wl_tablet::zwp_tablet_pad_v2::Event;
+        #[allow(clippy::match_same_arms)]
+        match event {
+            // ======= Constructor databurst =========
+            Event::Group { .. } => (),
+            Event::Path { .. } => (),
+            Event::Buttons { buttons } => {
+                let ctor = this.pads.collection.get_or_insert_ctor(pad.id()).unwrap();
+                ctor.button_count = buttons;
+            }
+            Event::Done => {
+                this.pads.collection.done(&pad.id());
+            }
+            Event::Removed => {
+                this.pads.collection.destroy(&pad.id());
+            }
+            // ======== Interaction data =========
+            Event::Button { .. } => (),
+            Event::Enter { .. } => (),
+            Event::Leave { .. } => (),
+            // ne
+            _ => (),
+        }
     }
     wayland_client::event_created_child!(
         TabletState,
@@ -339,6 +383,23 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
             }
             Event::Removed => this.tools.collection.destroy(&tool.id()),
             // ======== Interaction data =========
+            Event::ProximityIn { tablet, .. } => {
+                println!("In tablet{} tool{}", tablet.id(), tool.id());
+            }
+            Event::Down { .. } => {
+                println!("Down");
+            }
+            Event::Motion { .. } => {
+                println!("Motion");
+            }
+            Event::ProximityOut { .. } => {
+                println!("Out");
+            }
+
+            Event::Frame { .. } => {
+                println!("f");
+            }
+
             // ne
             _ => (),
         }

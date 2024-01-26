@@ -55,28 +55,47 @@ impl eframe::App for Viewer {
                     return;
                 }
             };
-            manager.pump().unwrap();
+            manager.pump().unwrap().for_each(|e| println!("{e:?}"));
 
-            ui.label(RichText::new("Hardware").heading());
+            ui.label(RichText::new("wl-tablet viewer ~ Connected :3").heading());
             ui.separator();
 
             ui.label("Tablets");
-            for tablet in manager.tablets() {
-                egui::CollapsingHeader::new(&tablet.name).show(ui, |_| ());
+            for (idx, tablet) in manager.tablets().iter().enumerate() {
+                egui::CollapsingHeader::new(&tablet.name)
+                    .id_source((&tablet.name, idx))
+                    .show(ui, |ui| ui.label(format!("USB - {:04X?}", tablet.usb_id)));
             }
+            if manager.tablets().is_empty() {
+                ui.label(RichText::new("No tablets...").weak());
+            }
+
             ui.separator();
+
+            ui.label("Pads");
+            for (idx, pad) in manager.pads().iter().enumerate() {
+                ui.collapsing(idx.to_string(), |ui| {
+                    ui.label(format!("Buttons: {}", pad.button_count));
+                });
+            }
+            if manager.pads().is_empty() {
+                ui.label(RichText::new("No pads...").weak());
+            }
+
+            ui.separator();
+
             ui.label("Tools");
             for (idx, tool) in manager.tools().iter().enumerate() {
                 let type_name = tool.tool_type.as_ref().map_or("Unknown", |ty| ty.as_ref());
                 let name = if let Some(id) = tool.id {
-                    format!("{type_name} (ID: {id:X})")
+                    format!("{type_name} (ID: {id:08X})")
                 } else {
                     format!("{type_name} (ID Unknown)")
                 };
                 egui::CollapsingHeader::new(name)
                     .id_source((tool.id, tool.wacom_id, idx))
                     .show(ui, |ui| {
-                        ui.label(format!("Wacom ID: {:?}", tool.wacom_id,));
+                        ui.label(format!("Wacom ID: {:08X?}", tool.wacom_id,));
                         for axis in tool.available_axes.iter_axes() {
                             ui.label(format!(
                                 "{} - {:?}",
@@ -92,6 +111,10 @@ impl eframe::App for Viewer {
                         }
                     });
             }
+            if manager.tools().is_empty() {
+                ui.label(RichText::new("No tools...").weak());
+            }
+
             ui.separator();
         });
     }
