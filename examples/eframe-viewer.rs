@@ -1,15 +1,23 @@
 use eframe::{
-    egui::{self, RichText},
+    egui::{self, Frame, RichText},
+    emath::Align2,
+    epaint::{Color32, FontId, Stroke, Vec2},
     CreationContext, EventLoopBuilder,
 };
 use raw_window_handle::HasRawDisplayHandle;
 use winit::platform::wayland::EventLoopBuilderExtWayland;
-use wl_tablet::{tool::Axis, Manager};
+use wl_tablet::{
+    events::summary::Summary,
+    tablet::UsbId,
+    tool::{AvailableAxes, Axis},
+    Manager,
+};
 
 fn main() {
     // Dont persist, require wayland.
     let native_options = eframe::NativeOptions {
         persist_window: false,
+        viewport: egui::ViewportBuilder::default().with_inner_size(Vec2 { x: 600.0, y: 500.0 }),
         event_loop_builder: Some(Box::new(|event_loop: &mut EventLoopBuilder<_>| {
             event_loop.with_wayland();
         })),
@@ -22,6 +30,149 @@ fn main() {
         Box::new(|context| Box::new(Viewer::new(context))),
     )
     .unwrap();
+}
+
+struct ShowPen<'a> {
+    summary: Summary<'a>,
+}
+impl egui::Widget for ShowPen<'_> {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let (resp, painter) = ui.allocate_painter(
+            ui.available_size(),
+            egui::Sense {
+                click: false,
+                drag: false,
+                focusable: false,
+            },
+        );
+        // Just play with the axes a bit to make something look nice :3
+        // All of the math fiddling and constants are just for aesthetics, little of it means anything lol
+        // Visualize as much as we can so we can tell at a glance everything is working.
+        if let wl_tablet::events::summary::ToolState::In(state) = self.summary.tool {
+            {
+                // Show the name
+                let mut cursor = resp.rect.left_top();
+                let pen_name = match (state.tool.id, state.tool.tool_type) {
+                    (None, None) => "Unknown Tool".to_owned(),
+                    (Some(id), None) => format!("{:08X}", id),
+                    (None, Some(ty)) => ty.as_ref().to_string(),
+                    (Some(id), Some(ty)) => format!("{} {:08X}", ty.as_ref(), id),
+                };
+                let rect = painter.text(
+                    cursor,
+                    Align2::LEFT_TOP,
+                    format!("Visualizing {pen_name} on {}", state.tablet.name),
+                    FontId::default(),
+                    Color32::WHITE,
+                );
+                cursor.y += rect.height();
+                // I can't visualize tools I can't test :V
+                let visualized_axes =
+                    AvailableAxes::PRESSURE | AvailableAxes::TILT | AvailableAxes::DISTANCE;
+                let seen_axes = state.tool.available_axes.intersection(visualized_axes);
+                let not_seen_axes = state.tool.available_axes.difference(visualized_axes);
+                let axes = if !not_seen_axes.is_empty() {
+                    // Pen supports axes not visualized.
+                    format!("Showing axes: {seen_axes:?}. No visualizers for {not_seen_axes:?}!")
+                } else {
+                    // We show all axes! yay!
+                    format!("Showing all axes: {seen_axes:?}")
+                };
+                // Show the capabilities
+                painter.text(
+                    cursor,
+                    Align2::LEFT_TOP,
+                    axes,
+                    FontId::default(),
+                    Color32::WHITE,
+                );
+            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+            let size = 75.0
+                * if state.down {
+                    // Touching, show a dot sized by pressure.
+                    state.pose.pressure.get().unwrap_or(0.5)
+                } else {
+                    // If not touching, show a large dot on hover
+                    // that closes in as the pen gets closer
+                    state
+                        .pose
+                        .distance
+                        .get()
+                        .map(|v| v.powf(1.5) * 0.5)
+                        .unwrap_or(0.5)
+                };
+            // Fade out with distance.
+            let opacity = 1.0
+                - state
+                    .pose
+                    .distance
+                    .get()
+                    .map(|v| v.powf(1.5))
+                    .unwrap_or(0.0);
+
+            // White if pressed, red if hovered.
+            let color = if state.down {
+                Color32::WHITE
+            } else {
+                Color32::LIGHT_RED
+            };
+
+            // Show an arrow in the direction of tilt.
+            let tip_pos = egui::Pos2 {
+                x: state.pose.position[0],
+                y: state.pose.position[1],
+            };
+            if let Some([tiltx, tilty]) = state.pose.tilt {
+                // These ops actually DO have mathematical meaning unlike the other
+                // mad aesthetical tinkering. These tilts describe a 3D vector from tip to back of pen,
+                // project this vector down onto the page for visualization.
+                let tilt_vec = egui::Vec2 {
+                    x: tiltx.sin(),
+                    y: tilty.sin(),
+                };
+                painter.arrow(
+                    tip_pos,
+                    400.0 * tilt_vec,
+                    Stroke {
+                        color: Color32::WHITE
+                            .gamma_multiply(tilt_vec.length())
+                            .gamma_multiply(opacity),
+                        width: tilt_vec.length() * 5.0,
+                    },
+                )
+            }
+            painter.circle_filled(tip_pos, size, color.gamma_multiply(opacity));
+        } else {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+        }
+        resp
+    }
+}
+
+/// Uses a USB ID database to fetch info strings:
+fn format_id(id: Option<UsbId>) -> String {
+    use usb_ids::FromId;
+    if let Some(id @ UsbId { vid, pid }) = id {
+        match usb_ids::Device::from_vid_pid(vid, pid) {
+            Some(device) => {
+                format!(
+                    "\"{} - {}\" [{id:04X?}]",
+                    device.vendor().name(),
+                    device.name()
+                )
+            }
+            None => {
+                if let Some(vendor) = usb_ids::Vendor::from_id(vid) {
+                    format!("\"{}\" - Unknown device. [{id:04X?}]", vendor.name())
+                } else {
+                    format!("Unknown vendor. [{id:04X?}]",)
+                }
+            }
+        }
+    } else {
+        "No ID.".into()
+    }
 }
 
 struct Viewer {
@@ -43,79 +194,114 @@ impl eframe::App for Viewer {
         self.manager = Err(wl_tablet::ManagerError::Unsupported);
     }
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let manager = match &mut self.manager {
-                Ok(t) => t,
-                Err(e) => {
+        // Access tablets, or show a message and bail if failed.
+        let manager = match &mut self.manager {
+            Ok(t) => t,
+            Err(e) => {
+                egui::CentralPanel::default().show(ctx, |ui| {
                     ui.label(
-                        RichText::new(format!("Failed to acquire tablet: {e}"))
+                        RichText::new(format!("Failed to acquire connection: {e}"))
                             .monospace()
                             .heading(),
-                    );
-                    return;
-                }
-            };
-            manager.pump().unwrap().for_each(|e| println!("{e:?}"));
-
-            ui.label(RichText::new("wl-tablet viewer ~ Connected :3").heading());
-            ui.separator();
-
-            ui.label("Tablets");
-            for (idx, tablet) in manager.tablets().iter().enumerate() {
-                egui::CollapsingHeader::new(&tablet.name)
-                    .id_source((&tablet.name, idx))
-                    .show(ui, |ui| ui.label(format!("USB - {:04X?}", tablet.usb_id)));
-            }
-            if manager.tablets().is_empty() {
-                ui.label(RichText::new("No tablets...").weak());
-            }
-
-            ui.separator();
-
-            ui.label("Pads");
-            for (idx, pad) in manager.pads().iter().enumerate() {
-                ui.collapsing(idx.to_string(), |ui| {
-                    ui.label(format!("Buttons: {}", pad.button_count));
+                    )
                 });
+                return;
             }
-            if manager.pads().is_empty() {
-                ui.label(RichText::new("No pads...").weak());
-            }
+        };
+        // FIXME: only do when interacting!
+        let has_tools = !manager.tools().is_empty();
+        let events = manager.pump().unwrap();
 
-            ui.separator();
+        // Copy iter and examine, if there are any events
+        // request a redraw.
+        if events.into_iter().next().is_some() {
+            ctx.request_repaint();
+        } else {
+            // poll every second for new events.
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
 
-            ui.label("Tools");
-            for (idx, tool) in manager.tools().iter().enumerate() {
-                let type_name = tool.tool_type.as_ref().map_or("Unknown", |ty| ty.as_ref());
-                let name = if let Some(id) = tool.id {
-                    format!("{type_name} (ID: {id:08X})")
-                } else {
-                    format!("{type_name} (ID Unknown)")
-                };
-                egui::CollapsingHeader::new(name)
-                    .id_source((tool.id, tool.wacom_id, idx))
-                    .show(ui, |ui| {
-                        ui.label(format!("Wacom ID: {:08X?}", tool.wacom_id,));
-                        for axis in tool.available_axes.iter_axes() {
-                            ui.label(format!(
-                                "{} - {:?}",
-                                axis.as_ref(),
-                                tool.axis(axis).unwrap()
-                            ));
-                            if axis == Axis::Distance {
-                                ui.label(format!(
-                                    "    Distance units: {:?}",
-                                    tool.distance_unit().unwrap()
-                                ));
-                            }
-                        }
-                    });
-            }
-            if manager.tools().is_empty() {
-                ui.label(RichText::new("No tools...").weak());
-            }
+        // Show an area to test various axes
+        egui::TopBottomPanel::bottom("viewer")
+            .exact_height(ctx.available_rect().height() / 2.0)
+            .frame(Frame::canvas(&ctx.style()))
+            .show_animated(ctx, has_tools, |ui| {
+                ui.add(ShowPen {
+                    summary: events.summarize(),
+                })
+            });
 
-            ui.separator();
+        // Show an info panel listing connected devices and their capabilities
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    ui.label(RichText::new("wl-tablet viewer ~ Connected :3").heading());
+                    ui.separator();
+
+                    ui.label("Tablets");
+                    for (idx, tablet) in manager.tablets().iter().enumerate() {
+                        egui::CollapsingHeader::new(&tablet.name)
+                            .id_source((&tablet.name, idx))
+                            .show(ui, |ui| {
+                                // Pretty-print the USBID
+                                ui.label(RichText::new(format_id(tablet.usb_id)).monospace())
+                            });
+                    }
+                    if manager.tablets().is_empty() {
+                        ui.label(RichText::new("No tablets...").weak());
+                    }
+
+                    ui.separator();
+
+                    ui.label("Pads");
+                    for (idx, pad) in manager.pads().iter().enumerate() {
+                        ui.collapsing(idx.to_string(), |ui| {
+                            ui.label(format!("Buttons: {}", pad.button_count));
+                        });
+                    }
+                    if manager.pads().is_empty() {
+                        ui.label(RichText::new("No pads...").weak());
+                    }
+
+                    ui.separator();
+
+                    ui.label("Tools");
+                    for (idx, tool) in manager.tools().iter().enumerate() {
+                        let type_name = tool
+                            .tool_type
+                            .as_ref()
+                            .map_or("Unknown tool", |ty| ty.as_ref());
+                        let name = if let Some(id) = tool.id {
+                            format!("{type_name} (ID: {id:08X})")
+                        } else {
+                            format!("{type_name} (ID Unknown)")
+                        };
+                        egui::CollapsingHeader::new(name)
+                            .id_source((tool.id, tool.wacom_id, idx))
+                            .show(ui, |ui| {
+                                ui.label(format!("Wacom ID: {:08X?}", tool.wacom_id,));
+                                for axis in tool.available_axes.iter_axes() {
+                                    ui.label(format!(
+                                        "{} - {:?}",
+                                        axis.as_ref(),
+                                        tool.axis(axis).unwrap()
+                                    ));
+                                    if axis == Axis::Distance {
+                                        ui.label(format!(
+                                            "    Distance units: {:?}",
+                                            tool.distance_unit().unwrap()
+                                        ));
+                                    }
+                                }
+                            });
+                    }
+                    if manager.tools().is_empty() {
+                        ui.label(RichText::new("No tools...").weak());
+                    }
+
+                    ui.separator();
+                });
         });
     }
 }

@@ -9,13 +9,18 @@
 //!
 //! Tools can report zero or more [Axes](Axis) - numerical values describing the characteristics of the user's interaction -
 //! which can be used to add greater expression to interactions.
+//!
+//! In some hardware, and most user configurations a tool is deeply associated with a specific tablet. However,
+//! this assumption is not made here, as several hardware vendors allow tools to be used across several connected
+//! tablets at once. For current tablet association, listen for the [`In` event](crate::events::ToolEvent::In), being
+//! aware that it may change over time.
 
 use std::fmt::Debug;
 
 use wayland_backend::client::ObjectId;
 
 bitflags::bitflags! {
-    /// See [`Axis`] for descriptions.
+    /// Bitflags describing all supported Axes. See [`Axis`] for descriptions.
     #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
     pub struct AvailableAxes: u16 {
         const PRESSURE = 1;
@@ -47,16 +52,19 @@ impl AvailableAxes {
 #[derive(Clone, Copy, Debug, strum::EnumCount, PartialEq, Eq, strum::AsRefStr)]
 pub enum Axis {
     /// The tool can sense how much force is applied, purpendicular to the pad surface.
+    ///
+    /// This does not correspond with any physical units of force and is often configurable via
+    /// the tablet driver to have a non-linear response curve.
     Pressure,
-    /// The tool can sense the left-right and forward-back angle from perpendicular.
+    /// The tool can sense the absolute left-right and forward-back tilt angles from perpendicular.
     Tilt,
     /// The tool can sense a distance from the pad. See [`Tool::distance_unit`] for the interpretation of this axis.
     Distance,
-    /// The tool can sense roll angle around it's own axis.
+    /// The tool can sense absolute roll angle around its own axis.
     Roll,
-    /// The tool has a scrollwheel. It may report continuous motion as well as discrete steps.
+    /// The tool has a scroll wheel. It may report continuous motion as well as discrete steps.
     Wheel,
-    /// The tool has a linear slider control, ranging from 0 ("natural" position) to 1.
+    /// The tool has an absolute linear slider control, ranging from -1 to 1 with zero being the "natural" position.
     Slider,
 }
 impl From<Axis> for AvailableAxes {
@@ -78,6 +86,7 @@ pub enum Type {
     Pencil,
     Brush,
     /// A nib found on the reverse of some styli primarily entended to erase.
+    /// To associate an eraser with its counterpart, if any, see [`Tool::id`].
     Eraser,
     /// A tool designed to work above the surface of the pad, making extensive
     /// use of the `Distance` and `Tilt` axes.
@@ -109,13 +118,14 @@ pub struct AxisInfo {
 }
 
 /// Description of the capabilities of a tool.
-#[derive(Debug)]
 pub struct Tool {
     /// Wayland internal ID.
     pub(crate) obj_id: ObjectId,
     /// An identifier that is baked into the hardware of the tool.
-    /// Likely to remain stable over executions, and will also connect related
-    /// tools together - for example, a pen and its eraser will share the same id.
+    /// Likely to remain stable over executions, and unique across even devices of the same model.
+    /// It is usable to save per-tool configurations to disk, for example.
+    ///
+    /// Connects related tools together - for example, a pen and its eraser will share the same id.
     ///
     /// `None` is unknown and does not imply relationships with other tools of id `None`.
     pub id: Option<u64>,
@@ -124,9 +134,33 @@ pub struct Tool {
     pub wacom_id: Option<u64>,
     /// Type of the tool, if known.
     pub tool_type: Option<Type>,
+    /// The axes this tool is advertised by the system to report. In practice, this be different
+    /// than the actual reported axes.
     pub available_axes: AvailableAxes,
     pub(crate) axis_info: [AxisInfo; <Axis as strum::EnumCount>::COUNT],
     pub(crate) distance_unit: DistanceUnit,
+}
+impl Debug for Tool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut this = f.debug_struct("Tool");
+        let _ = self.obj_id;
+        this.field("id", &self.id);
+        this.field("wacom_id", &self.wacom_id);
+        this.field("tool_type", &self.tool_type);
+        this.field("available_axes", &self.available_axes);
+
+        let axes: Vec<_> = self
+            .available_axes
+            .iter_axes()
+            .map(|axis| (axis, self.axis(axis).unwrap()))
+            .collect();
+        this.field("axis_info", &axes);
+        if let Some(du) = self.distance_unit() {
+            this.field("distance_unit", &du);
+        }
+
+        this.finish()
+    }
 }
 impl Tool {
     #[must_use]

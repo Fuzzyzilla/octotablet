@@ -6,6 +6,7 @@ use wayland_client::{
 use wayland_protocols::wp::tablet::zv2::client as wl_tablet;
 
 use crate::{
+    events::{FrameTimestamp, NicheF32, Pose},
     pad::Pad,
     tablet::{Tablet, UsbId},
     tool::{AvailableAxes, Tool},
@@ -60,6 +61,15 @@ impl HasWlId for Pad {
     }
 }
 
+#[derive(Clone)]
+pub struct RawSummary {
+    pub tool_id: ObjectId,
+    pub tablet_id: ObjectId,
+    pub down: bool,
+    pub pose: Pose,
+    pub time: FrameTimestamp,
+}
+
 #[derive(thiserror::Error, Debug)]
 enum WlConstructError {
     /// Reported when a wayland event describing construction parameters is recieved after
@@ -112,26 +122,15 @@ impl<T: HasWlId> WlCollection<T> {
 }
 
 #[derive(Default)]
-pub(crate) struct WlTablets {
-    pub(crate) collection: WlCollection<Tablet>,
-}
-#[derive(Default)]
-pub(crate) struct WlTools {
-    pub(crate) collection: WlCollection<Tool>,
-}
-#[derive(Default)]
-pub(crate) struct WlPads {
-    pub(crate) collection: WlCollection<Pad>,
-}
-
-#[derive(Default)]
 pub struct TabletState {
     pub seat: Option<wl_seat::WlSeat>,
     pub manager: Option<wl_tablet::zwp_tablet_manager_v2::ZwpTabletManagerV2>,
     pub tablet_seat: Option<wl_tablet::zwp_tablet_seat_v2::ZwpTabletSeatV2>,
-    pub(crate) tablets: WlTablets,
-    pub(crate) tools: WlTools,
-    pub(crate) pads: WlPads,
+    pub tablets: WlCollection<Tablet>,
+    pub tools: WlCollection<Tool>,
+    pub pads: WlCollection<Pad>,
+    pub _groups: WlCollection<Pad>,
+    pub summary: Option<RawSummary>,
     // We use linear scans to store multiple tablets.
     // This simplifies the API at little cost, as we don't expect more than a handful at any given time.
     pub pending_events: Vec<()>,
@@ -156,10 +155,6 @@ impl Dispatch<wl_registry::WlRegistry, ()> for TabletState {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        // When receiving events from the wl_registry, we are only interested in the
-        // `global` event, which signals a new available global.
-        // When receiving this event, we just print its characteristics in this example.
-        println!("{event:?}");
         if let wl_registry::Event::Global {
             name,
             interface,
@@ -253,23 +248,19 @@ impl Dispatch<wl_tablet::zwp_tablet_v2::ZwpTabletV2, ()> for TabletState {
         #[allow(clippy::match_same_arms)]
         match event {
             // ======= Constructor databurst =========
-            Event::Done => this.tablets.collection.done(&tablet.id()),
+            Event::Done => this.tablets.done(&tablet.id()),
             Event::Id { vid, pid } => {
-                this.tablets
-                    .collection
-                    .get_or_insert_ctor(tablet.id())
-                    .unwrap()
-                    .usb_id = Some(UsbId { vid, pid });
+                // Convert to u16s (have been crammed into u32s...) and set, if any.
+                this.tablets.get_or_insert_ctor(tablet.id()).unwrap().usb_id = u16::try_from(vid)
+                    .ok()
+                    .zip(u16::try_from(pid).ok())
+                    .map(|(vid, pid)| UsbId { vid, pid });
             }
             Event::Name { name } => {
-                this.tablets
-                    .collection
-                    .get_or_insert_ctor(tablet.id())
-                    .unwrap()
-                    .name = name;
+                this.tablets.get_or_insert_ctor(tablet.id()).unwrap().name = name;
             }
             Event::Path { .. } => (),
-            Event::Removed => this.tablets.collection.destroy(&tablet.id()),
+            Event::Removed => this.tablets.destroy(&tablet.id()),
             // ne
             _ => (),
         }
@@ -291,14 +282,14 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for TabletState 
             Event::Group { .. } => (),
             Event::Path { .. } => (),
             Event::Buttons { buttons } => {
-                let ctor = this.pads.collection.get_or_insert_ctor(pad.id()).unwrap();
+                let ctor = this.pads.get_or_insert_ctor(pad.id()).unwrap();
                 ctor.button_count = buttons;
             }
             Event::Done => {
-                this.pads.collection.done(&pad.id());
+                this.pads.done(&pad.id());
             }
             Event::Removed => {
-                this.pads.collection.destroy(&pad.id());
+                this.pads.destroy(&pad.id());
             }
             // ======== Interaction data =========
             Event::Button { .. } => (),
@@ -317,6 +308,7 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for TabletState 
     );
 }
 impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletState {
+    #[allow(clippy::too_many_lines)]
     fn event(
         this: &mut Self,
         tool: &wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2,
@@ -333,7 +325,7 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
                 capability: wayland_client::WEnum::Value(capability),
             } => {
                 use wl_tablet::zwp_tablet_tool_v2::Capability;
-                let ctor = this.tools.collection.get_or_insert_ctor(tool.id()).unwrap();
+                let ctor = this.tools.get_or_insert_ctor(tool.id()).unwrap();
                 match capability {
                     Capability::Distance => ctor.available_axes.insert(AvailableAxes::DISTANCE),
                     Capability::Pressure => ctor.available_axes.insert(AvailableAxes::PRESSURE),
@@ -349,14 +341,14 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
                 hardware_id_hi,
                 hardware_id_lo,
             } => {
-                let ctor = this.tools.collection.get_or_insert_ctor(tool.id()).unwrap();
+                let ctor = this.tools.get_or_insert_ctor(tool.id()).unwrap();
                 ctor.wacom_id = Some(u64::from(hardware_id_hi) << 32 | u64::from(hardware_id_lo));
             }
             Event::HardwareSerial {
                 hardware_serial_hi,
                 hardware_serial_lo,
             } => {
-                let ctor = this.tools.collection.get_or_insert_ctor(tool.id()).unwrap();
+                let ctor = this.tools.get_or_insert_ctor(tool.id()).unwrap();
                 ctor.id = Some(u64::from(hardware_serial_hi) << 32 | u64::from(hardware_serial_lo));
             }
             Event::Type {
@@ -364,7 +356,7 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
             } => {
                 use crate::tool::Type;
                 use wl_tablet::zwp_tablet_tool_v2::Type as WlType;
-                let ctor = this.tools.collection.get_or_insert_ctor(tool.id()).unwrap();
+                let ctor = this.tools.get_or_insert_ctor(tool.id()).unwrap();
                 match tool_type {
                     WlType::Airbrush => ctor.tool_type = Some(Type::Airbrush),
                     WlType::Brush => ctor.tool_type = Some(Type::Brush),
@@ -379,25 +371,104 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
                 }
             }
             Event::Done => {
-                this.tools.collection.done(&tool.id());
+                this.tools.done(&tool.id());
             }
-            Event::Removed => this.tools.collection.destroy(&tool.id()),
+            Event::Removed => this.tools.destroy(&tool.id()),
             // ======== Interaction data =========
             Event::ProximityIn { tablet, .. } => {
-                println!("In tablet{} tool{}", tablet.id(), tool.id());
-            }
-            Event::Down { .. } => {
-                println!("Down");
-            }
-            Event::Motion { .. } => {
-                println!("Motion");
+                this.summary = Some(RawSummary {
+                    tablet_id: tablet.id(),
+                    tool_id: tool.id(),
+                    down: false,
+                    pose: Pose::default(),
+                    time: FrameTimestamp::epoch(),
+                });
             }
             Event::ProximityOut { .. } => {
-                println!("Out");
+                if this
+                    .summary
+                    .as_ref()
+                    .is_some_and(|sum| sum.tool_id == tool.id())
+                {
+                    this.summary = None;
+                }
             }
-
-            Event::Frame { .. } => {
-                println!("f");
+            Event::Down { .. } => {
+                if let Some(summary) = &mut this.summary {
+                    if summary.tool_id == tool.id() {
+                        summary.down = true;
+                    }
+                }
+            }
+            Event::Up { .. } => {
+                if let Some(summary) = &mut this.summary {
+                    if summary.tool_id == tool.id() {
+                        summary.down = false;
+                    }
+                }
+            }
+            Event::Motion { x, y } => {
+                if let Some(summary) = &mut this.summary {
+                    // shhh...
+                    #[allow(clippy::cast_possible_truncation)]
+                    if summary.tool_id == tool.id() {
+                        summary.pose.position = [x as f32, y as f32];
+                    }
+                }
+            }
+            Event::Tilt { tilt_x, tilt_y } => {
+                if let Some(summary) = &mut this.summary {
+                    // shhh...
+                    #[allow(clippy::cast_possible_truncation)]
+                    if summary.tool_id == tool.id() {
+                        summary.pose.tilt =
+                            Some([(tilt_x as f32).to_radians(), (tilt_y as f32).to_radians()]);
+                    }
+                }
+            }
+            Event::Pressure { pressure } => {
+                if let Some(summary) = &mut this.summary {
+                    #[allow(clippy::cast_precision_loss)]
+                    if summary.tool_id == tool.id() {
+                        summary.pose.pressure =
+                            NicheF32::new_some((pressure as f32) / 65535.0).unwrap();
+                    }
+                }
+            }
+            Event::Distance { distance } => {
+                if let Some(summary) = &mut this.summary {
+                    #[allow(clippy::cast_precision_loss)]
+                    if summary.tool_id == tool.id() {
+                        summary.pose.distance =
+                            NicheF32::new_some((distance as f32) / 65535.0).unwrap();
+                    }
+                }
+            }
+            Event::Rotation { degrees } => {
+                if let Some(summary) = &mut this.summary {
+                    #[allow(clippy::cast_possible_truncation)]
+                    if summary.tool_id == tool.id() {
+                        summary.pose.roll =
+                            NicheF32::new_some((degrees as f32).to_radians()).unwrap();
+                    }
+                }
+            }
+            Event::Slider { position } => {
+                if let Some(summary) = &mut this.summary {
+                    #[allow(clippy::cast_precision_loss)]
+                    if summary.tool_id == tool.id() {
+                        summary.pose.distance =
+                            NicheF32::new_some((position as f32) / 65535.0).unwrap();
+                    }
+                }
+            }
+            Event::Frame { time } => {
+                if let Some(summary) = &mut this.summary {
+                    if summary.tool_id == tool.id() {
+                        summary.time =
+                            FrameTimestamp(std::time::Duration::from_millis(u64::from(time)));
+                    }
+                }
             }
 
             // ne

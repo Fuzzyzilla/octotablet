@@ -18,9 +18,9 @@ pub struct Id(ObjectId);
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct UsbId {
     /// Vendor ID
-    pub vid: u32,
+    pub vid: u16,
     /// Product ID
-    pub pid: u32,
+    pub pid: u16,
 }
 
 /// See [module level docs](`crate::tablet`) for details.

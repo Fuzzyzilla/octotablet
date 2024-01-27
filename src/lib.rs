@@ -11,18 +11,31 @@
 //!
 //! To get started, create a [`Manager`].
 //!
+//! ## Hardware support
+//! Aims to support a wide range of devices, as long as they use standard platform APIs (ie, no *Wacom SDK*).
+//!
+//! If you find a device which is missing features or otherwise behaving strangely, please submit an issue.
+//!
+//! During development, tested on:
+//! * *Wacom Cintiq 16* \[DTK-1660\]
+//! * *Wacom Intuos (S)* \[CTL-4100\]
+//! * *Wacom Intuos Pro small* \[PTH-451\]
+//! * *Wacom Pro Pen 2*
+//! * *Wacom Pro Pen 2k*
+//! * *XP-Pen Deco-01*
+//!
 //! ## Examples
 //! See [the examples directory](https://github.com/Fuzzyzilla/wl-tablet/tree/master/examples) for how
 //! this can be integrated into `winit` or `eframe` projects.
 
 #![warn(clippy::pedantic)]
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_op_in_unsafe_fn)]
 pub mod events;
 pub mod pad;
 pub mod tablet;
 pub mod tool;
 mod wl;
-use events::{Event, EventIterator};
+use events::Events;
 use wayland_client::DispatchError;
 
 pub enum TabletEvent {}
@@ -99,11 +112,10 @@ impl Manager {
     /// Parse pending events. Will update the hardware reports, as well as collecting inputs.
     /// Assumes another client on this connection is performing reads, which will be the case
     /// if you're using `winit` or `eframe`.
-    //#[must_use]
     #[allow(clippy::missing_errors_doc)]
-    pub fn pump(&mut self) -> Result<impl Iterator<Item = Event<'_>> + '_, DispatchError> {
+    pub fn pump(&mut self) -> Result<Events<'_>, DispatchError> {
         let _events = self.queue.dispatch_pending(&mut self.state)?;
-        Ok(EventIterator { _manager: &*self })
+        Ok(Events { manager: &*self })
     }
     /// Query the precision of [timestamps](events::FrameTimestamp) provided along with axis events, if any.
     /// This does *not* represent the polling rate. `None` if timestamps are not collected.
@@ -120,16 +132,16 @@ impl Manager {
     /// Pads are ordered arbitrarily.
     #[must_use]
     pub fn pads(&self) -> &[pad::Pad] {
-        &self.state.pads.collection.finished
+        &self.state.pads.finished
     }
     /// Access tool information. Tools are styluses or other hardware that
     /// communicate with one or more pads, and are responsible for reporting movements, pressure, etc.,
     /// and may have multiple buttons.
     ///
-    /// Returned tools are in order they were discovered, and are never removed.
+    /// Tools are ordered arbitrarily.
     #[must_use]
     pub fn tools(&self) -> &[tool::Tool] {
-        &self.state.tools.collection.finished
+        &self.state.tools.finished
     }
     /// A tablet is the entry point for interactive devices, and the top level of the hierarchy
     /// which may expose several pads or tools.
@@ -137,6 +149,34 @@ impl Manager {
     /// Tablets are ordered arbitrarily.
     #[must_use]
     pub fn tablets(&self) -> &[tablet::Tablet] {
-        &self.state.tablets.collection.finished
+        &self.state.tablets.finished
+    }
+    #[must_use]
+    fn make_summary(&self) -> events::summary::Summary {
+        let try_summarize = || -> Option<events::summary::Summary> {
+            let sum = self.state.summary.clone()?;
+
+            let tablet = self
+                .tablets()
+                .iter()
+                .find(|tab| tab.obj_id == sum.tablet_id)?;
+            let tool = self.tools().iter().find(|tab| tab.obj_id == sum.tool_id)?;
+            Some(events::summary::Summary {
+                tool: events::summary::ToolState::In(events::summary::InState {
+                    tablet,
+                    tool,
+                    pose: sum.pose,
+                    down: sum.down,
+                    timestamp: Some(sum.time),
+                }),
+                pads: &[],
+            })
+        };
+
+        // try block pls..
+        try_summarize().unwrap_or(events::summary::Summary {
+            tool: events::summary::ToolState::Out,
+            pads: &[],
+        })
     }
 }
