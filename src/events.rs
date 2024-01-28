@@ -104,12 +104,15 @@ impl PartialEq<NicheF32> for f32 {
 /// **All axes are Non-`NaN`, finite values.**
 ///
 /// Interpretations of some axes require querying the `Tool` that generated this pose.
-/// **Note**: There may be axes in here that the tool does *not* advertise as available,
-/// and axes it advertises may be are missing. This is a driver quirk.
+///
+/// # Quirks
+/// There may be axis values that the tool does *not* advertise as available,
+/// and axes it advertises may be missing.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct Pose {
     /// X, Y position, in pixels from the top left of the associated compositor surface.
-    /// This may exceed your window size in the negative or positive directions.
+    /// This may have subpixel precision, and may exceed your window size in the negative or
+    /// positive directions.
     pub position: [f32; 2],
     /// Distance from the surface of the tablet, if available. See the tool's
     /// [`distance_unit`](crate::tool::Tool::distance_unit) for interpretation of the value.
@@ -117,13 +120,23 @@ pub struct Pose {
     /// If `DistanceUnit::Unitless`, this is a normalized `0..=1` value,
     /// otherwise it is unbounded.
     ///
-    /// This will not necessarily be zero when in contact with the device.
+    /// # Quirks
+    /// This will not necessarily be zero when in contact with the device, and may
+    /// stop updating after contact is reported.
     pub distance: NicheF32,
     /// Perpindicular pressure, if available. `0..=1`
+    ///
+    /// # Quirks
+    /// Full pressure may not correspond to `1.0`.
     pub pressure: NicheF32,
-    /// Absolute tilt in randians from perpendicular in the X and Y directions.
+    /// Absolute tilt in randians from perpendicular in the X and Y directions. That is, the first angle
+    /// describes the angle between the pen and the Z (perpendicular to the surface) axis along the XZ plane,
+    /// and the second angle describes the angle between the pen and Z on the YZ plane.
     ///
     /// `[+,+]` is right+towards user, and `[-,-]` is left+away from user.
+    /// # Quirks
+    /// In theory the vector `[sin x, sin y]` should describe a projection of the pen's body down on the page,
+    /// with length <= 1. However in practice, reported values may break this trigonometric invariant.
     pub tilt: Option<[f32; 2]>,
     /// Absolute roll in radians, if available, around the tool's long axis. `0..<2pi`, where zero is a
     /// hardware-determined "natural" zero-point.

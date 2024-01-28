@@ -6,10 +6,10 @@
 //! A single pad may be further divided into "groups" if several physical clusters of interactables are
 //! present - for example, on the *Wacom Cintiq 22HD* a left and right group may be reported.
 //!
+//! The number of pads attached to a tablet may be dynamic on particularly esoteric hardware!
+//! ## Quirks
 //! Not every tablet with buttons or other extra features reports pads. Some *Gaomon* and *XPPEN* tablets, for example,
 //! merely emulate keypresses in the driver in response to button clicks, which is transparent to the client.
-//!
-//! The number of pads attached to a tablet may be dynamic on particularly esoteric hardware!
 
 use wayland_backend::client::ObjectId;
 

@@ -14,8 +14,6 @@
 //! ## Hardware support
 //! Aims to support a wide range of devices, as long as they use standard platform APIs (ie, no *Wacom SDK*).
 //!
-//! If you find a device which is missing features or otherwise behaving strangely, please submit an issue.
-//!
 //! During development, tested on:
 //! * *Wacom Cintiq 16* \[DTK-1660\]
 //! * *Wacom Intuos (S)* \[CTL-4100\]
@@ -23,6 +21,12 @@
 //! * *Wacom Pro Pen 2*
 //! * *Wacom Pro Pen 2k*
 //! * *XP-Pen Deco-01*
+//!
+//! **Note:** Nearly every graphics tablet/driver has no shortage of quirks. Some platforms try to correct for that,
+//! some dont. While API-level quirks are smoothed out by this crate, per-device quirk correction is beyond the scope
+//! of this project and quirked values are reported as-is. Where possible, documentation notes are included to warn
+//! where quirks are known to occur. If you encounter additional quirks, please submit a PR documenting them.
+//! **Guarantees are made only when explicitly stated so!**
 //!
 //! ## Examples
 //! See [the examples directory](https://github.com/Fuzzyzilla/wl-tablet/tree/master/examples) for how
@@ -55,6 +59,14 @@ pub enum ManagerError {
     /// The given window handle doesn't use a supported connection type.
     #[error("handle doesn't contain a supported display type")]
     Unsupported,
+}
+#[derive(Clone, Copy, Debug)]
+pub enum Backend {
+    /// [https://wayland.app/protocols/tablet-unstable-v2]
+    WaylandTabletUnstableV2,
+    // /// [https://learn.microsoft.com/en-us/windows/win32/api/msinkaut/] [https://learn.microsoft.com/en-us/windows/win32/tablet/realtimestylus-reference]
+    // /// [https://learn.microsoft.com/en-us/windows/win32/tablet/packetpropertyguids-constants]
+    // WindowsInk,
 }
 
 /// Manages a connection to the OS's tablet server. This is the main
@@ -125,6 +137,11 @@ impl Manager {
     pub fn timestamp_resolution(&self) -> Option<std::time::Duration> {
         // Wayland always reports, and with millisecond granularity.
         Some(std::time::Duration::from_millis(1))
+    }
+    /// Query the API currently in use. May give some hints as to the capabilities and limitations.
+    #[must_use]
+    pub fn backed(&self) -> Backend {
+        Backend::WaylandTabletUnstableV2
     }
     /// Access pad information. Pads are the physical object that you draw on,
     /// and may have touch support, an inbuilt display, lights, buttons, rings, and/or sliders.

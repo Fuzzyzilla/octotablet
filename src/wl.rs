@@ -9,7 +9,7 @@ use crate::{
     events::{FrameTimestamp, NicheF32, Pose},
     pad::Pad,
     tablet::{Tablet, UsbId},
-    tool::{AvailableAxes, Tool},
+    tool::{AvailableAxes, AxisInfo, Tool},
 };
 pub trait HasWlId {
     fn new_default(id: ObjectId) -> Self;
@@ -26,7 +26,9 @@ impl HasWlId for Tool {
             wacom_id: None,
             available_axes: AvailableAxes::empty(),
             tool_type: None,
+            // Unfortunately, Wayland doesn't enumerate axis precision info. :<
             axis_info: Default::default(),
+            position_info: AxisInfo::default(),
             distance_unit: crate::tool::DistanceUnit::Unitless,
         }
     }

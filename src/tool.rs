@@ -85,17 +85,19 @@ pub enum Type {
     Pen,
     Pencil,
     Brush,
-    /// A nib found on the reverse of some styli primarily entended to erase.
+    /// A nib found on the reverse of some styli primarily intended to erase.
     /// To associate an eraser with its counterpart, if any, see [`Tool::id`].
     Eraser,
     /// A tool designed to work above the surface of the pad, making extensive
     /// use of the `Distance` and `Tilt` axes.
     Airbrush,
-    /// A larger mouse-like device that rests on the pad with a physical transparent crosshair.
-    Lens,
+    /// A touch. Depending on hardware, touches may have additional expressive axes
+    /// over a regular touchscreen.
     Finger,
-    /// An emulated stylus from mouse input.
+    /// A mouse-like device that rests on the pad and provides absolute coordinates.
     Mouse,
+    /// A mouse-like device that rests on the pad with a transparent crosshair for visibility.
+    Lens,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -126,17 +128,22 @@ pub struct Tool {
     /// It is usable to save per-tool configurations to disk, for example.
     ///
     /// Connects related tools together - for example, a pen and its eraser will share the same id.
-    ///
     /// `None` is unknown and does not imply relationships with other tools of id `None`.
+    ///
+    /// If this is present, it's also a hint that the tool may be allowed to freely roam between
+    /// several connected tablets. Otherwise, the pen is considered tied to the first tablet it comes
+    /// [in proximity](crate::events::ToolEvent::In) to.
     pub id: Option<u64>,
     /// A unique tool type reported by wacom devices. With a lookup table of wacom hardware,
-    /// it is possible to find the specific hardware and additional capabilities of the device.
+    /// it is possible to find the specific model and additional capabilities of the device.
     pub wacom_id: Option<u64>,
     /// Type of the tool, if known.
     pub tool_type: Option<Type>,
     /// The axes this tool is advertised by the system to report. In practice, this be different
     /// than the actual reported axes.
     pub available_axes: AvailableAxes,
+    /// Information about the X,Y axes, which are always supported.
+    pub position_info: AxisInfo,
     pub(crate) axis_info: [AxisInfo; <Axis as strum::EnumCount>::COUNT],
     pub(crate) distance_unit: DistanceUnit,
 }
@@ -148,6 +155,7 @@ impl Debug for Tool {
         this.field("wacom_id", &self.wacom_id);
         this.field("tool_type", &self.tool_type);
         this.field("available_axes", &self.available_axes);
+        this.field("position_info", &self.position_info);
 
         let axes: Vec<_> = self
             .available_axes
