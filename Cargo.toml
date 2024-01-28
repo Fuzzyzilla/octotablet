@@ -18,5 +18,6 @@ wayland-protocols = { version = "0.31.0", features = ["client", "unstable"] }
 [dev-dependencies]
 eframe = {version = "0.25.0", default-features = false, features = ["accesskit", "wayland", "default_fonts", "glow"] }
 winit = {version = "0.29.10", default-features = false, features = ["wayland", "rwh_05"]}
+tiny-skia = {version = "0.11.3", default-features = false, features = ["std", "simd"]}
 usb-ids = "1.2024.1"
 softbuffer = "0.4.1"
