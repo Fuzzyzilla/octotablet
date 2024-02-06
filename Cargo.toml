@@ -8,7 +8,7 @@ edition = "2021"
 
 [dependencies]
 bitflags = "2.4.2"
-raw-window-handle = "0.5.0"
+raw-window-handle = "0.6.0"
 strum = { version = "0.25.0", features = ["derive"] }
 thiserror = "1.0.56"
 wayland-backend = { version = "0.3.2", features = ["client_system"] }
@@ -16,8 +16,8 @@ wayland-client = "0.31.1"
 wayland-protocols = { version = "0.31.0", features = ["client", "unstable"] }
 
 [dev-dependencies]
-eframe = {version = "0.25.0", default-features = false, features = ["accesskit", "wayland", "default_fonts", "glow"] }
-winit = {version = "0.29.10", default-features = false, features = ["wayland", "rwh_05"]}
+eframe = {version = "0.26.0", default-features = false, features = ["accesskit", "wayland", "default_fonts", "glow"] }
+winit = {version = "0.29.10", default-features = false, features = ["wayland", "rwh_06"]}
 tiny-skia = {version = "0.11.3", default-features = false, features = ["std", "simd"]}
 usb-ids = "1.2024.1"
 softbuffer = "0.4.1"

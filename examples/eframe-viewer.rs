@@ -4,13 +4,12 @@ use eframe::{
     epaint::{Color32, FontId, Shape, Stroke, Vec2},
     CreationContext, EventLoopBuilder,
 };
-use raw_window_handle::HasRawDisplayHandle;
+use raw_window_handle::HasDisplayHandle;
 use winit::platform::wayland::EventLoopBuilderExtWayland;
 use wl_tablet::{
     events::summary::{InState, Summary},
     tablet::UsbId,
     tool::{AvailableAxes, Axis},
-    Manager,
 };
 
 fn main() {
@@ -44,7 +43,9 @@ impl Viewer {
         // Context gives us access to the handle, connect to the tablet server:
         Self {
             // Safety: Destroyed in `on_exit`, before we lose the display.
-            manager: unsafe { Manager::new_raw(context.raw_display_handle()) },
+            manager: unsafe {
+                wl_tablet::Builder::new().build_raw(context.display_handle().unwrap().as_raw())
+            },
         }
     }
 }

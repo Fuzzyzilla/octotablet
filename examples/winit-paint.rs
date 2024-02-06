@@ -1,7 +1,6 @@
 //! Simple winit example, using tiny-skia for drawing.
 //! Run under `--release` or it's horrifyingly slow!
 
-use raw_window_handle::HasRawDisplayHandle;
 use winit::dpi::PhysicalSize;
 use wl_tablet::tool::Type;
 
@@ -11,10 +10,12 @@ fn main() {
     let mut event_loop = winit::event_loop::EventLoopBuilder::<()>::default()
         .build()
         .unwrap();
-    let window = winit::window::WindowBuilder::default()
-        .with_inner_size(PhysicalSize::new(512u32, 512u32))
-        .build(&event_loop)
-        .unwrap();
+    let window = std::sync::Arc::new(
+        winit::window::WindowBuilder::default()
+            .with_inner_size(PhysicalSize::new(512u32, 512u32))
+            .build(&event_loop)
+            .unwrap(),
+    );
 
     // To allow us to draw on the screen without pulling in a whole GPU package,
     // we use `softbuffer` for presentation and `tiny-skia` for drawing
@@ -25,8 +26,11 @@ fn main() {
     let mut previous_point = None::<[f32; 2]>;
 
     // Fetch the tablets, using our window's handle for access.
-    // *We must be sure that the `window` outlives this `manager`!*
-    let mut manager = unsafe { wl_tablet::Manager::new_raw(window.raw_display_handle()) }.unwrap();
+    // Since we `Arc'd` our window, we get the safety of `build_shared`. Where this is not possible,
+    // `build_raw` is available as well!
+    let mut manager = wl_tablet::Builder::default()
+        .build_shared(window.clone())
+        .unwrap();
 
     while !event_loop.exiting() {
         // Throttle the loop. Everything here will run *as fast as possible*
@@ -175,11 +179,4 @@ fn main() {
             previous_point = None;
         }
     }
-    // Explicit drop order.
-    // Is this required? Prolly not. Good for demonstration? Arguably so.
-    drop(surface);
-    drop(softbuffer);
-    // Make sure manager drops before window - that's the safety contract we signed when constructing it!
-    drop(manager);
-    drop(window);
 }

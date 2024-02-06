@@ -9,7 +9,7 @@
 //! This library requires low-level access to the windowing server, which is provided
 //! by many windowing abstractions through the [`raw_window_handle`](https://crates.io/crates/raw-window-handle) crate.
 //!
-//! To get started, create a [`Manager`].
+//! To get started, create a [`Builder`].
 //!
 //! ## Hardware support
 //! Aims to support a wide range of devices, as long as they use standard platform APIs (ie, no *Wacom SDK*).
@@ -34,23 +34,31 @@
 
 #![warn(clippy::pedantic)]
 #![forbid(unsafe_op_in_unsafe_fn)]
+pub mod builder;
 pub mod events;
 pub mod pad;
 pub mod tablet;
 pub mod tool;
 mod wl;
+pub use builder::Builder;
 use events::Events;
 use wayland_client::DispatchError;
 
 pub enum TabletEvent {}
 
+/// A trait that every object is.
+/// Used to cast things to `dyn Erased` which leaves us with a wholly erased type.
+trait Erased {}
+impl<T> Erased for T {}
+
 #[allow(dead_code)]
 enum Backing {
-    // The RWH owner is boxed and thus is valid for as long as we need.
-    Box(Box<dyn std::any::Any>),
     // The RWH owner is arc'd and thus is valid for as long as we need.
-    Arc(std::sync::Arc<dyn std::any::Any>),
-    // The RWH is a pointer, and the user has guaranteed that it is valid as long as this object lives.
+    // We don't need to remember what type the pointer came from, but `dyn WhateverTrait` remembers
+    // enough to be able to destruct it cleanly.
+    Arc(std::sync::Arc<dyn Erased>),
+    // The RWH is some kind of raw pointer without lifetimes, and the user has guaranteed
+    // that it is valid as long as this object lives.
     Raw,
 }
 
@@ -59,6 +67,9 @@ pub enum ManagerError {
     /// The given window handle doesn't use a supported connection type.
     #[error("handle doesn't contain a supported display type")]
     Unsupported,
+    /// Failed to acquire a window handle
+    #[error(transparent)]
+    HandleError(#[from] raw_window_handle::HandleError),
 }
 #[derive(Clone, Copy, Debug)]
 pub enum Backend {
@@ -72,51 +83,40 @@ pub enum Backend {
 /// Manages a connection to the OS's tablet server. This is the main
 /// entry point for enumerating hardware and listening for events.
 pub struct Manager {
-    _display_owner: Backing,
     _display: wayland_client::protocol::wl_display::WlDisplay,
     _conn: wayland_client::Connection,
     queue: wayland_client::EventQueue<wl::TabletState>,
     _qh: wayland_client::QueueHandle<wl::TabletState>,
     state: wl::TabletState,
+
+    // `_backing` MUST BE LAST IN DECLARATION ORDER!
+    // the other fields may rely on the lifetime guarantees granted by the contents
+    // of this `Backing`, and it's guaranteed that drop order == declaration order.
+    // Never thought I'd end up in a situation like this in Rust :P
+    _backing: Backing,
 }
-/// # Constructors
 impl Manager {
-    /// Creates a tablet manager with a disconnected lifetime from the given display.
+    /// Creates a tablet manager with from the given pointer to `wl_display`.
     /// # Safety
-    /// The given display handle must be valid as long as the returned `Manager` is alive.
-    // Silly clippy, it's a self-describing err type!
-    #[allow(clippy::missing_errors_doc)]
-    pub unsafe fn new_raw(
-        handle: raw_window_handle::RawDisplayHandle,
-    ) -> Result<Self, ManagerError> {
-        match handle {
-            raw_window_handle::RawDisplayHandle::Wayland(wlh) => {
-                // Safety - deferred to this fn's contract
-                Ok(unsafe { Self::from_wayland_display(wlh.display.cast()) })
-            }
-            _ => Err(ManagerError::Unsupported),
-        }
-    }
-    /// Creates a tablet manager with a disconnected lifetime from the given pointer to `wl_display`.
-    /// # Safety
-    /// The given display pointer must be valid as long as the returned `Manager` is alive.
-    pub unsafe fn from_wayland_display(wl_display: *mut ()) -> Self {
+    /// The given display pointer must be valid as long as the returned `Manager` is alive. The [`Backing`] parameter
+    /// is kept alive with the returned Manager, which can be used to uphold this requirement.
+    pub(crate) unsafe fn build_wayland_display(wl_display: *mut (), backing: Backing) -> Manager {
         // Safety - deferred to this fn's contract
         let backend =
             unsafe { wayland_backend::client::Backend::from_foreign_display(wl_display.cast()) };
         let conn = wayland_client::Connection::from_backend(backend);
         let display = conn.display();
-        let queue = conn.new_event_queue::<wl::TabletState>();
+        let queue = conn.new_event_queue::<crate::wl::TabletState>();
         let qh = queue.handle();
         // Allow the manager impl to sift through and capture extention handles
         display.get_registry(&qh, ());
-        Self {
-            _display_owner: Backing::Raw,
+        Manager {
+            _backing: backing,
             _display: display,
             _conn: conn,
             queue,
             _qh: qh,
-            state: wl::TabletState::default(),
+            state: crate::wl::TabletState::default(),
         }
     }
 }
