@@ -11,7 +11,8 @@ use std::fmt::Debug;
 pub mod summary;
 
 use crate::{
-    pad::{Pad, PadGroup},
+    pad::{Group, Pad},
+    platform::PlatformImpl,
     tablet::Tablet,
     tool::Tool,
     Manager,
@@ -226,7 +227,7 @@ pub enum PadEvent<'a> {
     /// Unplugged or otherwise becomes unavailable. The pad will be removed from the hardware report.
     Removed,
     Group {
-        group: &'a PadGroup,
+        group: &'a Group,
         event: PadGroupEvent,
     }, //Enter,
        //Exit,
@@ -282,7 +283,7 @@ impl<'manager> Events<'manager> {
     /// care about intermediate events and just want to know final buttons/positions/etc.
     #[must_use = "returns a new object describing the overall end state"]
     pub fn summarize(self) -> summary::Summary<'manager> {
-        self.manager.make_summary()
+        self.manager.internal.make_summary()
     }
 }
 impl<'manager> IntoIterator for Events<'manager> {

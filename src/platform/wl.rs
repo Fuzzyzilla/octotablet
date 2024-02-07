@@ -1,3 +1,7 @@
+//! Implementation details for Wayland's `tablet_unstable_v2` protocol.
+//!
+//! Within this module, it is sound to assume `cfg(wl_tablet) == true`
+//! (compiling for a wayland target + has deps, or is building docs).
 use wayland_backend::client::ObjectId;
 use wayland_client::{
     protocol::{wl_registry, wl_seat},
@@ -11,6 +15,95 @@ use crate::{
     tablet::{Tablet, UsbId},
     tool::{AvailableAxes, AxisInfo, Tool},
 };
+
+use super::InternalID;
+pub struct Manager {
+    _display: wayland_client::protocol::wl_display::WlDisplay,
+    _conn: wayland_client::Connection,
+    queue: wayland_client::EventQueue<TabletState>,
+    _qh: wayland_client::QueueHandle<TabletState>,
+    state: TabletState,
+}
+impl Manager {
+    /// Creates a tablet manager with from the given pointer to `wl_display`.
+    /// # Safety
+    /// The given display pointer must be valid as long as the returned `Manager` is alive. The [`Backing`] parameter
+    /// is kept alive with the returned Manager, which can be used to uphold this requirement.
+    pub(crate) unsafe fn build_wayland_display(wl_display: *mut ()) -> Manager {
+        // Safety - deferred to this fn's contract
+        let backend =
+            unsafe { wayland_backend::client::Backend::from_foreign_display(wl_display.cast()) };
+        let conn = wayland_client::Connection::from_backend(backend);
+        let display = conn.display();
+        let queue = conn.new_event_queue();
+        let qh = queue.handle();
+        // Allow the manager impl to sift through and capture extention handles
+        display.get_registry(&qh, ());
+        Manager {
+            _display: display,
+            _conn: conn,
+            queue,
+            _qh: qh,
+            state: TabletState::default(),
+        }
+    }
+}
+impl super::PlatformImpl for Manager {
+    #[allow(clippy::missing_errors_doc)]
+    fn pump(&mut self) -> Result<(), crate::PumpError> {
+        self.queue.dispatch_pending(&mut self.state)?;
+        Ok(())
+    }
+    #[must_use]
+    fn timestamp_granularity(&self) -> Option<std::time::Duration> {
+        // Wayland always reports, and with millisecond granularity.
+        Some(std::time::Duration::from_millis(1))
+    }
+    #[must_use]
+    fn pads(&self) -> &[crate::pad::Pad] {
+        &self.state.pads.finished
+    }
+    #[must_use]
+    fn tools(&self) -> &[crate::tool::Tool] {
+        &self.state.tools.finished
+    }
+    #[must_use]
+    fn tablets(&self) -> &[crate::tablet::Tablet] {
+        &self.state.tablets.finished
+    }
+    #[must_use]
+    fn make_summary(&self) -> crate::events::summary::Summary {
+        let try_summarize = || -> Option<crate::events::summary::Summary> {
+            let sum = self.state.summary.clone()?;
+
+            let tablet = self
+                .tablets()
+                .iter()
+                .find(|tab| tab.obj_id.unwrap_wl() == &sum.tablet_id)?;
+            let tool = self
+                .tools()
+                .iter()
+                .find(|tab| tab.obj_id.unwrap_wl() == &sum.tool_id)?;
+            Some(crate::events::summary::Summary {
+                tool: crate::events::summary::ToolState::In(crate::events::summary::InState {
+                    tablet,
+                    tool,
+                    pose: sum.pose,
+                    down: sum.down,
+                    timestamp: Some(sum.time),
+                }),
+                pads: &[],
+            })
+        };
+
+        // try block pls..
+        try_summarize().unwrap_or(crate::events::summary::Summary {
+            tool: crate::events::summary::ToolState::Out,
+            pads: &[],
+        })
+    }
+}
+
 pub trait HasWlId {
     fn new_default(id: ObjectId) -> Self;
     fn id(&self) -> &ObjectId;
@@ -21,7 +114,7 @@ pub trait HasWlId {
 impl HasWlId for Tool {
     fn new_default(id: ObjectId) -> Self {
         Tool {
-            obj_id: id,
+            obj_id: InternalID::Wayland(id),
             id: None,
             wacom_id: None,
             available_axes: AvailableAxes::empty(),
@@ -33,32 +126,32 @@ impl HasWlId for Tool {
         }
     }
     fn id(&self) -> &ObjectId {
-        &self.obj_id
+        self.obj_id.unwrap_wl()
     }
 }
 impl HasWlId for Tablet {
     fn new_default(id: ObjectId) -> Self {
         Tablet {
-            obj_id: id,
+            obj_id: InternalID::Wayland(id),
             name: String::new(),
             usb_id: None,
         }
     }
     fn id(&self) -> &ObjectId {
-        &self.obj_id
+        self.obj_id.unwrap_wl()
     }
 }
 impl HasWlId for Pad {
     fn new_default(id: ObjectId) -> Self {
         Pad {
-            obj_id: id,
+            obj_id: InternalID::Wayland(id),
             // 0 is the default and what the protocol specifies should be used if
             // the constructor for this value is never sent.
             button_count: 0,
         }
     }
     fn id(&self) -> &ObjectId {
-        &self.obj_id
+        self.obj_id.unwrap_wl()
     }
 }
 

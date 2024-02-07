@@ -1,4 +1,21 @@
-use crate::{Backing, Manager, ManagerError};
+use crate::{Backing, Manager};
+
+#[derive(thiserror::Error, Debug)]
+pub enum BuildError {
+    /// The given window handle doesn't use a supported connection type.
+    #[error("handle doesn't contain a supported display type")]
+    Unsupported,
+    /// Failed to acquire a window handle
+    #[error("{:?}", .0)]
+    HandleError(raw_window_handle::HandleError),
+}
+// #[from] thiserror attribute breaks horribly D:
+impl From<raw_window_handle::HandleError> for BuildError {
+    fn from(value: raw_window_handle::HandleError) -> Self {
+        Self::HandleError(value)
+    }
+}
+
 #[derive(Default)]
 pub struct Builder {}
 
@@ -13,30 +30,33 @@ impl Builder {
 impl Builder {
     /// Build from a shared display handle carrier. Internally, this `Arc` is kept alive for as
     /// long as the returned `Manager` is around ensuring safe operation.
-    // Unimplementable on `rwh_05`, as it's safety conditions are not strong enough to ensure this
+    // Unimplementable on `rwh_05`, as its safety conditions are not strong enough to ensure this
     // is sound!
     // Silly clippy, it's a self-describing err type!
     #[allow(clippy::missing_errors_doc)]
     pub fn build_shared(
         self,
         rwh: std::sync::Arc<impl raw_window_handle::HasDisplayHandle + 'static>,
-    ) -> Result<Manager, ManagerError> {
+    ) -> Result<Manager, BuildError> {
         match rwh.display_handle()?.as_raw() {
+            #[cfg(wl_tablet)]
             raw_window_handle::RawDisplayHandle::Wayland(wlh) => {
                 // Erase the type, we don't care - we just need to be able to `Drop` it and to keep it around as
                 // long as we need!
-                let backing = rwh as std::sync::Arc<dyn crate::Erased>;
+                let backing = Backing::Arc(rwh as _);
                 // Safety - The returned `display_handle` is valid for as long as `rwh` is due to
                 // safety bound on `DisplayHandle::borrow_raw`. Since we keep the `rwh` alive inside the manager,
                 // the pointer is thus valid for the lifetime of the manager.
-                Ok(unsafe {
-                    Manager::build_wayland_display(
-                        wlh.display.as_ptr().cast(),
-                        Backing::Arc(backing),
-                    )
+                let internal = crate::platform::PlatformManager::Wayland(unsafe {
+                    // Safety - deferred to this fn's contract
+                    crate::platform::wl::Manager::build_wayland_display(wlh.display.as_ptr().cast())
+                });
+                Ok(Manager {
+                    internal,
+                    _backing: backing,
                 })
             }
-            _ => Err(ManagerError::Unsupported),
+            _ => Err(BuildError::Unsupported),
         }
     }
     /// Build from a display handle carrier, such as a reference to a `winit` window, with unbound lifetime.
@@ -49,15 +69,21 @@ impl Builder {
     pub unsafe fn build_raw(
         self,
         rwh: raw_window_handle::RawDisplayHandle,
-    ) -> Result<Manager, ManagerError> {
+    ) -> Result<Manager, BuildError> {
         match rwh {
+            #[cfg(wl_tablet)]
             raw_window_handle::RawDisplayHandle::Wayland(wlh) => {
-                // Safety - deferred to this fn's contract
-                Ok(unsafe {
-                    Manager::build_wayland_display(wlh.display.as_ptr().cast(), Backing::Raw)
+                let backing = Backing::Raw;
+                let internal = crate::platform::PlatformManager::Wayland(unsafe {
+                    // Safety - deferred to this fn's contract
+                    crate::platform::wl::Manager::build_wayland_display(wlh.display.as_ptr().cast())
+                });
+                Ok(Manager {
+                    internal,
+                    _backing: backing,
                 })
             }
-            _ => Err(ManagerError::Unsupported),
+            _ => Err(BuildError::Unsupported),
         }
     }
 }

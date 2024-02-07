@@ -17,7 +17,7 @@
 
 use std::fmt::Debug;
 
-use wayland_backend::client::ObjectId;
+use crate::platform::InternalID;
 
 bitflags::bitflags! {
     /// Bitflags describing all supported Axes. See [`Axis`] for descriptions.
@@ -121,8 +121,8 @@ pub struct AxisInfo {
 
 /// Description of the capabilities of a tool.
 pub struct Tool {
-    /// Wayland internal ID.
-    pub(crate) obj_id: ObjectId,
+    /// Platform internal ID.
+    pub(crate) obj_id: InternalID,
     /// An identifier that is baked into the hardware of the tool.
     /// Likely to remain stable over executions, and unique across even devices of the same model.
     /// It is usable to save per-tool configurations to disk, for example.

@@ -1,10 +1,8 @@
-//! # ~~Cross-platform~~\* Tablet, Pad, and Stylus interface
-//! *\*Only wayland support right now lol*
+//! # Cross-platform Tablet, Pad, and Stylus interface
 //!
-//! Current plans are Wayland's *`tablet_unstable_v2`*, Windows Ink, and X11's *`xinput`*, but aims to
-//! one day provide a unified API for tablet access across Linux, Windows, and Mac. Additionally,
-//! rather than providing the intersection of these platforms' capabilities, aims to expose the union of them
-//! such that no features are lost to abstraction.
+//! Current plans are Wayland's *`tablet_unstable_v2`*, Windows Ink's `RealTimeStylus`, and X11's *`xinput`*, but aims to
+//! one day provide a unified API for tablet access across more platforms. Additionally, rather than providing the intersection
+//! of these platforms' capabilities, aims to expose the union of them such that no features are lost to abstraction.
 //!
 //! This library requires low-level access to the windowing server, which is provided
 //! by many windowing abstractions through the [`raw_window_handle`](https://crates.io/crates/raw-window-handle) crate.
@@ -12,7 +10,7 @@
 //! To get started, create a [`Builder`].
 //!
 //! ## Hardware support
-//! Aims to support a wide range of devices, as long as they use standard platform APIs (ie, no *Wacom SDK*).
+//! Aims to support a wide range of devices, as long as they use standard platform APIs (ie, no tablet-specific APIs).
 //!
 //! During development, tested on:
 //! * *Wacom Cintiq 16* \[DTK-1660\]
@@ -34,17 +32,17 @@
 
 #![warn(clippy::pedantic)]
 #![forbid(unsafe_op_in_unsafe_fn)]
+
 pub mod builder;
 pub mod events;
 pub mod pad;
+mod platform;
+use platform::InternalID;
 pub mod tablet;
 pub mod tool;
-mod wl;
 pub use builder::Builder;
 use events::Events;
-use wayland_client::DispatchError;
-
-pub enum TabletEvent {}
+use platform::PlatformImpl;
 
 /// A trait that every object is.
 /// Used to cast things to `dyn Erased` which leaves us with a wholly erased type.
@@ -61,72 +59,44 @@ enum Backing {
     // that it is valid as long as this object lives.
     Raw,
 }
-
-#[derive(thiserror::Error, Debug)]
-pub enum ManagerError {
-    /// The given window handle doesn't use a supported connection type.
-    #[error("handle doesn't contain a supported display type")]
-    Unsupported,
-    /// Failed to acquire a window handle
-    #[error(transparent)]
-    HandleError(#[from] raw_window_handle::HandleError),
-}
 #[derive(Clone, Copy, Debug)]
 pub enum Backend {
-    /// [https://wayland.app/protocols/tablet-unstable-v2]
+    /// [`tablet_unstable_v2`](https://wayland.app/protocols/tablet-unstable-v2)
+    ///
+    /// **Note**: "unstable" here refers to the protocol itself, not to the stability of its integration into this crate!
+    #[cfg(wl_tablet)]
     WaylandTabletUnstableV2,
-    // /// [https://learn.microsoft.com/en-us/windows/win32/api/msinkaut/] [https://learn.microsoft.com/en-us/windows/win32/tablet/realtimestylus-reference]
-    // /// [https://learn.microsoft.com/en-us/windows/win32/tablet/packetpropertyguids-constants]
-    // WindowsInk,
+    /// [`RealTimeStylus`](https://learn.microsoft.com/en-us/windows/win32/tablet/realtimestylus-reference)
+    // [https://learn.microsoft.com/en-us/windows/win32/api/msinkaut/]
+    // [https://learn.microsoft.com/en-us/windows/win32/tablet/packetpropertyguids-constants]
+    #[cfg(ink_rts)]
+    WindowsInkRealTimeStylus,
+}
+/// Errors that may occur during even pumping.
+#[derive(thiserror::Error, Debug)]
+pub enum PumpError {
+    #[cfg(wl_tablet)]
+    #[error(transparent)]
+    WaylandDispatch(#[from] wayland_client::DispatchError),
 }
 
 /// Manages a connection to the OS's tablet server. This is the main
 /// entry point for enumerating hardware and listening for events.
 pub struct Manager {
-    _display: wayland_client::protocol::wl_display::WlDisplay,
-    _conn: wayland_client::Connection,
-    queue: wayland_client::EventQueue<wl::TabletState>,
-    _qh: wayland_client::QueueHandle<wl::TabletState>,
-    state: wl::TabletState,
-
+    pub(crate) internal: platform::PlatformManager,
     // `_backing` MUST BE LAST IN DECLARATION ORDER!
     // the other fields may rely on the lifetime guarantees granted by the contents
     // of this `Backing`, and it's guaranteed that drop order == declaration order.
     // Never thought I'd end up in a situation like this in Rust :P
-    _backing: Backing,
-}
-impl Manager {
-    /// Creates a tablet manager with from the given pointer to `wl_display`.
-    /// # Safety
-    /// The given display pointer must be valid as long as the returned `Manager` is alive. The [`Backing`] parameter
-    /// is kept alive with the returned Manager, which can be used to uphold this requirement.
-    pub(crate) unsafe fn build_wayland_display(wl_display: *mut (), backing: Backing) -> Manager {
-        // Safety - deferred to this fn's contract
-        let backend =
-            unsafe { wayland_backend::client::Backend::from_foreign_display(wl_display.cast()) };
-        let conn = wayland_client::Connection::from_backend(backend);
-        let display = conn.display();
-        let queue = conn.new_event_queue::<crate::wl::TabletState>();
-        let qh = queue.handle();
-        // Allow the manager impl to sift through and capture extention handles
-        display.get_registry(&qh, ());
-        Manager {
-            _backing: backing,
-            _display: display,
-            _conn: conn,
-            queue,
-            _qh: qh,
-            state: crate::wl::TabletState::default(),
-        }
-    }
+    pub(crate) _backing: Backing,
 }
 impl Manager {
     /// Parse pending events. Will update the hardware reports, as well as collecting inputs.
     /// Assumes another client on this connection is performing reads, which will be the case
     /// if you're using `winit` or `eframe`.
     #[allow(clippy::missing_errors_doc)]
-    pub fn pump(&mut self) -> Result<Events<'_>, DispatchError> {
-        let _events = self.queue.dispatch_pending(&mut self.state)?;
+    pub fn pump(&mut self) -> Result<Events<'_>, PumpError> {
+        self.internal.pump()?;
         Ok(Events { manager: &*self })
     }
     /// Query the precision of [timestamps](events::FrameTimestamp) provided along with axis events, if any.
@@ -141,7 +111,12 @@ impl Manager {
     /// Query the API currently in use. May give some hints as to the capabilities and limitations.
     #[must_use]
     pub fn backed(&self) -> Backend {
-        Backend::WaylandTabletUnstableV2
+        match self.internal {
+            #[cfg(wl_tablet)]
+            platform::PlatformManager::Wayland(_) => Backend::WaylandTabletUnstableV2,
+            #[cfg(ink_rts)]
+            platform::PlatformManager::Ink(_) => Backend::WindowsInkRealTimeStylus,
+        }
     }
     /// Access pad information. Pads are the physical object that you draw on,
     /// and may have touch support, an inbuilt display, lights, buttons, rings, and/or sliders.
@@ -149,7 +124,7 @@ impl Manager {
     /// Pads are ordered arbitrarily.
     #[must_use]
     pub fn pads(&self) -> &[pad::Pad] {
-        &self.state.pads.finished
+        self.internal.pads()
     }
     /// Access tool information. Tools are styluses or other hardware that
     /// communicate with one or more pads, and are responsible for reporting movements, pressure, etc.,
@@ -158,7 +133,7 @@ impl Manager {
     /// Tools are ordered arbitrarily.
     #[must_use]
     pub fn tools(&self) -> &[tool::Tool] {
-        &self.state.tools.finished
+        self.internal.tools()
     }
     /// A tablet is the entry point for interactive devices, and the top level of the hierarchy
     /// which may expose several pads or tools.
@@ -166,34 +141,6 @@ impl Manager {
     /// Tablets are ordered arbitrarily.
     #[must_use]
     pub fn tablets(&self) -> &[tablet::Tablet] {
-        &self.state.tablets.finished
-    }
-    #[must_use]
-    fn make_summary(&self) -> events::summary::Summary {
-        let try_summarize = || -> Option<events::summary::Summary> {
-            let sum = self.state.summary.clone()?;
-
-            let tablet = self
-                .tablets()
-                .iter()
-                .find(|tab| tab.obj_id == sum.tablet_id)?;
-            let tool = self.tools().iter().find(|tab| tab.obj_id == sum.tool_id)?;
-            Some(events::summary::Summary {
-                tool: events::summary::ToolState::In(events::summary::InState {
-                    tablet,
-                    tool,
-                    pose: sum.pose,
-                    down: sum.down,
-                    timestamp: Some(sum.time),
-                }),
-                pads: &[],
-            })
-        };
-
-        // try block pls..
-        try_summarize().unwrap_or(events::summary::Summary {
-            tool: events::summary::ToolState::Out,
-            pads: &[],
-        })
+        self.internal.tablets()
     }
 }

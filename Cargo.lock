@@ -1048,6 +1048,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "enum_dispatch"
+version = "0.3.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f33313078bb8d4d05a2733a94ac4c2d8a0df9a2b84424ebf4f33bfc224a890e"
+dependencies = [
+ "once_cell",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.48",
+]
+
+[[package]]
 name = "enumflags2"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3586,7 +3598,9 @@ name = "wl-tablet"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.4.2",
+ "cfg_aliases 0.2.0",
  "eframe",
+ "enum_dispatch",
  "raw-window-handle 0.6.0",
  "softbuffer",
  "strum",
@@ -3596,6 +3610,7 @@ dependencies = [
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",
+ "windows 0.52.0",
  "winit",
 ]
 

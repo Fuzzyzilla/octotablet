@@ -2,10 +2,9 @@ use eframe::{
     egui::{self, Frame, RichText},
     emath::Align2,
     epaint::{Color32, FontId, Shape, Stroke, Vec2},
-    CreationContext, EventLoopBuilder,
+    CreationContext,
 };
 use raw_window_handle::HasDisplayHandle;
-use winit::platform::wayland::EventLoopBuilderExtWayland;
 use wl_tablet::{
     events::summary::{InState, Summary},
     tablet::UsbId,
@@ -13,13 +12,9 @@ use wl_tablet::{
 };
 
 fn main() {
-    // Dont persist, require wayland.
     let native_options = eframe::NativeOptions {
         persist_window: false,
         viewport: egui::ViewportBuilder::default().with_inner_size(Vec2 { x: 600.0, y: 500.0 }),
-        event_loop_builder: Some(Box::new(|event_loop: &mut EventLoopBuilder<_>| {
-            event_loop.with_wayland();
-        })),
         // Im stupid and don't want to figure out how to make the
         // colors dynamic, they only work on Dark lol
         default_theme: eframe::Theme::Dark,
@@ -36,7 +31,7 @@ fn main() {
 
 /// Main app, displaying info and a [test area](ShowPen).
 struct Viewer {
-    manager: Result<wl_tablet::Manager, wl_tablet::ManagerError>,
+    manager: Result<wl_tablet::Manager, wl_tablet::builder::BuildError>,
 }
 impl Viewer {
     fn new(context: &CreationContext<'_>) -> Self {
@@ -53,7 +48,7 @@ impl eframe::App for Viewer {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Drop the tablet, since our connection to the server is soon over.
         // Replace with dummy err.
-        self.manager = Err(wl_tablet::ManagerError::Unsupported);
+        self.manager = Err(wl_tablet::builder::BuildError::Unsupported);
     }
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Access tablets, or show a message and bail if failed.
@@ -79,9 +74,8 @@ impl eframe::App for Viewer {
             // Arbitrary time that should be fast enough for even the fanciest of monitors x3
             ctx.request_repaint_after(std::time::Duration::from_secs_f32(1.0 / 144.0));
         } else {
-            // poll every second for new events. (Egui will not necessarily
-            // notice the tablet input and so won't repaint on it's own!)
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            // poll for new events. (Egui will not necessarily notice the tablet input and so won't repaint on its own!)
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
 
         // Show an area to test various axes
