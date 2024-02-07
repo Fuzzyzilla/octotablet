@@ -72,10 +72,10 @@ impl eframe::App for Viewer {
         };
         // FIXME: only do when interacting!
         let has_tools = !manager.tools().is_empty();
-        let events = manager.pump().unwrap();
+        let summary = manager.pump().unwrap().summarize();
 
-        // Copy iter and examine, if there are any events then request a redraw.
-        if events.into_iter().next().is_some() {
+        // If an interaction is ongoing, request redraws often.
+        if matches!(summary.tool, wl_tablet::events::summary::ToolState::In(_)) {
             // Arbitrary time that should be fast enough for even the fanciest of monitors x3
             ctx.request_repaint_after(std::time::Duration::from_secs_f32(1.0 / 144.0));
         } else {
@@ -88,11 +88,7 @@ impl eframe::App for Viewer {
         egui::TopBottomPanel::bottom("viewer")
             .exact_height(ctx.available_rect().height() / 2.0)
             .frame(Frame::canvas(&ctx.style()))
-            .show_animated(ctx, has_tools, |ui| {
-                ui.add(ShowPen {
-                    summary: events.summarize(),
-                })
-            });
+            .show_animated(ctx, has_tools, |ui| ui.add(ShowPen { summary }));
 
         // Show an info panel listing connected devices and their capabilities
         egui::CentralPanel::default().show(ctx, |ui| {

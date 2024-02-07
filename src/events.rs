@@ -10,7 +10,12 @@
 use std::fmt::Debug;
 pub mod summary;
 
-use crate::{pad::Pad, tablet::Tablet, tool::Tool, Manager};
+use crate::{
+    pad::{Pad, PadGroup},
+    tablet::Tablet,
+    tool::Tool,
+    Manager,
+};
 
 /// An opaque, monotonic timestamp with unspecified epoch.
 /// The precision of this is given by [`crate::Manager::timestamp_resolution`].
@@ -214,14 +219,28 @@ pub enum TabletEvent {
 }
 /// Events associated with a specific `Pad`.
 #[derive(Clone, Copy, Debug)]
-pub enum PadEvent {
+pub enum PadEvent<'a> {
+    /// The pad is new. May be enumerated at the start of the program,
+    /// may be newly plugged in, or sent immediately before its first use.
     Added,
+    /// Unplugged or otherwise becomes unavailable. The pad will be removed from the hardware report.
     Removed,
-    Enter,
-    Exit,
-    Button(),
-    Ring,
-    Slider,
+    Group {
+        group: &'a PadGroup,
+        event: PadGroupEvent,
+    }, //Enter,
+       //Exit,
+}
+/// Events associated with a specific `Pad`.
+#[derive(Clone, Copy, Debug)]
+pub enum PadGroupEvent {
+    /// The tablet is new. May be enumerated at the start of the program,
+    /// may be newly plugged in, or sent immediately before its first use.
+    Added,
+    /// Unplugged or otherwise becomes unavailable. The tablet will be removed from the hardware report.
+    Removed,
+    //Enter,
+    //Exit,
 }
 #[derive(Clone, Copy, Debug)]
 pub enum Event<'a> {
@@ -235,7 +254,7 @@ pub enum Event<'a> {
     },
     Pad {
         pad: &'a Pad,
-        event: PadEvent,
+        event: PadEvent<'a>,
     },
 }
 

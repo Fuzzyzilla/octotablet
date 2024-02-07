@@ -55,7 +55,6 @@ impl HasWlId for Pad {
             // 0 is the default and what the protocol specifies should be used if
             // the constructor for this value is never sent.
             button_count: 0,
-            feedback: None,
         }
     }
     fn id(&self) -> &ObjectId {
@@ -268,47 +267,6 @@ impl Dispatch<wl_tablet::zwp_tablet_v2::ZwpTabletV2, ()> for TabletState {
         }
     }
 }
-impl Dispatch<wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for TabletState {
-    fn event(
-        this: &mut Self,
-        pad: &wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2,
-        event: wl_tablet::zwp_tablet_pad_v2::Event,
-        (): &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        use wl_tablet::zwp_tablet_pad_v2::Event;
-        #[allow(clippy::match_same_arms)]
-        match event {
-            // ======= Constructor databurst =========
-            Event::Group { .. } => (),
-            Event::Path { .. } => (),
-            Event::Buttons { buttons } => {
-                let ctor = this.pads.get_or_insert_ctor(pad.id()).unwrap();
-                ctor.button_count = buttons;
-            }
-            Event::Done => {
-                this.pads.done(&pad.id());
-            }
-            Event::Removed => {
-                this.pads.destroy(&pad.id());
-            }
-            // ======== Interaction data =========
-            Event::Button { .. } => (),
-            Event::Enter { .. } => (),
-            Event::Leave { .. } => (),
-            // ne
-            _ => (),
-        }
-    }
-    wayland_client::event_created_child!(
-        TabletState,
-        wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2,
-        [
-            wl_tablet::zwp_tablet_pad_v2::EVT_GROUP_OPCODE => (wl_tablet::zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, ()),
-        ]
-    );
-}
 impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletState {
     #[allow(clippy::too_many_lines)]
     fn event(
@@ -478,6 +436,48 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
         }
     }
 }
+impl Dispatch<wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for TabletState {
+    fn event(
+        this: &mut Self,
+        pad: &wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2,
+        event: wl_tablet::zwp_tablet_pad_v2::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use wl_tablet::zwp_tablet_pad_v2::Event;
+        #[allow(clippy::match_same_arms)]
+        match event {
+            // ======= Constructor databurst =========
+            Event::Group { .. } => (),
+            Event::Path { .. } => (),
+            Event::Buttons { buttons } => {
+                let ctor = this.pads.get_or_insert_ctor(pad.id()).unwrap();
+                ctor.button_count = buttons;
+            }
+            Event::Done => {
+                this.pads.done(&pad.id());
+            }
+            Event::Removed => {
+                this.pads.destroy(&pad.id());
+            }
+            // ======== Interaction data =========
+            Event::Button { .. } => (),
+            Event::Enter { .. } => (),
+            Event::Leave { .. } => (),
+            // ne
+            _ => (),
+        }
+        println!("pad {event:?}");
+    }
+    wayland_client::event_created_child!(
+        TabletState,
+        wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2,
+        [
+            wl_tablet::zwp_tablet_pad_v2::EVT_GROUP_OPCODE => (wl_tablet::zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, ()),
+        ]
+    );
+}
 impl Dispatch<wl_tablet::zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, ()> for TabletState {
     fn event(
         _: &mut Self,
@@ -487,9 +487,6 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, ()> for T
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // When receiving events from the wl_registry, we are only interested in the
-        // `global` event, which signals a new available global.
-        // When receiving this event, we just print its characteristics in this example.
         println!("pad group {event:?}");
     }
     wayland_client::event_created_child!(
@@ -497,6 +494,7 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, ()> for T
         wl_tablet::zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2,
         [
             wl_tablet::zwp_tablet_pad_group_v2::EVT_RING_OPCODE => (wl_tablet::zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2, ()),
+            wl_tablet::zwp_tablet_pad_group_v2::EVT_STRIP_OPCODE => (wl_tablet::zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2, ()),
         ]
     );
 }
@@ -509,9 +507,18 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2, ()> for Tab
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // When receiving events from the wl_registry, we are only interested in the
-        // `global` event, which signals a new available global.
-        // When receiving this event, we just print its characteristics in this example.
         println!("ring {event:?}");
+    }
+}
+impl Dispatch<wl_tablet::zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2, ()> for TabletState {
+    fn event(
+        _: &mut Self,
+        _ring: &wl_tablet::zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2,
+        event: wl_tablet::zwp_tablet_pad_strip_v2::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        println!("strip {event:?}");
     }
 }
