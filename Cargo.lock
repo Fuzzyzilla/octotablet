@@ -2005,6 +2005,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "octotablet"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.4.2",
+ "cfg_aliases 0.2.0",
+ "eframe",
+ "enum_dispatch",
+ "raw-window-handle 0.6.0",
+ "softbuffer",
+ "strum",
+ "thiserror",
+ "tiny-skia",
+ "usb-ids",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "windows 0.52.0",
+ "winit",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3591,27 +3612,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7cad8365489051ae9f054164e459304af2e7e9bb407c958076c8bf4aef52da5"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "wl-tablet"
-version = "0.1.0"
-dependencies = [
- "bitflags 2.4.2",
- "cfg_aliases 0.2.0",
- "eframe",
- "enum_dispatch",
- "raw-window-handle 0.6.0",
- "softbuffer",
- "strum",
- "thiserror",
- "tiny-skia",
- "usb-ids",
- "wayland-backend",
- "wayland-client",
- "wayland-protocols",
- "windows 0.52.0",
- "winit",
 ]
 
 [[package]]

@@ -1,8 +1,13 @@
+//! Builder-style configuration for connecting to the system tablet API.
+//!
+//! For a default configuration, `Builder::new().build_{shared, raw}` is all you need!
+
 use crate::{Backing, Manager};
 
 #[derive(thiserror::Error, Debug)]
 pub enum BuildError {
     /// The given window handle doesn't use a supported connection type.
+    /// This includes cases where the platform is otherwise supported but the feature was disabled at compile-time.
     #[error("handle doesn't contain a supported display type")]
     Unsupported,
     /// Failed to acquire a window handle
@@ -16,6 +21,7 @@ impl From<raw_window_handle::HandleError> for BuildError {
     }
 }
 
+/// Pre-construction configuration for a [`Manager`].
 #[derive(Default)]
 pub struct Builder {}
 

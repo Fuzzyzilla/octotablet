@@ -4,12 +4,14 @@ use eframe::{
     epaint::{Color32, FontId, Shape, Stroke, Vec2},
     CreationContext,
 };
-use raw_window_handle::HasDisplayHandle;
-use wl_tablet::{
-    events::summary::{InState, Summary},
+use octotablet::{
+    builder::{BuildError, Builder},
+    events::summary::{InState, Summary, ToolState},
     tablet::UsbId,
     tool::{AvailableAxes, Axis},
+    Manager,
 };
+use raw_window_handle::HasDisplayHandle;
 
 fn main() {
     let native_options = eframe::NativeOptions {
@@ -31,7 +33,7 @@ fn main() {
 
 /// Main app, displaying info and a [test area](ShowPen).
 struct Viewer {
-    manager: Result<wl_tablet::Manager, wl_tablet::builder::BuildError>,
+    manager: Result<Manager, BuildError>,
 }
 impl Viewer {
     fn new(context: &CreationContext<'_>) -> Self {
@@ -39,7 +41,7 @@ impl Viewer {
         Self {
             // Safety: Destroyed in `on_exit`, before we lose the display.
             manager: unsafe {
-                wl_tablet::Builder::new().build_raw(context.display_handle().unwrap().as_raw())
+                Builder::new().build_raw(context.display_handle().unwrap().as_raw())
             },
         }
     }
@@ -48,7 +50,7 @@ impl eframe::App for Viewer {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Drop the tablet, since our connection to the server is soon over.
         // Replace with dummy err.
-        self.manager = Err(wl_tablet::builder::BuildError::Unsupported);
+        self.manager = Err(BuildError::Unsupported);
     }
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Access tablets, or show a message and bail if failed.
@@ -70,7 +72,7 @@ impl eframe::App for Viewer {
         let summary = manager.pump().unwrap().summarize();
 
         // If an interaction is ongoing, request redraws often.
-        if matches!(summary.tool, wl_tablet::events::summary::ToolState::In(_)) {
+        if matches!(summary.tool, ToolState::In(_)) {
             // Arbitrary time that should be fast enough for even the fanciest of monitors x3
             ctx.request_repaint_after(std::time::Duration::from_secs_f32(1.0 / 144.0));
         } else {
@@ -89,7 +91,7 @@ impl eframe::App for Viewer {
             egui::ScrollArea::vertical()
                 .auto_shrink(false)
                 .show(ui, |ui| {
-                    ui.label(RichText::new("wl-tablet viewer ~ Connected :3").heading());
+                    ui.label(RichText::new("Octotablet viewer ~ Connected! 🐙").heading());
                     ui.separator();
 
                     ui.label("Tablets");
@@ -201,7 +203,7 @@ impl egui::Widget for ShowPen<'_> {
         // Just play with the axes a bit to make something look nice :3
         // All of the math fiddling and constants are just for aesthetics, little of it means anything lol
         // Visualize as much as we can so we can tell at a glance everything is working.
-        if let wl_tablet::events::summary::ToolState::In(state) = self.summary.tool {
+        if let ToolState::In(state) = self.summary.tool {
             // ======= Interation text ======
             {
                 // Show the name

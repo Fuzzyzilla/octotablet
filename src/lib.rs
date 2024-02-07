@@ -1,8 +1,8 @@
-//! # Cross-platform Tablet, Pad, and Stylus interface
+//! # Cross-platform [Tablet](tablet), [Pad](pad), and [Stylus](tool) API 🐙✨
 //!
 //! Current plans are Wayland's *`tablet_unstable_v2`*, Windows Ink's `RealTimeStylus`, and X11's *`xinput`*, but aims to
-//! one day provide a unified API for tablet access across more platforms. Additionally, rather than providing the intersection
-//! of these platforms' capabilities, aims to expose the union of them such that no features are lost to abstraction.
+//! provide a unified API for tablet access across more platforms in the future. Additionally, rather than providing the intersection
+//! of these platforms' capabilities, it aims to expose the union of them such that no features are lost to abstraction.
 //!
 //! This library requires low-level access to the windowing server, which is provided
 //! by many windowing abstractions through the [`raw_window_handle`](https://crates.io/crates/raw-window-handle) crate.
@@ -27,7 +27,7 @@
 //! **Guarantees are made only when explicitly stated so!**
 //!
 //! ## Examples
-//! See [the examples directory](https://github.com/Fuzzyzilla/wl-tablet/tree/master/examples) for how
+//! See [the examples directory](https://github.com/Fuzzyzilla/octotablet/tree/master/examples) for how
 //! this can be integrated into `winit` or `eframe` projects.
 
 #![warn(clippy::pedantic)]

@@ -1,8 +1,19 @@
 [package]
-name = "wl-tablet"
+name = "octotablet"
 version = "0.1.0"
-authors = ["aspen <fuzzyzilla01@gmail.com>"]
+authors = ["Aspen <fuzzyzilla01@gmail.com>"]
 edition = "2021"
+categories = [
+    # lol, very few relavant ones. Notably nothing for platform abstraction :V
+    "os",
+]
+keywords = [
+    # Not wacom specific but this is the most well-known search query
+    "wacom",
+    "tablet",
+    "stylus",
+    "pen",
+]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

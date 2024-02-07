@@ -1,21 +1,23 @@
-# Unnamed Cross-Platform Tablet Library
+# Device-agnostic Cross-platform Tablet Library 🐙✨
 
-Work in progress high-level tablet/stylus input library with aspirations
-to be an easy-to-use cross-platform API without losing features to abstraction.
+Work in progress high-level tablet/pad/stylus library, reporting connected hardware features and providing easy-to-use
+event-based access to user input.
 
 ## Platform Support
-| Platform                             |       Support |
-|--------------------------------------|--------------:|
-| Linux/Wayland (`tablet_unstable_v2`) |      Full[^1] |
-| Windows (Ink `RealTimeStylus`)       |  In progress! |
-| Linux/X11 (`xinput`)                 |      I'll try |
-| Windows (`Winuser.h` Pointer API)    | I'll consider |
-| MacOS                                |   Help needed |
-| IOS                                  |   Help needed |
-| Android                              |   Help needed |
-| Windows (`wintab`, proprietary)      |   Not planned |
+| Platform                             |         Support |
+|--------------------------------------|----------------:|
+| Linux/Wayland (`tablet_unstable_v2`) | In progress[^1] |
+| Windows (Ink `RealTimeStylus`)       | In progress[^2] |
+| Linux/X11 (`xinput`)                 |        I'll try |
+| Windows (`Winuser.h` Pointer API)    |   I'll consider |
+| MacOS                                |     Help needed |
+| IOS                                  |     Help needed |
+| Android                              |     Help needed |
+| Windows (`wintab`, proprietary)      |     Not planned |
 
-[^1]: Compositor support/conformance for this protocol is hit or miss and some features may not work (to be expected from an unstable API I guess!).
+[^1]: Compositor support/conformance for this protocol is hit or miss and some features may not work (to be expected from an unstable API I guess!)
+[^2]: Pads and associated hardware are not exposed by the Ink API. Unsure where this information *is* reported, if anywhere.
+
 ## Device Support
 So far, tested on:
 * *Wacom Cintiq 16* \[DTK-1660\]
@@ -26,8 +28,9 @@ So far, tested on:
 * *XP-Pen Deco-01*
 
 ## Documenting
+By default, documentation contains the current platform's capabilities only (ie, building docs on windows will omit everything wayland-related).
 Run `rustdoc` with the `docsrs` cfg set in order to generate documentation for all platforms regardless of host platform:
 ```bash
 RUSTFLAGS="--cfg docsrs" cargo doc
 ```
-This is still restricted to enabled features.
+This is still restricted by enabled features.

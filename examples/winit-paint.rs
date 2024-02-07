@@ -1,8 +1,8 @@
 //! Simple winit example, using tiny-skia for drawing.
 //! Run under `--release` or it's horrifyingly slow!
 
+use octotablet::{builder::Builder, events::summary::ToolState, tool::Type};
 use winit::dpi::PhysicalSize;
-use wl_tablet::tool::Type;
 
 use winit::platform::pump_events::EventLoopExtPumpEvents;
 
@@ -28,9 +28,7 @@ fn main() {
     // Fetch the tablets, using our window's handle for access.
     // Since we `Arc'd` our window, we get the safety of `build_shared`. Where this is not possible,
     // `build_raw` is available as well!
-    let mut manager = wl_tablet::Builder::default()
-        .build_shared(window.clone())
-        .unwrap();
+    let mut manager = Builder::default().build_shared(window.clone()).unwrap();
 
     while !event_loop.exiting() {
         // Throttle the loop. Everything here will run *as fast as possible*
@@ -117,7 +115,7 @@ fn main() {
         // Todo: make this use events api instead of summary api, as is more correct for drawing app usecases.
         // If the pen is down, draw some pretty pictures! We do this by saving the last
         // known point, and drawing a line between that point and the current point.
-        if let wl_tablet::events::summary::ToolState::In(state) = sum.tool {
+        if let ToolState::In(state) = sum.tool {
             const BRUSH_SIZE: f32 = 20.0;
             // Ignore when not pressed.
             if !state.down {
