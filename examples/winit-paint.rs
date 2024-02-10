@@ -28,7 +28,7 @@ fn main() {
     // Fetch the tablets, using our window's handle for access.
     // Since we `Arc'd` our window, we get the safety of `build_shared`. Where this is not possible,
     // `build_raw` is available as well!
-    let mut manager = Builder::default().build_shared(window.clone()).unwrap();
+    let mut manager = Builder::default().build_shared(&window).unwrap();
 
     while !event_loop.exiting() {
         // Throttle the loop. Everything here will run *as fast as possible*

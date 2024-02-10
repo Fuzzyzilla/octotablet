@@ -27,9 +27,8 @@ pub struct Manager {
 impl Manager {
     /// Creates a tablet manager with from the given pointer to `wl_display`.
     /// # Safety
-    /// The given display pointer must be valid as long as the returned `Manager` is alive. The [`Backing`] parameter
-    /// is kept alive with the returned Manager, which can be used to uphold this requirement.
-    pub(crate) unsafe fn build_wayland_display(wl_display: *mut ()) -> Manager {
+    /// The given display pointer must be valid as long as the returned `Manager` is alive.
+    pub(crate) unsafe fn build_wayland_display(wl_display: *mut ()) -> Self {
         // Safety - deferred to this fn's contract
         let backend =
             unsafe { wayland_backend::client::Backend::from_foreign_display(wl_display.cast()) };

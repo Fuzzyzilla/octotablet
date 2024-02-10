@@ -80,27 +80,6 @@ pub(crate) trait PlatformImpl {
     #[must_use]
     fn make_summary(&self) -> crate::events::summary::Summary;
 }
-// temp :P
-impl PlatformImpl for std::convert::Infallible {
-    fn pump(&mut self) -> Result<(), crate::PumpError> {
-        match *self {}
-    }
-    fn timestamp_granularity(&self) -> Option<std::time::Duration> {
-        match *self {}
-    }
-    fn pads(&self) -> &[crate::pad::Pad] {
-        match *self {}
-    }
-    fn tools(&self) -> &[crate::tool::Tool] {
-        match *self {}
-    }
-    fn tablets(&self) -> &[crate::tablet::Tablet] {
-        match *self {}
-    }
-    fn make_summary(&self) -> crate::events::summary::Summary {
-        match *self {}
-    }
-}
 
 /// Static dispatch between compiled backends.
 /// Enum cause why not, (almost?) always has one variant and is thus compiles away to the inner type transparently.
@@ -110,5 +89,5 @@ pub(crate) enum PlatformManager {
     #[cfg(wl_tablet)]
     Wayland(wl::Manager),
     #[cfg(ink_rts)]
-    Ink(std::convert::Infallible),
+    Ink(ink::Manager),
 }

@@ -11,7 +11,6 @@ use octotablet::{
     tool::{AvailableAxes, Axis},
     Manager,
 };
-use raw_window_handle::HasDisplayHandle;
 
 fn main() {
     let native_options = eframe::NativeOptions {
@@ -40,9 +39,7 @@ impl Viewer {
         // Context gives us access to the handle, connect to the tablet server:
         Self {
             // Safety: Destroyed in `on_exit`, before we lose the display.
-            manager: unsafe {
-                Builder::new().build_raw(context.display_handle().unwrap().as_raw())
-            },
+            manager: unsafe { Builder::new().build_raw(context) },
         }
     }
 }
