@@ -16,7 +16,7 @@ use raw_window_handle::HasDisplayHandle;
 fn main() {
     let native_options = eframe::NativeOptions {
         persist_window: false,
-        viewport: egui::ViewportBuilder::default().with_inner_size(Vec2 { x: 600.0, y: 500.0 }),
+        viewport: egui::ViewportBuilder::default().with_inner_size(Vec2 { x: 800.0, y: 500.0 }),
         // Im stupid and don't want to figure out how to make the
         // colors dynamic, they only work on Dark lol
         default_theme: eframe::Theme::Dark,
@@ -34,6 +34,9 @@ fn main() {
 /// Main app, displaying info and a [test area](ShowPen).
 struct Viewer {
     manager: Result<Manager, BuildError>,
+    last_frame_time: std::time::Instant,
+    show_events: bool,
+    events_stream: std::collections::VecDeque<String>,
 }
 impl Viewer {
     fn new(context: &CreationContext<'_>) -> Self {
@@ -43,6 +46,9 @@ impl Viewer {
             manager: unsafe {
                 Builder::new().build_raw(context.display_handle().unwrap().as_raw())
             },
+            last_frame_time: std::time::Instant::now(),
+            show_events: false,
+            events_stream: std::collections::VecDeque::with_capacity(128),
         }
     }
 }
@@ -67,9 +73,9 @@ impl eframe::App for Viewer {
                 return;
             }
         };
-        // FIXME: only do when interacting!
         let has_tools = !manager.tools().is_empty();
-        let summary = manager.pump().unwrap().summarize();
+        let events = manager.pump().unwrap();
+        let summary = events.summarize();
 
         // If an interaction is ongoing, request redraws often.
         if matches!(summary.tool, ToolState::In(_)) {
@@ -79,6 +85,45 @@ impl eframe::App for Viewer {
             // poll for new events. (Egui will not necessarily notice the tablet input and so won't repaint on its own!)
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
+
+        // Format events.
+        let mut event_count = 0;
+        for event in events {
+            event_count += 1;
+            if self.events_stream.len() == self.events_stream.capacity() {
+                // remove top
+                let _ = self.events_stream.pop_front();
+            }
+            // add pretty-print at bottom!
+            self.events_stream.push_back(format!("{event:#?}"));
+        }
+        // Show an area to print events, if requested.
+        egui::SidePanel::right("events")
+            .exact_width(ctx.available_rect().width() / 3.0)
+            .show_animated(ctx, self.show_events, |ui| {
+                // Show speed:
+                let freq = event_count as f32 / self.last_frame_time.elapsed().as_secs_f32();
+                ui.label(
+                    RichText::new(format!("{freq:.01} events/sec",))
+                        .heading()
+                        .weak(),
+                );
+                // Show events:
+                egui::ScrollArea::new([false, true])
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Grid::new("events-grid")
+                            .num_columns(1)
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for message in &self.events_stream {
+                                    ui.label(message);
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
 
         // Show an area to test various axes
         egui::TopBottomPanel::bottom("viewer")
@@ -91,7 +136,11 @@ impl eframe::App for Viewer {
             egui::ScrollArea::vertical()
                 .auto_shrink(false)
                 .show(ui, |ui| {
-                    ui.label(RichText::new("Octotablet viewer ~ Connected! 🐙").heading());
+                    // Heading
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Octotablet viewer ~ Connected! 🐙").heading());
+                        ui.toggle_value(&mut self.show_events, "Show Events stream...")
+                    });
                     ui.separator();
 
                     ui.label("Tablets");
@@ -127,13 +176,13 @@ impl eframe::App for Viewer {
                             .tool_type
                             .as_ref()
                             .map_or("Unknown tool", |ty| ty.as_ref());
-                        let name = if let Some(id) = tool.id {
+                        let name = if let Some(id) = tool.hardware_id {
                             format!("{type_name} (ID: {id:08X})")
                         } else {
                             format!("{type_name} (ID Unknown)")
                         };
                         egui::CollapsingHeader::new(name)
-                            .id_source((tool.id, tool.wacom_id, idx))
+                            .id_source((tool.hardware_id, tool.wacom_id, idx))
                             .show(ui, |ui| {
                                 ui.label(format!("Wacom ID: {:08X?}", tool.wacom_id,));
                                 for axis in tool.available_axes.iter_axes() {
@@ -158,6 +207,9 @@ impl eframe::App for Viewer {
                     ui.separator();
                 });
         });
+
+        // Keep track of time
+        self.last_frame_time = std::time::Instant::now();
     }
 }
 
@@ -208,7 +260,7 @@ impl egui::Widget for ShowPen<'_> {
             {
                 // Show the name
                 let mut cursor = resp.rect.left_top();
-                let pen_name = match (state.tool.id, state.tool.tool_type) {
+                let pen_name = match (state.tool.hardware_id, state.tool.tool_type) {
                     (None, None) => "Unknown Tool".to_owned(),
                     (Some(id), None) => format!("{:08X}", id),
                     (None, Some(ty)) => ty.as_ref().to_string(),

@@ -24,13 +24,13 @@ pub enum ElementType {
 }
 
 pub struct Pad {
-    pub(crate) obj_id: crate::InternalID,
+    pub(crate) internal_id: crate::InternalID,
     pub button_count: u32,
 }
 impl std::fmt::Debug for Pad {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut this = fmt.debug_struct("Pad");
-        let _ = self.obj_id;
+        let _ = self.internal_id;
         this.field("button_count", &self.button_count);
         this.finish()
     }
@@ -55,7 +55,7 @@ impl std::fmt::Debug for Group {
 
 /// A continuous circular touch-sensitive area or scrollwheel, reporting absolute position in radians clockwise from "logical north."
 pub struct Ring {
-    pub(crate) obj_id: crate::InternalID,
+    pub(crate) internal_id: crate::InternalID,
     /// Granularity of the reported angle, if known. This does not affect the range of values.
     ///
     /// For example, if the ring reports a granularity of `32,768`, there are
@@ -65,7 +65,7 @@ pub struct Ring {
 impl std::fmt::Debug for Ring {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut this = fmt.debug_struct("PadRing");
-        let _ = self.obj_id;
+        let _ = self.internal_id;
         this.field("granularity", &self.granularity);
         this.finish()
     }
@@ -73,7 +73,7 @@ impl std::fmt::Debug for Ring {
 
 /// A touch-sensitive strip or slider, reporting absolute position in `0..=1` where 0 is "logical top/left."
 pub struct Strip {
-    pub(crate) obj_id: crate::InternalID,
+    pub(crate) internal_id: crate::InternalID,
     /// Granularity of the reported linear position, if known. This does not affect the range of values.
     ///
     /// For example, if the ring reports a granularity of `32,768`, there are
@@ -83,7 +83,7 @@ pub struct Strip {
 impl std::fmt::Debug for Strip {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut this = fmt.debug_struct("PadStrip");
-        let _ = self.obj_id;
+        let _ = self.internal_id;
         this.field("granularity", &self.granularity);
         this.finish()
     }

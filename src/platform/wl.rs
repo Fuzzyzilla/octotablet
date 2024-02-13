@@ -2,7 +2,8 @@
 //!
 //! Within this module, it is sound to assume `cfg(wl_tablet) == true`
 //! (compiling for a wayland target + has deps, or is building docs).
-use wayland_backend::client::ObjectId;
+use crate::events::raw as raw_events;
+pub type ID = wayland_backend::client::ObjectId;
 use wayland_client::{
     protocol::{wl_registry, wl_seat},
     Connection, Dispatch, Proxy, QueueHandle,
@@ -51,6 +52,7 @@ impl Manager {
 impl super::PlatformImpl for Manager {
     #[allow(clippy::missing_errors_doc)]
     fn pump(&mut self) -> Result<(), crate::PumpError> {
+        self.state.events.clear();
         self.queue.dispatch_pending(&mut self.state)?;
         Ok(())
     }
@@ -71,6 +73,9 @@ impl super::PlatformImpl for Manager {
     fn tablets(&self) -> &[crate::tablet::Tablet] {
         &self.state.tablets.finished
     }
+    fn raw_events(&self) -> super::RawEventsIter<'_> {
+        super::RawEventsIter::Wayland(self.state.events.iter())
+    }
     #[must_use]
     fn make_summary(&self) -> crate::events::summary::Summary {
         let try_summarize = || -> Option<crate::events::summary::Summary> {
@@ -79,11 +84,11 @@ impl super::PlatformImpl for Manager {
             let tablet = self
                 .tablets()
                 .iter()
-                .find(|tab| tab.obj_id.unwrap_wl() == &sum.tablet_id)?;
+                .find(|tab| tab.internal_id.unwrap_wl() == &sum.tablet_id)?;
             let tool = self
                 .tools()
                 .iter()
-                .find(|tab| tab.obj_id.unwrap_wl() == &sum.tool_id)?;
+                .find(|tab| tab.internal_id.unwrap_wl() == &sum.tool_id)?;
             Some(crate::events::summary::Summary {
                 tool: crate::events::summary::ToolState::In(crate::events::summary::InState {
                     tablet,
@@ -105,17 +110,17 @@ impl super::PlatformImpl for Manager {
 }
 
 pub trait HasWlId {
-    fn new_default(id: ObjectId) -> Self;
-    fn id(&self) -> &ObjectId;
+    fn new_default(id: ID) -> Self;
+    fn id(&self) -> &ID;
     /// Sent when constructors are done. Use this to
     /// make everything internally consistent.
     fn done(&mut self) {}
 }
 impl HasWlId for Tool {
-    fn new_default(id: ObjectId) -> Self {
+    fn new_default(id: ID) -> Self {
         Tool {
-            obj_id: InternalID::Wayland(id),
-            id: None,
+            internal_id: InternalID::Wayland(id),
+            hardware_id: None,
             wacom_id: None,
             available_axes: AvailableAxes::empty(),
             tool_type: None,
@@ -125,40 +130,40 @@ impl HasWlId for Tool {
             distance_unit: crate::tool::DistanceUnit::Unitless,
         }
     }
-    fn id(&self) -> &ObjectId {
-        self.obj_id.unwrap_wl()
+    fn id(&self) -> &ID {
+        self.internal_id.unwrap_wl()
     }
 }
 impl HasWlId for Tablet {
-    fn new_default(id: ObjectId) -> Self {
+    fn new_default(id: ID) -> Self {
         Tablet {
-            obj_id: InternalID::Wayland(id),
+            internal_id: InternalID::Wayland(id),
             name: String::new(),
             usb_id: None,
         }
     }
-    fn id(&self) -> &ObjectId {
-        self.obj_id.unwrap_wl()
+    fn id(&self) -> &ID {
+        self.internal_id.unwrap_wl()
     }
 }
 impl HasWlId for Pad {
-    fn new_default(id: ObjectId) -> Self {
+    fn new_default(id: ID) -> Self {
         Pad {
-            obj_id: InternalID::Wayland(id),
+            internal_id: InternalID::Wayland(id),
             // 0 is the default and what the protocol specifies should be used if
             // the constructor for this value is never sent.
             button_count: 0,
         }
     }
-    fn id(&self) -> &ObjectId {
-        self.obj_id.unwrap_wl()
+    fn id(&self) -> &ID {
+        self.internal_id.unwrap_wl()
     }
 }
 
 #[derive(Clone)]
 pub struct RawSummary {
-    pub tool_id: ObjectId,
-    pub tablet_id: ObjectId,
+    pub tool_id: ID,
+    pub tablet_id: ID,
     pub down: bool,
     pub pose: Pose,
     pub time: FrameTimestamp,
@@ -187,7 +192,7 @@ impl<T> Default for WlCollection<T> {
     }
 }
 impl<T: HasWlId> WlCollection<T> {
-    fn get_or_insert_ctor(&mut self, id: ObjectId) -> Result<&mut T, WlConstructError> {
+    fn get_or_insert_ctor(&mut self, id: ID) -> Result<&mut T, WlConstructError> {
         if self.finished.iter().any(|obj| obj.id() == &id) {
             return Err(WlConstructError::AlreadyFinished);
         }
@@ -200,7 +205,7 @@ impl<T: HasWlId> WlCollection<T> {
 
         Ok(&mut self.constructing[index])
     }
-    fn done(&mut self, id: &ObjectId) {
+    fn done(&mut self, id: &ID) {
         if let Some(finished_idx) = self.constructing.iter().position(|obj| obj.id() == id) {
             let mut finished_obj = self.constructing.remove(finished_idx);
             finished_obj.done();
@@ -209,25 +214,23 @@ impl<T: HasWlId> WlCollection<T> {
             self.finished.push(finished_obj);
         }
     }
-    fn destroy(&mut self, id: &ObjectId) {
+    fn destroy(&mut self, id: &ID) {
         self.constructing.retain(|obj| obj.id() != id);
         self.finished.retain(|obj| obj.id() != id);
     }
 }
 
 #[derive(Default)]
-pub struct TabletState {
-    pub seat: Option<wl_seat::WlSeat>,
-    pub manager: Option<wl_tablet::zwp_tablet_manager_v2::ZwpTabletManagerV2>,
-    pub tablet_seat: Option<wl_tablet::zwp_tablet_seat_v2::ZwpTabletSeatV2>,
-    pub tablets: WlCollection<Tablet>,
-    pub tools: WlCollection<Tool>,
-    pub pads: WlCollection<Pad>,
-    pub _groups: WlCollection<Pad>,
-    pub summary: Option<RawSummary>,
-    // We use linear scans to store multiple tablets.
-    // This simplifies the API at little cost, as we don't expect more than a handful at any given time.
-    pub pending_events: Vec<()>,
+struct TabletState {
+    seat: Option<wl_seat::WlSeat>,
+    manager: Option<wl_tablet::zwp_tablet_manager_v2::ZwpTabletManagerV2>,
+    tablet_seat: Option<wl_tablet::zwp_tablet_seat_v2::ZwpTabletSeatV2>,
+    tablets: WlCollection<Tablet>,
+    tools: WlCollection<Tool>,
+    pads: WlCollection<Pad>,
+    _groups: WlCollection<Pad>,
+    summary: Option<RawSummary>,
+    events: Vec<crate::events::raw::Event<ID>>,
 }
 impl TabletState {
     fn try_acquire_tablet_seat(&mut self, qh: &QueueHandle<Self>) {
@@ -342,7 +345,13 @@ impl Dispatch<wl_tablet::zwp_tablet_v2::ZwpTabletV2, ()> for TabletState {
         #[allow(clippy::match_same_arms)]
         match event {
             // ======= Constructor databurst =========
-            Event::Done => this.tablets.done(&tablet.id()),
+            Event::Done => {
+                this.events.push(raw_events::Event::Tablet {
+                    tablet: tablet.id(),
+                    event: raw_events::TabletEvent::Added,
+                });
+                this.tablets.done(&tablet.id());
+            }
             Event::Id { vid, pid } => {
                 // Convert to u16s (have been crammed into u32s...) and set, if any.
                 this.tablets.get_or_insert_ctor(tablet.id()).unwrap().usb_id = u16::try_from(vid)
@@ -354,7 +363,13 @@ impl Dispatch<wl_tablet::zwp_tablet_v2::ZwpTabletV2, ()> for TabletState {
                 this.tablets.get_or_insert_ctor(tablet.id()).unwrap().name = name;
             }
             Event::Path { .. } => (),
-            Event::Removed => this.tablets.destroy(&tablet.id()),
+            Event::Removed => {
+                this.events.push(raw_events::Event::Tablet {
+                    tablet: tablet.id(),
+                    event: raw_events::TabletEvent::Removed,
+                });
+                this.tablets.destroy(&tablet.id());
+            }
             // ne
             _ => (),
         }
@@ -402,7 +417,8 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
                 hardware_serial_lo,
             } => {
                 let ctor = this.tools.get_or_insert_ctor(tool.id()).unwrap();
-                ctor.id = Some(u64::from(hardware_serial_hi) << 32 | u64::from(hardware_serial_lo));
+                ctor.hardware_id =
+                    Some(u64::from(hardware_serial_hi) << 32 | u64::from(hardware_serial_lo));
             }
             Event::Type {
                 tool_type: wayland_client::WEnum::Value(tool_type),
@@ -424,11 +440,27 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
                 }
             }
             Event::Done => {
+                this.events.push(raw_events::Event::Tool {
+                    tool: tool.id(),
+                    event: raw_events::ToolEvent::Added,
+                });
                 this.tools.done(&tool.id());
             }
-            Event::Removed => this.tools.destroy(&tool.id()),
+            Event::Removed => {
+                this.events.push(raw_events::Event::Tool {
+                    tool: tool.id(),
+                    event: raw_events::ToolEvent::Removed,
+                });
+                this.tools.destroy(&tool.id());
+            }
             // ======== Interaction data =========
             Event::ProximityIn { tablet, .. } => {
+                this.events.push(raw_events::Event::Tool {
+                    tool: tool.id(),
+                    event: raw_events::ToolEvent::In {
+                        tablet: tablet.id(),
+                    },
+                });
                 this.summary = Some(RawSummary {
                     tablet_id: tablet.id(),
                     tool_id: tool.id(),
@@ -438,6 +470,10 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
                 });
             }
             Event::ProximityOut { .. } => {
+                this.events.push(raw_events::Event::Tool {
+                    tool: tool.id(),
+                    event: raw_events::ToolEvent::Out,
+                });
                 if this
                     .summary
                     .as_ref()
@@ -447,6 +483,10 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
                 }
             }
             Event::Down { .. } => {
+                this.events.push(raw_events::Event::Tool {
+                    tool: tool.id(),
+                    event: raw_events::ToolEvent::Down,
+                });
                 if let Some(summary) = &mut this.summary {
                     if summary.tool_id == tool.id() {
                         summary.down = true;
@@ -454,6 +494,10 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
                 }
             }
             Event::Up { .. } => {
+                this.events.push(raw_events::Event::Tool {
+                    tool: tool.id(),
+                    event: raw_events::ToolEvent::Up,
+                });
                 if let Some(summary) = &mut this.summary {
                     if summary.tool_id == tool.id() {
                         summary.down = false;
@@ -517,11 +561,22 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
             }
             Event::Frame { time } => {
                 if let Some(summary) = &mut this.summary {
+                    // HACK HACK HACK!!
+                    this.events.push(raw_events::Event::Tool {
+                        tool: tool.id(),
+                        event: raw_events::ToolEvent::Pose(summary.pose),
+                    });
                     if summary.tool_id == tool.id() {
                         summary.time =
                             FrameTimestamp(std::time::Duration::from_millis(u64::from(time)));
                     }
                 }
+                this.events.push(raw_events::Event::Tool {
+                    tool: tool.id(),
+                    event: raw_events::ToolEvent::Frame(Some(FrameTimestamp(
+                        std::time::Duration::from_millis(u64::from(time)),
+                    ))),
+                });
             }
 
             // ne

@@ -8,6 +8,7 @@
 //! If you're using the tools as a mouse-with-extras and only care about the final position, use summaries.
 
 use std::fmt::Debug;
+pub(crate) mod raw;
 pub mod summary;
 
 use crate::{
@@ -68,6 +69,13 @@ impl NicheF32 {
     pub fn get(self) -> Option<f32> {
         (!self.0.is_nan()).then_some(self.0)
     }
+    /// Create from an [`Option`]. `Some` and `None` variants will correspond exactly with return value of `self.get()`.
+    /// # Safety
+    /// The value must not be `Some(NaN)`.
+    pub unsafe fn from_option_unchecked(value: Option<f32>) -> Self {
+        debug_assert!(!value.is_some_and(f32::is_nan));
+        Self(value.unwrap_or(f32::NAN))
+    }
 }
 impl Default for NicheF32 {
     fn default() -> Self {
@@ -107,7 +115,8 @@ impl PartialEq<NicheF32> for f32 {
 
 /// Represents the state of all axes of a tool at some snapshot in time.
 ///
-/// **All axes are Non-`NaN`, finite values.**
+/// **All f32 axes are Non-`NaN`, finite values.** Nullable axes use unspecified NaN values to represent None, but
+/// their getter guarantees the fetched value, if any, is non-NaN.
 ///
 /// Interpretations of some axes require querying the `Tool` that generated this pose.
 ///
@@ -115,6 +124,9 @@ impl PartialEq<NicheF32> for f32 {
 /// There may be axis values that the tool does *not* advertise as available,
 /// and axes it advertises may be missing.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
+// that's not at all what this is, clippy!
+// private field is to uphold safety invariants.
+#[allow(clippy::manual_non_exhaustive)]
 pub struct Pose {
     /// X, Y position, in pixels from the top left of the associated compositor surface.
     /// This may have subpixel precision, and may exceed your window size in the negative or
@@ -152,6 +164,49 @@ pub struct Pose {
     pub wheel: Option<(f32, i32)>,
     /// Absolute slider position, if available. `-1..=1`, where zero is the "natural" position.
     pub slider: NicheF32,
+    /// There is a safety invariant we made to the user, we uphold it with a private field and unsafe ctor.
+    _private: (),
+}
+impl Pose {
+    /// Make a new pose from axis data.
+    /// # Safety
+    /// Invariant: all `f32` data must be non-null!
+    #[must_use]
+    pub unsafe fn new(
+        position: [f32; 2],
+        distance: Option<f32>,
+        pressure: Option<f32>,
+        tilt: Option<[f32; 2]>,
+        roll: Option<f32>,
+        wheel: Option<(f32, i32)>,
+        slider: Option<f32>,
+    ) -> Pose {
+        // Safeties: Non-NaN. this is deferred to this fn's contract.
+        let pose = Self {
+            position,
+            distance: unsafe { NicheF32::from_option_unchecked(distance) },
+            pressure: unsafe { NicheF32::from_option_unchecked(pressure) },
+            tilt,
+            roll: unsafe { NicheF32::from_option_unchecked(roll) },
+            wheel,
+            slider: unsafe { NicheF32::from_option_unchecked(slider) },
+            _private: (),
+        };
+        pose.debug_assert_not_nan();
+        pose
+    }
+    fn debug_assert_not_nan(&self) {
+        #[cfg(debug_assertions)]
+        {
+            assert!(!self.position[0].is_nan() && !self.position[1].is_nan());
+            if let Some(tilt) = self.tilt {
+                assert!(!tilt[0].is_nan() && !tilt[1].is_nan());
+            }
+            if let Some(wheel) = self.wheel {
+                assert!(!wheel.0.is_nan());
+            }
+        }
+    }
 }
 
 /// Events associated with a specific `Tool`.
@@ -204,10 +259,8 @@ pub enum ToolEvent<'a> {
     Frame(Option<FrameTimestamp>),
     /// The tool is no longer pressed.
     Up,
-    /// The tool has left sensing range or left the window region of the givent `tablet`.
-    Out {
-        tablet: &'a Tablet,
-    },
+    /// The tool has left sensing range or left the window region of the tablet.
+    Out,
 }
 /// Events associated with a specific `Tablet`.
 #[derive(Clone, Copy, Debug)]
@@ -292,11 +345,13 @@ impl<'manager> IntoIterator for Events<'manager> {
     fn into_iter(self) -> Self::IntoIter {
         EventIterator {
             manager: self.manager,
+            raw: self.manager.internal.raw_events(),
         }
     }
 }
-pub struct EventIterator<'manager> {
-    pub(crate) manager: &'manager Manager,
+pub struct EventIterator<'a> {
+    manager: &'a Manager,
+    raw: crate::platform::RawEventsIter<'a>,
 }
 impl<'manager> EventIterator<'manager> {
     /// Get access to the `Manager` that owns these devices and events.
@@ -308,6 +363,73 @@ impl<'manager> EventIterator<'manager> {
 impl<'manager> Iterator for EventIterator<'manager> {
     type Item = Event<'manager>;
     fn next(&mut self) -> Option<Self::Item> {
-        None
+        use raw::{
+            Event as RawEvent, PadEvent as RawPad, TabletEvent as RawTablet, ToolEvent as RawTool,
+        };
+        Some(match self.raw.next()? {
+            RawEvent::Tool { tool, event } => {
+                // A linear scan is gonna be much more efficient than the alternatives
+                // for any reasonable number of tools. If you have like.... 30 tools at once, then
+                // maybe binary search would eek out a win :P
+                let tool = self
+                    .manager
+                    .tools()
+                    .iter()
+                    .find(|t| t.internal_id == tool)
+                    .unwrap();
+                Event::Tool {
+                    tool,
+                    event: match event {
+                        RawTool::Added => ToolEvent::Added,
+                        RawTool::Removed => ToolEvent::Removed,
+                        RawTool::In { tablet } => ToolEvent::In {
+                            tablet: self
+                                .manager
+                                .tablets()
+                                .iter()
+                                .find(|t| t.internal_id == tablet)
+                                .unwrap(),
+                        },
+                        RawTool::Down => ToolEvent::Down,
+                        RawTool::Button(v) => ToolEvent::Button(v),
+                        RawTool::Pose(v) => ToolEvent::Pose(v),
+                        RawTool::Frame(v) => ToolEvent::Frame(v),
+                        RawTool::Up => ToolEvent::Up,
+                        RawTool::Out => ToolEvent::Out,
+                    },
+                }
+            }
+            RawEvent::Tablet { tablet, event } => {
+                let tablet = self
+                    .manager
+                    .tablets()
+                    .iter()
+                    .find(|t| t.internal_id == tablet)
+                    .unwrap();
+                Event::Tablet {
+                    tablet,
+                    event: match event {
+                        RawTablet::Added => TabletEvent::Added,
+                        RawTablet::Removed => TabletEvent::Removed,
+                    },
+                }
+            }
+            RawEvent::Pad { pad, event } => {
+                let pad = self
+                    .manager
+                    .pads()
+                    .iter()
+                    .find(|t| t.internal_id == pad)
+                    .unwrap();
+                Event::Pad {
+                    pad,
+                    event: match event {
+                        RawPad::Added => PadEvent::Added,
+                        RawPad::Group { .. } => todo!(),
+                        RawPad::Removed => PadEvent::Removed,
+                    },
+                }
+            }
+        })
     }
 }

@@ -11,9 +11,9 @@ pub(crate) mod wl;
 #[derive(Clone, Hash, Eq, PartialEq)]
 pub(crate) enum InternalID {
     #[cfg(wl_tablet)]
-    Wayland(wayland_backend::client::ObjectId),
+    Wayland(wl::ID),
     #[cfg(ink_rts)]
-    Ink(u32),
+    Ink(ink::ID),
 }
 impl std::fmt::Debug for InternalID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -29,10 +29,10 @@ impl std::fmt::Debug for InternalID {
 }
 
 /// Unwrappers. Impls are free to assume their IDs are always the right type, as there are no accessors
-/// and no way to share IDs between managers of different backends.
+/// and no way to share IDs between managers of different backends. Thus, the only way this can fail is e.g. the wayland
+/// backend creating an Ink ID.
 ///
 /// In most (all?) compilation environments, these are infallible and compile down to nothing, hence the inline (profile me :3).
-/// Regardless, the failure case is a logic error on the part of the implementation and should never be reached in practice.
 impl InternalID {
     // Move formatting and unwinding machinery out of the inline path.
     // Tested on compiler explorer, this being inline(never) does *not* prevent it from being elided entirely
@@ -63,6 +63,37 @@ impl InternalID {
         }
     }
 }
+#[cfg(wl_tablet)]
+impl From<wl::ID> for InternalID {
+    fn from(value: wl::ID) -> Self {
+        Self::Wayland(value)
+    }
+}
+#[cfg(ink_rts)]
+impl From<ink::ID> for InternalID {
+    fn from(value: ink::ID) -> Self {
+        Self::Ink(value)
+    }
+}
+
+pub(crate) enum RawEventsIter<'a> {
+    #[cfg(wl_tablet)]
+    Wayland(std::slice::Iter<'a, crate::events::raw::Event<wl::ID>>),
+    #[cfg(ink_rts)]
+    Ink(std::slice::Iter<'a, raw::Event<ink::ID>>),
+}
+impl Iterator for RawEventsIter<'_> {
+    type Item = crate::events::raw::Event<InternalID>;
+    fn next(&mut self) -> Option<Self::Item> {
+        // This is still a branch per iten, sadness! Not sure a cheaper way to go about it.
+        match self {
+            #[cfg(wl_tablet)]
+            Self::Wayland(wl) => wl.next().cloned().map(crate::events::raw::Event::id_into),
+            #[cfg(ink_rts)]
+            Self::Ink(ink) => ink.next().cloned().map(crate::events::raw::Event::id_into),
+        }
+    }
+}
 
 /// Trait that all platforms implement, giving the main `Manager` higher-level access to the black box.
 #[enum_dispatch::enum_dispatch]
@@ -77,6 +108,8 @@ pub(crate) trait PlatformImpl {
     fn tools(&self) -> &[crate::tool::Tool];
     #[must_use]
     fn tablets(&self) -> &[crate::tablet::Tablet];
+    #[must_use]
+    fn raw_events(&self) -> RawEventsIter<'_>;
     #[must_use]
     fn make_summary(&self) -> crate::events::summary::Summary;
 }
@@ -95,6 +128,9 @@ impl PlatformImpl for std::convert::Infallible {
         match *self {}
     }
     fn tablets(&self) -> &[crate::tablet::Tablet] {
+        match *self {}
+    }
+    fn raw_events(&self) -> RawEventsIter<'_> {
         match *self {}
     }
     fn make_summary(&self) -> crate::events::summary::Summary {
