@@ -36,7 +36,7 @@ struct Viewer {
     manager: Result<Manager, BuildError>,
     last_frame_time: std::time::Instant,
     show_events: bool,
-    events_stream: std::collections::VecDeque<String>,
+    events_stream: std::collections::VecDeque<(String, Color32)>,
 }
 impl Viewer {
     fn new(context: &CreationContext<'_>) -> Self {
@@ -95,35 +95,91 @@ impl eframe::App for Viewer {
                 let _ = self.events_stream.pop_front();
             }
             // add pretty-print at bottom!
-            self.events_stream.push_back(format!("{event:#?}"));
+            let pretty = match event {
+                octotablet::events::Event::Pad { .. }
+                | octotablet::events::Event::Tablet { .. } => {
+                    // default format
+                    (format!("{event:#?}"), Color32::WHITE)
+                }
+                octotablet::events::Event::Tool { tool, event } => {
+                    let id = tool.id();
+                    match event {
+                        octotablet::events::ToolEvent::Added => {
+                            (format!("Added tool {id:08X?}"), Color32::GREEN)
+                        }
+                        octotablet::events::ToolEvent::Removed => {
+                            (format!("Removed tool {id:08X?}"), Color32::RED)
+                        }
+                        octotablet::events::ToolEvent::In { tablet } => {
+                            let tab_id = tablet.id();
+                            (
+                                format!("Tool {id:08X?} in over {tab_id:08X?}"),
+                                Color32::YELLOW,
+                            )
+                        }
+                        octotablet::events::ToolEvent::Out => {
+                            (format!("Tool {id:08X?} out"), Color32::BROWN)
+                        }
+                        octotablet::events::ToolEvent::Down => {
+                            (format!("Tool {id:08X?} down"), Color32::LIGHT_BLUE)
+                        }
+                        octotablet::events::ToolEvent::Up => {
+                            (format!("Tool {id:08X?} up"), Color32::LIGHT_BLUE)
+                        }
+                        octotablet::events::ToolEvent::Pose(pose) => {
+                            (format!("Tool {id:08X?} {pose:#?}"), Color32::GRAY)
+                        }
+                        octotablet::events::ToolEvent::Button {
+                            button_id: button_idx,
+                            pressed,
+                        } => (
+                            format!(
+                                "Tool {id:08X?} Button {button_idx} {}",
+                                if pressed { "Pressed" } else { "Released" }
+                            ),
+                            if pressed {
+                                Color32::GREEN
+                            } else {
+                                Color32::RED
+                            },
+                        ),
+                        octotablet::events::ToolEvent::Frame(time) => {
+                            if let Some(time) = time {
+                                (format!("Frame {time:?}"), Color32::WHITE)
+                            } else {
+                                ("Frame".into(), Color32::WHITE)
+                            }
+                        }
+                    }
+                }
+            };
+            self.events_stream.push_back(pretty);
         }
         // Show an area to print events, if requested.
-        egui::SidePanel::right("events")
-            .exact_width(ctx.available_rect().width() / 3.0)
-            .show_animated(ctx, self.show_events, |ui| {
-                // Show speed:
-                let freq = event_count as f32 / self.last_frame_time.elapsed().as_secs_f32();
-                ui.label(
-                    RichText::new(format!("{freq:.01} events/sec",))
-                        .heading()
-                        .weak(),
-                );
-                // Show events:
-                egui::ScrollArea::new([false, true])
-                    .stick_to_bottom(true)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        egui::Grid::new("events-grid")
-                            .num_columns(1)
-                            .striped(true)
-                            .show(ui, |ui| {
-                                for message in &self.events_stream {
-                                    ui.label(message);
-                                    ui.end_row();
-                                }
-                            });
-                    });
-            });
+        egui::SidePanel::right("events").show_animated(ctx, self.show_events, |ui| {
+            // Show speed:
+            let freq = event_count as f32 / self.last_frame_time.elapsed().as_secs_f32();
+            ui.label(
+                RichText::new(format!("{freq:.01} events/sec",))
+                    .heading()
+                    .weak(),
+            );
+            // Show events:
+            egui::ScrollArea::new([false, true])
+                .stick_to_bottom(true)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Grid::new("events-grid")
+                        .num_columns(1)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (message, color) in &self.events_stream {
+                                ui.label(RichText::new(message).monospace().color(*color));
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
 
         // Show an area to test various axes
         egui::TopBottomPanel::bottom("viewer")
@@ -177,11 +233,14 @@ impl eframe::App for Viewer {
                             .as_ref()
                             .map_or("Unknown tool", |ty| ty.as_ref());
                         let name = if let Some(id) = tool.hardware_id {
-                            format!("{type_name} (ID: {id:08X})")
+                            format!(
+                                "{type_name:<7} ({:08X?} - Hardware ID: {id:08X})",
+                                tool.id()
+                            )
                         } else {
-                            format!("{type_name} (ID Unknown)")
+                            format!("{type_name:<7} ({:08X?} - Hardware ID Unknown", tool.id())
                         };
-                        egui::CollapsingHeader::new(name)
+                        egui::CollapsingHeader::new(RichText::new(name).monospace())
                             .id_source((tool.hardware_id, tool.wacom_id, idx))
                             .show(ui, |ui| {
                                 ui.label(format!("Wacom ID: {:08X?}", tool.wacom_id,));
@@ -287,10 +346,24 @@ impl egui::Widget for ShowPen<'_> {
                     format!("Showing all axes: {seen_axes:?}")
                 };
                 // Show the capabilities
-                painter.text(
+                let rect = painter.text(
                     cursor,
                     Align2::LEFT_TOP,
                     axes,
+                    FontId::default(),
+                    Color32::WHITE,
+                );
+                cursor.y += rect.height();
+                // Show pressed buttons
+                let buttons = if !state.pressed_buttons.is_empty() {
+                    format!("Pressing tool buttons {:04X?}", state.pressed_buttons)
+                } else {
+                    "No pressed tool buttons".to_owned()
+                };
+                painter.text(
+                    cursor,
+                    Align2::LEFT_TOP,
+                    buttons,
                     FontId::default(),
                     Color32::WHITE,
                 );
@@ -335,6 +408,7 @@ impl egui::Widget for ShowPen<'_> {
                     },
                 )
             }
+            // Draw a shape to visualize pressure and distance and such
             painter.add(make_pen_shape(&state, opacity));
         } else {
             painter.text(

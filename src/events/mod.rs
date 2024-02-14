@@ -43,11 +43,18 @@ impl std::ops::Sub for FrameTimestamp {
     }
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum NicheF32Error {
+    #[error("provided value was NaN")]
+    NaN,
+}
+
 /// An Option type where NaN is the niche.
 // Todo: manual Ord that makes it not partial.
 #[derive(Copy, Clone, PartialOrd)]
 pub struct NicheF32(f32);
 impl NicheF32 {
+    pub const NONE: NicheF32 = NicheF32(f32::NAN);
     /// Wrap a float in this niche, `NaN` coercing to `None`.
     // Not pub cause it might be a footgun lol
     #[must_use]
@@ -62,7 +69,7 @@ impl NicheF32 {
     /// Get a `None` niche.
     #[must_use]
     pub const fn new_none() -> Self {
-        Self(f32::NAN)
+        Self::NONE
     }
     /// Get the optional value within. If `Some`, guaranteed to not be `NaN`.
     #[must_use]
@@ -72,9 +79,20 @@ impl NicheF32 {
     /// Create from an [`Option`]. `Some` and `None` variants will correspond exactly with return value of `self.get()`.
     /// # Safety
     /// The value must not be `Some(NaN)`.
+    #[must_use]
     pub unsafe fn from_option_unchecked(value: Option<f32>) -> Self {
-        debug_assert!(!value.is_some_and(f32::is_nan));
-        Self(value.unwrap_or(f32::NAN))
+        unsafe { value.try_into().unwrap_unchecked() }
+    }
+}
+impl TryFrom<Option<f32>> for NicheF32 {
+    type Error = NicheF32Error;
+    fn try_from(value: Option<f32>) -> Result<Self, Self::Error> {
+        if value.is_some_and(f32::is_nan) {
+            Err(NicheF32Error::NaN)
+        } else {
+            // Not Some(NAN), so we can convert.
+            Ok(NicheF32(value.unwrap_or(f32::NAN)))
+        }
     }
 }
 impl Default for NicheF32 {
@@ -115,18 +133,16 @@ impl PartialEq<NicheF32> for f32 {
 
 /// Represents the state of all axes of a tool at some snapshot in time.
 ///
-/// **All f32 axes are Non-`NaN`, finite values.** Nullable axes use unspecified NaN values to represent None, but
-/// their getter guarantees the fetched value, if any, is non-NaN.
-///
 /// Interpretations of some axes require querying the `Tool` that generated this pose.
 ///
 /// # Quirks
-/// There may be axis values that the tool does *not* advertise as available,
-/// and axes it advertises may be missing.
+/// There may be axis values reported that the tool does *not* advertise as available,
+/// and axes it does advertise may be missing. These should not necessarily be written off entirely -
+/// sometimes it truly has the capability and just fails to advertise it!
+// I would *REALLY* like to make the fact that these f32's are non-NaN and finite an invariant, but I literally
+// cannot figure out an ergonomic way to do that. Private fields + read-only accessors is one way, but it sucks to use
+// for the client. Unsafe wrapper type feels terrible too. Weh!
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
-// that's not at all what this is, clippy!
-// private field is to uphold safety invariants.
-#[allow(clippy::manual_non_exhaustive)]
 pub struct Pose {
     /// X, Y position, in pixels from the top left of the associated compositor surface.
     /// This may have subpixel precision, and may exceed your window size in the negative or
@@ -145,9 +161,10 @@ pub struct Pose {
     /// Perpindicular pressure, if available. `0..=1`
     ///
     /// # Quirks
-    /// Full pressure may not correspond to `1.0`.
+    /// * Pressure is often non-linear, as configured by the user in the driver software.
+    /// * Full pressure may not correspond to `1.0`.
     pub pressure: NicheF32,
-    /// Absolute tilt in randians from perpendicular in the X and Y directions. That is, the first angle
+    /// Absolute tilt in radians from perpendicular in the X and Y directions. That is, the first angle
     /// describes the angle between the pen and the Z (perpendicular to the surface) axis along the XZ plane,
     /// and the second angle describes the angle between the pen and Z on the YZ plane.
     ///
@@ -164,38 +181,9 @@ pub struct Pose {
     pub wheel: Option<(f32, i32)>,
     /// Absolute slider position, if available. `-1..=1`, where zero is the "natural" position.
     pub slider: NicheF32,
-    /// There is a safety invariant we made to the user, we uphold it with a private field and unsafe ctor.
-    _private: (),
 }
 impl Pose {
-    /// Make a new pose from axis data.
-    /// # Safety
-    /// Invariant: all `f32` data must be non-null!
-    #[must_use]
-    pub unsafe fn new(
-        position: [f32; 2],
-        distance: Option<f32>,
-        pressure: Option<f32>,
-        tilt: Option<[f32; 2]>,
-        roll: Option<f32>,
-        wheel: Option<(f32, i32)>,
-        slider: Option<f32>,
-    ) -> Pose {
-        // Safeties: Non-NaN. this is deferred to this fn's contract.
-        let pose = Self {
-            position,
-            distance: unsafe { NicheF32::from_option_unchecked(distance) },
-            pressure: unsafe { NicheF32::from_option_unchecked(pressure) },
-            tilt,
-            roll: unsafe { NicheF32::from_option_unchecked(roll) },
-            wheel,
-            slider: unsafe { NicheF32::from_option_unchecked(slider) },
-            _private: (),
-        };
-        pose.debug_assert_not_nan();
-        pose
-    }
-    fn debug_assert_not_nan(&self) {
+    pub(crate) fn debug_assert_not_nan(&self) {
         #[cfg(debug_assertions)]
         {
             assert!(!self.position[0].is_nan() && !self.position[1].is_nan());
@@ -210,48 +198,51 @@ impl Pose {
 }
 
 /// Events associated with a specific `Tool`.
-/// Events are logically grouped into "Frames" representing grouping
-/// of events in time, providing the timestamp that the group's events
-/// occured at if available.
+/// Events other than Added and Removed are logically grouped into "Frames" representing grouping
+/// of events in time, providing the timestamp that the group's events occured at if available.
 /// Events within a frame are arbitrarily ordered and to be interpreted
 /// as having happened similtaneously.
 ///
 /// For example,
 /// <pre>
-///   /Added
-///   |In
-///   |Axes
-///   \Frame
-///   /Axes
-///   |Down
-///   |Button
-///   \Frame
+/// -Added
+/// /In
+/// |Pose
+/// \Frame
+/// /Pose
+/// |Button
+/// \Frame
+/// /Pose
+/// |Out
+/// \Frame
+/// -Removed
 /// </pre>
 #[derive(Clone, Copy, Debug)]
 pub enum ToolEvent<'a> {
     /// The tool is new. May be enumerated at the start of the program,
-    /// or sent immediately before its first use.
+    /// or sent immediately before its first use. This is not part of a `Frame`.
     Added,
     /// The tool will no longer send events. It is undefined under what situation this occurs -
     /// it could be on `Out`, when the tablet that discovered it is disconnected, or never.
-    /// The tool may immediately be added again before next use, use its [hardware id](crate::tool::Tool::id)
+    /// The tool may immediately be added again before next use, use its [hardware id](crate::tool::Tool::hardware_id)
     /// to re-associate it with its past self.
+    ///
+    /// This is not part of a `Frame`.
     Removed,
     /// The tool has entered sensing range or entered the window region over the given `tablet`.
     /// Note that this is subject to filtering by the OS -
     /// you may or may not recieve this event when the pen enters sensing range
     /// above a different window.
-    In {
-        tablet: &'a Tablet,
-    },
+    In { tablet: &'a Tablet },
     /// The tool is considered "pressed." It is implementation defined what the exact semantics are,
     /// but you should treat this as a click or command to start drawing.
     ///
     /// For a pen, this could be contact with the surface with some threshold of force.
     /// For an Airbrush, lens, or mouse, this could be a button.
     Down,
-    Button(()),
-    /// A snapshot of all axes at this point in time
+    /// A button on the tool was pressed or released. *This is not an index!*
+    Button { button_id: u32, pressed: bool },
+    /// A snapshot of all axes at this point in time. See [`Pose`] for quirks.
     // This single variant is so much larger than all the others and inflates the whole
     // event enum by over 2x D:
     Pose(Pose),
@@ -391,7 +382,9 @@ impl<'manager> Iterator for EventIterator<'manager> {
                                 .unwrap(),
                         },
                         RawTool::Down => ToolEvent::Down,
-                        RawTool::Button(v) => ToolEvent::Button(v),
+                        RawTool::Button { button_id, pressed } => {
+                            ToolEvent::Button { button_id, pressed }
+                        }
                         RawTool::Pose(v) => ToolEvent::Pose(v),
                         RawTool::Frame(v) => ToolEvent::Frame(v),
                         RawTool::Up => ToolEvent::Up,

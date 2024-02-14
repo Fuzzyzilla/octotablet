@@ -79,7 +79,7 @@ impl super::PlatformImpl for Manager {
     #[must_use]
     fn make_summary(&self) -> crate::events::summary::Summary {
         let try_summarize = || -> Option<crate::events::summary::Summary> {
-            let sum = self.state.summary.clone()?;
+            let sum = self.state.summary.as_ref()?;
 
             let tablet = self
                 .tablets()
@@ -95,6 +95,7 @@ impl super::PlatformImpl for Manager {
                     tool,
                     pose: sum.pose,
                     down: sum.down,
+                    pressed_buttons: &sum.buttons,
                     timestamp: Some(sum.time),
                 }),
                 pads: &[],
@@ -131,6 +132,8 @@ impl HasWlId for Tool {
         }
     }
     fn id(&self) -> &ID {
+        // Unwrap OK - We only ever create `Wayland` instances, and it's not possible
+        // for an externally created instance to get in here.
         self.internal_id.unwrap_wl()
     }
 }
@@ -143,6 +146,8 @@ impl HasWlId for Tablet {
         }
     }
     fn id(&self) -> &ID {
+        // Unwrap OK - We only ever create `Wayland` instances, and it's not possible
+        // for an externally created instance to get in here.
         self.internal_id.unwrap_wl()
     }
 }
@@ -156,17 +161,21 @@ impl HasWlId for Pad {
         }
     }
     fn id(&self) -> &ID {
+        // Unwrap OK - We only ever create `Wayland` instances, and it's not possible
+        // for an externally created instance to get in here.
         self.internal_id.unwrap_wl()
     }
 }
 
 #[derive(Clone)]
-pub struct RawSummary {
-    pub tool_id: ID,
-    pub tablet_id: ID,
-    pub down: bool,
-    pub pose: Pose,
-    pub time: FrameTimestamp,
+struct RawSummary {
+    tool_id: ID,
+    tablet_id: ID,
+    down: bool,
+    pose: Pose,
+    // Names of the currently held buttons.
+    buttons: smallvec::SmallVec<[u32; 4]>,
+    time: FrameTimestamp,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -220,6 +229,31 @@ impl<T: HasWlId> WlCollection<T> {
     }
 }
 
+/// only one or none of these events may happen per tool per frame.
+#[derive(PartialEq, Eq)]
+enum FrameState {
+    In(ID),
+    Out,
+    Down,
+    Up,
+}
+
+/// Keeps track of partial frame data that's in the processes of being assembled from messages.
+struct FrameInProgress {
+    tool: ID,
+    state_transition: Option<FrameState>,
+    position: Option<[f32; 2]>,
+    distance: Option<f32>,
+    pressure: Option<f32>,
+    tilt: Option<[f32; 2]>,
+    roll: Option<f32>,
+    wheel: Option<(f32, i32)>,
+    slider: Option<f32>,
+    // Stream of button events that happened during this frame.
+    // By the nature of frames, these are considered to have happened at the same time, but order is still preserved.
+    buttons: smallvec::SmallVec<[(u32, bool); 1]>,
+}
+
 #[derive(Default)]
 struct TabletState {
     seat: Option<wl_seat::WlSeat>,
@@ -230,9 +264,136 @@ struct TabletState {
     pads: WlCollection<Pad>,
     _groups: WlCollection<Pad>,
     summary: Option<RawSummary>,
+    frames_in_progress: Vec<FrameInProgress>,
     events: Vec<crate::events::raw::Event<ID>>,
 }
 impl TabletState {
+    fn drop_tool(&mut self, tool: &ID) {
+        self.tools.destroy(tool);
+        self.frames_in_progress.retain(|frame| &frame.tool != tool);
+    }
+    // Create or get the partially built frame.
+    fn frame_in_progress(&mut self, tool: ID) -> &mut FrameInProgress {
+        let pos = self
+            .frames_in_progress
+            .iter()
+            .position(|frame| frame.tool == tool);
+        if let Some(pos) = pos {
+            &mut self.frames_in_progress[pos]
+        } else {
+            self.frames_in_progress.push(FrameInProgress {
+                tool,
+                state_transition: None,
+                position: None,
+                distance: None,
+                pressure: None,
+                tilt: None,
+                roll: None,
+                wheel: None,
+                slider: None,
+                buttons: smallvec::SmallVec::new(),
+            });
+            self.frames_in_progress.last_mut().unwrap()
+        }
+    }
+    fn frame(&mut self, tool: &ID, millis: u32) {
+        // Emit the frame. Notably, we leave the frame intact - only changed values are reported by the server,
+        // so this allows previous values to be inherited.
+        let clear = if let Some(frame) = self
+            .frames_in_progress
+            .iter_mut()
+            .find(|frame| &frame.tool == tool)
+        {
+            // Provide strong ordering of events within a frame in an intuitive way, despite the fact that
+            // they're to be interpreted as all having happened similtaneously. Explicitly not an API-level guarantee, should it be?
+
+            // emit ins and downs first...
+            match frame.state_transition {
+                Some(FrameState::In(ref tablet)) => self.events.push(raw_events::Event::Tool {
+                    tool: tool.clone(),
+                    event: raw_events::ToolEvent::In {
+                        tablet: tablet.clone(),
+                    },
+                }),
+                Some(FrameState::Down) => self.events.push(raw_events::Event::Tool {
+                    tool: tool.clone(),
+                    event: raw_events::ToolEvent::Down,
+                }),
+                _ => (),
+            }
+            // Emit pose...
+            // Position is the only required axis.
+            // We explicity do *not* check that the reported axes line up with the capabilities of the tool.
+            // The reported capabilities often lie - we leave this to the user to handle, by just reporting every
+            // axis it gave data for with no regard for capabilities.
+            if let Some(position) = frame.position.filter(|[x, y]| !x.is_nan() && !y.is_nan()) {
+                // Filter to prevent NaN's. This is not currently an invariant we guarantee since I can't figure out how
+                // to ergonomically express it at the type level, but the legwork is already done:
+                let pose = Pose {
+                    position,
+                    // Try to make the Option into Niche'd option. If NaN, fail back to None.
+                    distance: frame.distance.try_into().unwrap_or(NicheF32::NONE),
+                    pressure: frame.pressure.try_into().unwrap_or(NicheF32::NONE),
+                    roll: frame.roll.try_into().unwrap_or(NicheF32::NONE),
+                    slider: frame.slider.try_into().unwrap_or(NicheF32::NONE),
+                    tilt: frame.tilt.filter(|[x, y]| !x.is_nan() && !y.is_nan()),
+                    wheel: frame.wheel.filter(|(delta, _)| !delta.is_nan()),
+                };
+                // Make double extra sure!
+                pose.debug_assert_not_nan();
+
+                self.events.push(raw_events::Event::Tool {
+                    tool: tool.clone(),
+                    event: raw_events::ToolEvent::Pose(pose),
+                });
+            }
+            // Emit buttons...
+            for &(button_id, pressed) in &frame.buttons {
+                self.events.push(raw_events::Event::Tool {
+                    tool: tool.clone(),
+                    event: raw_events::ToolEvent::Button { button_id, pressed },
+                });
+            }
+            // emit ups and outs last... Return true from Out to mark the frame for clearing.
+            let clear = match frame.state_transition {
+                Some(FrameState::Up) => {
+                    self.events.push(raw_events::Event::Tool {
+                        tool: tool.clone(),
+                        event: raw_events::ToolEvent::Up,
+                    });
+                    // We're still In - leave the frame intact.
+                    false
+                }
+                Some(FrameState::Out) => {
+                    self.events.push(raw_events::Event::Tool {
+                        tool: tool.clone(),
+                        event: raw_events::ToolEvent::Out,
+                    });
+                    // Out - destroy the partial frame afterwards.
+                    true
+                }
+                _ => false,
+            };
+            // Frame finished. Remove all one-shot components.
+            frame.state_transition = None;
+            frame.buttons.clear();
+            clear
+        } else {
+            false
+        };
+        // Emit frame. This may be an empty frame if above was None, that's alright!
+        self.events.push(raw_events::Event::Tool {
+            tool: tool.clone(),
+            event: raw_events::ToolEvent::Frame(Some(FrameTimestamp(
+                std::time::Duration::from_millis(u64::from(millis)),
+            ))),
+        });
+
+        if clear {
+            // Marked for deletion.
+            self.frames_in_progress.retain(|frame| &frame.tool != tool);
+        }
+    }
     fn try_acquire_tablet_seat(&mut self, qh: &QueueHandle<Self>) {
         if self.tablet_seat.is_some() {
             return;
@@ -451,29 +612,23 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
                     tool: tool.id(),
                     event: raw_events::ToolEvent::Removed,
                 });
-                this.tools.destroy(&tool.id());
+                this.drop_tool(&tool.id());
             }
             // ======== Interaction data =========
             Event::ProximityIn { tablet, .. } => {
-                this.events.push(raw_events::Event::Tool {
-                    tool: tool.id(),
-                    event: raw_events::ToolEvent::In {
-                        tablet: tablet.id(),
-                    },
-                });
+                this.frame_in_progress(tool.id()).state_transition =
+                    Some(FrameState::In(tablet.id()));
                 this.summary = Some(RawSummary {
                     tablet_id: tablet.id(),
                     tool_id: tool.id(),
                     down: false,
+                    buttons: smallvec::smallvec![],
                     pose: Pose::default(),
                     time: FrameTimestamp::epoch(),
                 });
             }
             Event::ProximityOut { .. } => {
-                this.events.push(raw_events::Event::Tool {
-                    tool: tool.id(),
-                    event: raw_events::ToolEvent::Out,
-                });
+                this.frame_in_progress(tool.id()).state_transition = Some(FrameState::Out);
                 if this
                     .summary
                     .as_ref()
@@ -483,10 +638,7 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
                 }
             }
             Event::Down { .. } => {
-                this.events.push(raw_events::Event::Tool {
-                    tool: tool.id(),
-                    event: raw_events::ToolEvent::Down,
-                });
+                this.frame_in_progress(tool.id()).state_transition = Some(FrameState::Down);
                 if let Some(summary) = &mut this.summary {
                     if summary.tool_id == tool.id() {
                         summary.down = true;
@@ -494,89 +646,118 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
                 }
             }
             Event::Up { .. } => {
-                this.events.push(raw_events::Event::Tool {
-                    tool: tool.id(),
-                    event: raw_events::ToolEvent::Up,
-                });
+                this.frame_in_progress(tool.id()).state_transition = Some(FrameState::Up);
                 if let Some(summary) = &mut this.summary {
                     if summary.tool_id == tool.id() {
                         summary.down = false;
                     }
                 }
             }
+            #[allow(clippy::cast_possible_truncation)]
             Event::Motion { x, y } => {
+                let x = x as f32;
+                let y = y as f32;
+                this.frame_in_progress(tool.id()).position = Some([x, y]);
                 if let Some(summary) = &mut this.summary {
                     // shhh...
                     #[allow(clippy::cast_possible_truncation)]
                     if summary.tool_id == tool.id() {
-                        summary.pose.position = [x as f32, y as f32];
+                        summary.pose.position = [x, y];
                     }
                 }
             }
+            #[allow(clippy::cast_possible_truncation)]
             Event::Tilt { tilt_x, tilt_y } => {
+                let tilt_x = (tilt_x as f32).to_radians();
+                let tilt_y = (tilt_y as f32).to_radians();
+                this.frame_in_progress(tool.id()).tilt = Some([tilt_x, tilt_y]);
                 if let Some(summary) = &mut this.summary {
                     // shhh...
                     #[allow(clippy::cast_possible_truncation)]
                     if summary.tool_id == tool.id() {
-                        summary.pose.tilt =
-                            Some([(tilt_x as f32).to_radians(), (tilt_y as f32).to_radians()]);
+                        summary.pose.tilt = Some([tilt_x, tilt_y]);
                     }
                 }
             }
             Event::Pressure { pressure } => {
+                // Saturating-as (guaranteed by the protocol spec to be 0..=65535)
+                let pressure = u16::try_from(pressure).unwrap_or(65535);
+                let pressure = f32::from(pressure) / 65535.0;
+                this.frame_in_progress(tool.id()).pressure = Some(pressure);
                 if let Some(summary) = &mut this.summary {
                     #[allow(clippy::cast_precision_loss)]
                     if summary.tool_id == tool.id() {
-                        summary.pose.pressure =
-                            NicheF32::new_some((pressure as f32) / 65535.0).unwrap();
+                        summary.pose.pressure = NicheF32::new_some(pressure).unwrap();
                     }
                 }
             }
             Event::Distance { distance } => {
+                // Saturating-as (guaranteed by the protocol spec to be 0..=65535)
+                let distance = u16::try_from(distance).unwrap_or(65535);
+                let distance = f32::from(distance) / 65535.0;
+                this.frame_in_progress(tool.id()).distance = Some(distance);
                 if let Some(summary) = &mut this.summary {
                     #[allow(clippy::cast_precision_loss)]
                     if summary.tool_id == tool.id() {
-                        summary.pose.distance =
-                            NicheF32::new_some((distance as f32) / 65535.0).unwrap();
+                        summary.pose.distance = NicheF32::new_some(distance).unwrap();
                     }
                 }
             }
+            #[allow(clippy::cast_possible_truncation)]
             Event::Rotation { degrees } => {
+                let radians = (degrees as f32).to_radians();
+                this.frame_in_progress(tool.id()).roll = Some(radians);
                 if let Some(summary) = &mut this.summary {
                     #[allow(clippy::cast_possible_truncation)]
                     if summary.tool_id == tool.id() {
-                        summary.pose.roll =
-                            NicheF32::new_some((degrees as f32).to_radians()).unwrap();
+                        summary.pose.roll = NicheF32::new_some(radians).unwrap();
                     }
                 }
             }
             Event::Slider { position } => {
+                // Saturating-as (guaranteed by the protocol spec to be 0..=65535)
+                let position = u16::try_from(position).unwrap_or(65535);
+                let position = f32::from(position) / 65535.0;
+                this.frame_in_progress(tool.id()).slider = Some(position);
                 if let Some(summary) = &mut this.summary {
                     #[allow(clippy::cast_precision_loss)]
                     if summary.tool_id == tool.id() {
-                        summary.pose.distance =
-                            NicheF32::new_some((position as f32) / 65535.0).unwrap();
+                        summary.pose.slider = NicheF32::new_some(position).unwrap();
+                    }
+                }
+            }
+            Event::Button { button, state, .. } => {
+                let pressed = matches!(
+                    state,
+                    wayland_client::WEnum::Value(
+                        wl_tablet::zwp_tablet_tool_v2::ButtonState::Pressed
+                    )
+                );
+                this.frame_in_progress(tool.id())
+                    .buttons
+                    .push((button, pressed));
+                if let Some(summary) = &mut this.summary {
+                    if summary.tool_id == tool.id() {
+                        if pressed {
+                            // Add id if not already present
+                            if !summary.buttons.contains(&button) {
+                                summary.buttons.push(button);
+                            }
+                        } else {
+                            // clear id from the set
+                            summary.buttons.retain(|b| *b != button);
+                        }
                     }
                 }
             }
             Event::Frame { time } => {
                 if let Some(summary) = &mut this.summary {
-                    // HACK HACK HACK!!
-                    this.events.push(raw_events::Event::Tool {
-                        tool: tool.id(),
-                        event: raw_events::ToolEvent::Pose(summary.pose),
-                    });
                     if summary.tool_id == tool.id() {
                         summary.time =
                             FrameTimestamp(std::time::Duration::from_millis(u64::from(time)));
                     }
                 }
-                this.events.push(raw_events::Event::Tool {
-                    tool: tool.id(),
-                    event: raw_events::ToolEvent::Frame(Some(FrameTimestamp(
-                        std::time::Duration::from_millis(u64::from(time)),
-                    ))),
-                });
+                this.frame(&tool.id(), time);
             }
 
             // ne

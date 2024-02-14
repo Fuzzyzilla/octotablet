@@ -14,6 +14,8 @@ pub struct InState<'a> {
     pub down: bool,
     /// Timestamp of the given pose.
     pub timestamp: Option<super::FrameTimestamp>,
+    /// IDs of tool buttons that are currently held down.
+    pub pressed_buttons: &'a [u32],
 }
 
 #[derive(Clone, Copy, Debug)]

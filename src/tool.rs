@@ -112,8 +112,7 @@ pub enum DistanceUnit {
     #[default]
     Unitless,
     /// The distance is reported as an absolute distance in centimeters.
-    /// The maximum sensed distance in cm is included, if available.
-    Cm { max: Option<f32> },
+    Cm,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

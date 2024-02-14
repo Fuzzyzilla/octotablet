@@ -160,7 +160,7 @@ fn main() {
                                 let r = from.red();
                                 let g = from.green();
                                 let b = from.blue();
-                                // softbuffer requires `0000'0000'rrrr'rrrr'gggg'gggg'bbb'bbbb` format
+                                // softbuffer requires `0000'0000'rrrr'rrrr'gggbg'gggg'bbb'bbbb` format
                                 *into = (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b));
                             });
                         buffer.present().unwrap();
