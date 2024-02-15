@@ -34,19 +34,25 @@ fn main() {
 /// Main app, displaying info and a [test area](ShowPen).
 struct Viewer {
     manager: Result<Manager, BuildError>,
+    // Keep track of when the last frame was, so that we can show speed of events
     last_frame_time: std::time::Instant,
+    // Allow code to set a duration to poll events more rapidly.
+    // Egui does not automatically update when the tablet does!
+    poll_until: std::time::Instant,
     show_events: bool,
     events_stream: std::collections::VecDeque<(String, Color32)>,
 }
 impl Viewer {
     fn new(context: &CreationContext<'_>) -> Self {
+        let now = std::time::Instant::now();
         // Context gives us access to the handle, connect to the tablet server:
         Self {
             // Safety: Destroyed in `on_exit`, before we lose the display.
             manager: unsafe {
                 Builder::new().build_raw(context.display_handle().unwrap().as_raw())
             },
-            last_frame_time: std::time::Instant::now(),
+            last_frame_time: now,
+            poll_until: now,
             show_events: false,
             events_stream: std::collections::VecDeque::with_capacity(128),
         }
@@ -73,16 +79,26 @@ impl eframe::App for Viewer {
                 return;
             }
         };
-        let has_tools = !manager.tools().is_empty();
         let events = manager.pump().unwrap();
         let summary = events.summarize();
+        // If at least one event...
+        let has_events = events.into_iter().next().is_some();
+        // Poll more often for a while!
+        let poll = if has_events {
+            // Set up to poll for an additional 500ms afterwards, to catch future events.
+            self.poll_until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            true
+        } else {
+            // No new events. Still poll if we're in the time frame set before:
+            self.poll_until > std::time::Instant::now()
+        };
 
         // If an interaction is ongoing, request redraws often.
-        if matches!(summary.tool, ToolState::In(_)) {
-            // Arbitrary time that should be fast enough for even the fanciest of monitors x3
-            ctx.request_repaint_after(std::time::Duration::from_secs_f32(1.0 / 144.0));
+        if poll {
+            // Arbitrary fast poll time, without being so fast as to gobble up the CPU.
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32(1.0 / 60.0));
         } else {
-            // poll for new events. (Egui will not necessarily notice the tablet input and so won't repaint on its own!)
+            // poll for new events slower. (Egui will not necessarily notice the tablet input and so won't repaint on its own!)
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
 
@@ -95,65 +111,7 @@ impl eframe::App for Viewer {
                 let _ = self.events_stream.pop_front();
             }
             // add pretty-print at bottom!
-            let pretty = match event {
-                octotablet::events::Event::Pad { .. }
-                | octotablet::events::Event::Tablet { .. } => {
-                    // default format
-                    (format!("{event:#?}"), Color32::WHITE)
-                }
-                octotablet::events::Event::Tool { tool, event } => {
-                    let id = tool.id();
-                    match event {
-                        octotablet::events::ToolEvent::Added => {
-                            (format!("Added tool {id:08X?}"), Color32::GREEN)
-                        }
-                        octotablet::events::ToolEvent::Removed => {
-                            (format!("Removed tool {id:08X?}"), Color32::RED)
-                        }
-                        octotablet::events::ToolEvent::In { tablet } => {
-                            let tab_id = tablet.id();
-                            (
-                                format!("Tool {id:08X?} in over {tab_id:08X?}"),
-                                Color32::YELLOW,
-                            )
-                        }
-                        octotablet::events::ToolEvent::Out => {
-                            (format!("Tool {id:08X?} out"), Color32::BROWN)
-                        }
-                        octotablet::events::ToolEvent::Down => {
-                            (format!("Tool {id:08X?} down"), Color32::LIGHT_BLUE)
-                        }
-                        octotablet::events::ToolEvent::Up => {
-                            (format!("Tool {id:08X?} up"), Color32::LIGHT_BLUE)
-                        }
-                        octotablet::events::ToolEvent::Pose(pose) => {
-                            (format!("Tool {id:08X?} {pose:#?}"), Color32::GRAY)
-                        }
-                        octotablet::events::ToolEvent::Button {
-                            button_id: button_idx,
-                            pressed,
-                        } => (
-                            format!(
-                                "Tool {id:08X?} Button {button_idx} {}",
-                                if pressed { "Pressed" } else { "Released" }
-                            ),
-                            if pressed {
-                                Color32::GREEN
-                            } else {
-                                Color32::RED
-                            },
-                        ),
-                        octotablet::events::ToolEvent::Frame(time) => {
-                            if let Some(time) = time {
-                                (format!("Frame {time:?}"), Color32::WHITE)
-                            } else {
-                                ("Frame".into(), Color32::WHITE)
-                            }
-                        }
-                    }
-                }
-            };
-            self.events_stream.push_back(pretty);
+            self.events_stream.push_back(pretty_print_event(event));
         }
         // Show an area to print events, if requested.
         egui::SidePanel::right("events").show_animated(ctx, self.show_events, |ui| {
@@ -185,7 +143,7 @@ impl eframe::App for Viewer {
         egui::TopBottomPanel::bottom("viewer")
             .exact_height(ctx.available_rect().height() / 2.0)
             .frame(Frame::canvas(&ctx.style()))
-            .show_animated(ctx, has_tools, |ui| ui.add(ShowPen { summary }));
+            .show(ctx, |ui| ui.add(ShowPen { summary }));
 
         // Show an info panel listing connected devices and their capabilities
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -217,7 +175,45 @@ impl eframe::App for Viewer {
                     ui.label("Pads");
                     for (idx, pad) in manager.pads().iter().enumerate() {
                         ui.collapsing(idx.to_string(), |ui| {
-                            ui.label(format!("Buttons: {}", pad.button_count));
+                            ui.label(format!("Total Buttons: {}", pad.total_buttons));
+                            for (idx, group) in pad.groups.iter().enumerate() {
+                                egui::CollapsingHeader::new(format!("Group {idx}"))
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        ui.label(format!(
+                                            "Mode count: {:?}",
+                                            group.mode_count.map(std::num::NonZeroU32::get)
+                                        ));
+                                        ui.label(format!(
+                                            "Associated button indices: {:?}",
+                                            &group.buttons
+                                        ));
+                                        // Show rings
+                                        egui::CollapsingHeader::new(format!(
+                                            "Rings ({})",
+                                            group.rings.len()
+                                        ))
+                                        .default_open(true)
+                                        .enabled(!group.rings.is_empty())
+                                        .show(ui, |ui| {
+                                            for ring in &group.rings {
+                                                ui.label(format!("{ring:#?}"));
+                                            }
+                                        });
+                                        // Show strips
+                                        egui::CollapsingHeader::new(format!(
+                                            "Strips ({})",
+                                            group.strips.len()
+                                        ))
+                                        .default_open(true)
+                                        .enabled(!group.strips.is_empty())
+                                        .show(ui, |ui| {
+                                            for strip in &group.strips {
+                                                ui.label(format!("{strip:#?}"));
+                                            }
+                                        });
+                                    });
+                            }
                         });
                     }
                     if manager.pads().is_empty() {
@@ -294,6 +290,152 @@ fn format_id(id: Option<UsbId>) -> String {
         }
     } else {
         "No ID.".into()
+    }
+}
+
+// Print a Strip or Ring event
+fn pretty_print_touch_event(
+    name: String,
+    event: octotablet::events::TouchStripEvent,
+    fmt_pose: impl FnOnce(f32) -> String,
+) -> (String, Color32) {
+    match event {
+        octotablet::events::TouchStripEvent::Pose(pose) => {
+            (format!("{name} Pose {}", fmt_pose(pose)), Color32::WHITE)
+        }
+        octotablet::events::TouchStripEvent::Frame(time) => {
+            if let Some(time) = time {
+                (format!("{name} Frame {time:?}"), Color32::GRAY)
+            } else {
+                (format!("{name} Frame"), Color32::GRAY)
+            }
+        }
+        octotablet::events::TouchStripEvent::Source(src) => {
+            (format!("{name} Interacted by {src:?}"), Color32::GRAY)
+        }
+        octotablet::events::TouchStripEvent::Up => (format!("{name} Up"), Color32::LIGHT_BLUE),
+    }
+}
+
+// Print out event in a nicer way than `Debug`, with some color too!
+fn pretty_print_event(event: octotablet::events::Event) -> (String, Color32) {
+    match event {
+        octotablet::events::Event::Tablet { .. } => {
+            // default format
+            (format!("{event:#?}"), Color32::WHITE)
+        }
+        octotablet::events::Event::Pad { pad, event } => {
+            let id = pad.id();
+            match event {
+                octotablet::events::PadEvent::Added => {
+                    (format!("Added pad {id:08X?}"), Color32::GREEN)
+                }
+                octotablet::events::PadEvent::Removed => {
+                    (format!("Removed pad {id:08X?}"), Color32::RED)
+                }
+                octotablet::events::PadEvent::Enter { tablet } => {
+                    let tab_id = tablet.id();
+                    (
+                        format!("Pad {id:08X?} connected to {tab_id:08X?}"),
+                        Color32::YELLOW,
+                    )
+                }
+                octotablet::events::PadEvent::Exit => (
+                    format!("Pad {id:08X?} disconnected from tablet"),
+                    Color32::BROWN,
+                ),
+                octotablet::events::PadEvent::Button {
+                    button_idx,
+                    pressed,
+                    group,
+                } => {
+                    // Find the index of this group. Much more friendly then a big opaque ID.
+                    let group_id = group.map(octotablet::pad::Group::id);
+                    let group_idx = group_id
+                        .and_then(|id| pad.groups.iter().position(|group| group.id() == id));
+                    (
+                        format!(
+                            "Pad {id:08X?} Button {button_idx} {} (Owned by group {group_idx:?})",
+                            if pressed { "Pressed" } else { "Released" }
+                        ),
+                        if pressed {
+                            Color32::DARK_GREEN
+                        } else {
+                            Color32::DARK_RED
+                        },
+                    )
+                }
+                octotablet::events::PadEvent::Group { group, event } => {
+                    let group = group.id();
+                    match event {
+                        octotablet::events::PadGroupEvent::Mode(m) => (
+                            format!("Group {group:08X?} switched to mode {m}"),
+                            Color32::LIGHT_BLUE,
+                        ),
+                        octotablet::events::PadGroupEvent::Ring { ring, event } => {
+                            let ring = ring.id();
+                            pretty_print_touch_event(format!("Ring {ring:08X?}"), event, |pose| {
+                                format!("{:.01}deg", pose.to_degrees())
+                            })
+                        }
+                        octotablet::events::PadGroupEvent::Strip { strip, event } => {
+                            let strip = strip.id();
+                            pretty_print_touch_event(format!("Strip {strip:08X?}"), event, |pose| {
+                                format!("{:.01}%", pose * 100.0)
+                            })
+                        }
+                    }
+                }
+            }
+        }
+        octotablet::events::Event::Tool { tool, event } => {
+            let id = tool.id();
+            match event {
+                octotablet::events::ToolEvent::Added => {
+                    (format!("Added tool {id:08X?}"), Color32::GREEN)
+                }
+                octotablet::events::ToolEvent::Removed => {
+                    (format!("Removed tool {id:08X?}"), Color32::RED)
+                }
+                octotablet::events::ToolEvent::In { tablet } => {
+                    let tab_id = tablet.id();
+                    (
+                        format!("Tool {id:08X?} in\n  - over {tab_id:08X?}"),
+                        Color32::YELLOW,
+                    )
+                }
+                octotablet::events::ToolEvent::Out => {
+                    (format!("Tool {id:08X?} out"), Color32::BROWN)
+                }
+                octotablet::events::ToolEvent::Down => {
+                    (format!("Tool {id:08X?} down"), Color32::LIGHT_BLUE)
+                }
+                octotablet::events::ToolEvent::Up => {
+                    (format!("Tool {id:08X?} up"), Color32::LIGHT_BLUE)
+                }
+                octotablet::events::ToolEvent::Pose(pose) => {
+                    (format!("Tool {id:08X?} {pose:#?}"), Color32::WHITE)
+                }
+                octotablet::events::ToolEvent::Button { button_id, pressed } => (
+                    format!(
+                        "Tool {id:08X?} Button {button_id} {}",
+                        if pressed { "Pressed" } else { "Released" }
+                    ),
+                    if pressed {
+                        Color32::DARK_GREEN
+                    } else {
+                        Color32::DARK_RED
+                    },
+                ),
+                octotablet::events::ToolEvent::Frame(time) => {
+                    if let Some(time) = time {
+                        (format!("Frame {time:?}"), Color32::GRAY)
+                    } else {
+                        ("Frame".into(), Color32::GRAY)
+                    }
+                }
+            }
+        }
     }
 }
 

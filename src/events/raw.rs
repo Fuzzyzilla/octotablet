@@ -33,18 +33,19 @@ impl<Id> ToolEvent<Id> {
         }
     }
 }
-/// Events associated with a specific `Tablet`.
 #[derive(Clone, Debug)]
 pub enum TabletEvent {
     Added,
     Removed,
 }
-/// Events associated with a specific `Pad`.
 #[derive(Clone, Debug)]
 pub enum PadEvent<Id> {
     Added,
     Removed,
-    Group { group: Id, event: PadGroupEvent },
+    Group { group: Id, event: PadGroupEvent<Id> },
+    Button { button_idx: u32, pressed: bool },
+    Enter { tablet: Id },
+    Exit,
 }
 impl<Id> PadEvent<Id> {
     // Can't impl `From`, due to conflict with `From<T> for T` :(
@@ -54,14 +55,50 @@ impl<Id> PadEvent<Id> {
             Self::Removed => PadEvent::Removed,
             Self::Group { group, event } => PadEvent::Group {
                 group: Into::from(group),
-                event,
+                event: event.id_into(),
             },
+            Self::Button {
+                button_idx,
+                pressed,
+            } => PadEvent::Button {
+                button_idx,
+                pressed,
+            },
+            Self::Enter { tablet } => PadEvent::Enter {
+                tablet: Into::from(tablet),
+            },
+            Self::Exit => PadEvent::Exit,
         }
     }
 }
-/// Events associated with a specific `Pad`.
-#[derive(Clone, Copy, Debug)]
-pub enum PadGroupEvent {}
+#[derive(Clone, Debug)]
+pub enum PadGroupEvent<Id> {
+    Ring {
+        ring: Id,
+        event: super::TouchStripEvent,
+    },
+    Strip {
+        strip: Id,
+        event: super::TouchStripEvent,
+    },
+    Mode(u32),
+}
+impl<Id> PadGroupEvent<Id> {
+    // Can't impl `From`, due to conflict with `From<T> for T` :(
+    pub fn id_into<Into: From<Id>>(self) -> PadGroupEvent<Into> {
+        match self {
+            Self::Ring { ring, event } => PadGroupEvent::Ring {
+                ring: Into::from(ring),
+                event,
+            },
+            Self::Strip { strip, event } => PadGroupEvent::Strip {
+                strip: Into::from(strip),
+                event,
+            },
+            Self::Mode(mode) => PadGroupEvent::Mode(mode),
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub enum Event<Id> {
     Tool { tool: Id, event: ToolEvent<Id> },

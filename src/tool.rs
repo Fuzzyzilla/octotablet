@@ -17,14 +17,6 @@
 
 use std::fmt::Debug;
 
-use crate::platform::InternalID;
-
-#[derive(Hash, PartialEq, Eq, Debug)]
-/// An opaque representation of a tool, stable and unique as long as this tool is not
-/// [`removed`](crate::events::ToolEvent::Removed) but not to be considered stable across connections.
-/// That is, the same tool may have differing IDs on different executions, or being removed and re-added.
-pub struct ID(InternalID);
-
 bitflags::bitflags! {
     /// Bitflags describing all supported Axes. See [`Axis`] for descriptions.
     #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -127,7 +119,7 @@ pub struct AxisInfo {
 /// Description of the capabilities of a tool.
 pub struct Tool {
     /// Platform internal ID.
-    pub(crate) internal_id: InternalID,
+    pub(crate) internal_id: crate::InternalID,
     /// An identifier that is baked into the hardware of the tool.
     /// Likely to remain stable over executions, and unique across even devices of the same model.
     /// It is usable to save per-tool configurations to disk, for example.
@@ -176,13 +168,6 @@ impl Debug for Tool {
     }
 }
 impl Tool {
-    /// Opaque, transient ID of this tool, assigned arbitrarily by the software. See [`ID`] for more info.
-    ///
-    /// *See also: [`Tool::hardware_id`], [`Tool::wacom_id`]*
-    #[must_use]
-    pub fn id(&self) -> ID {
-        ID(self.internal_id.clone())
-    }
     #[must_use]
     pub fn axis(&self, axis: Axis) -> Option<AxisInfo> {
         self.available_axes
@@ -197,3 +182,5 @@ impl Tool {
             .then_some(self.distance_unit)
     }
 }
+
+crate::macro_bits::impl_get_id!(ID for Tool);

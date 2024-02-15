@@ -2,7 +2,10 @@
 //!
 //! Within this module, it is sound to assume `cfg(wl_tablet) == true`
 //! (compiling for a wayland target + has deps, or is building docs).
-use crate::events::raw as raw_events;
+use crate::{
+    events::raw as raw_events,
+    pad::{Group, Ring, Strip, TouchSource},
+};
 pub type ID = wayland_backend::client::ObjectId;
 use wayland_client::{
     protocol::{wl_registry, wl_seat},
@@ -52,7 +55,7 @@ impl Manager {
 impl super::PlatformImpl for Manager {
     #[allow(clippy::missing_errors_doc)]
     fn pump(&mut self) -> Result<(), crate::PumpError> {
-        self.state.events.clear();
+        self.state.cleanup_start();
         self.queue.dispatch_pending(&mut self.state)?;
         Ok(())
     }
@@ -63,15 +66,15 @@ impl super::PlatformImpl for Manager {
     }
     #[must_use]
     fn pads(&self) -> &[crate::pad::Pad] {
-        &self.state.pads.finished
+        &self.state.pads
     }
     #[must_use]
     fn tools(&self) -> &[crate::tool::Tool] {
-        &self.state.tools.finished
+        &self.state.tools
     }
     #[must_use]
     fn tablets(&self) -> &[crate::tablet::Tablet] {
-        &self.state.tablets.finished
+        &self.state.tablets
     }
     fn raw_events(&self) -> super::RawEventsIter<'_> {
         super::RawEventsIter::Wayland(self.state.events.iter())
@@ -110,17 +113,22 @@ impl super::PlatformImpl for Manager {
     }
 }
 
-pub trait HasWlId {
+pub trait HasWlId: Sized {
+    type DoneError;
     fn new_default(id: ID) -> Self;
     fn id(&self) -> &ID;
     /// Sent when constructors are done. Use this to
     /// make everything internally consistent.
-    fn done(&mut self) {}
+    fn done(self) -> Result<Self, Self::DoneError>;
 }
 impl HasWlId for Tool {
+    type DoneError = std::convert::Infallible;
+    fn done(self) -> Result<Self, Self::DoneError> {
+        Ok(self)
+    }
     fn new_default(id: ID) -> Self {
         Tool {
-            internal_id: InternalID::Wayland(id),
+            internal_id: id.into(),
             hardware_id: None,
             wacom_id: None,
             available_axes: AvailableAxes::empty(),
@@ -138,9 +146,13 @@ impl HasWlId for Tool {
     }
 }
 impl HasWlId for Tablet {
+    type DoneError = std::convert::Infallible;
+    fn done(self) -> Result<Self, Self::DoneError> {
+        Ok(self)
+    }
     fn new_default(id: ID) -> Self {
         Tablet {
-            internal_id: InternalID::Wayland(id),
+            internal_id: id.into(),
             name: String::new(),
             usb_id: None,
         }
@@ -152,12 +164,76 @@ impl HasWlId for Tablet {
     }
 }
 impl HasWlId for Pad {
+    type DoneError = ();
+    fn done(self) -> Result<Self, Self::DoneError> {
+        if self.groups.is_empty() {
+            Err(())
+        } else {
+            Ok(self)
+        }
+    }
     fn new_default(id: ID) -> Self {
         Pad {
-            internal_id: InternalID::Wayland(id),
+            internal_id: id.into(),
             // 0 is the default and what the protocol specifies should be used if
             // the constructor for this value is never sent.
-            button_count: 0,
+            total_buttons: 0,
+            groups: Vec::new(),
+        }
+    }
+    fn id(&self) -> &ID {
+        // Unwrap OK - We only ever create `Wayland` instances, and it's not possible
+        // for an externally created instance to get in here.
+        self.internal_id.unwrap_wl()
+    }
+}
+impl HasWlId for Group {
+    type DoneError = std::convert::Infallible;
+    fn done(self) -> Result<Self, Self::DoneError> {
+        Ok(self)
+    }
+    fn new_default(id: ID) -> Self {
+        Group {
+            internal_id: InternalID::Wayland(id),
+            buttons: Vec::new(),
+            rings: Vec::new(),
+            strips: Vec::new(),
+            feedback: None,
+            mode_count: None,
+        }
+    }
+    fn id(&self) -> &ID {
+        // Unwrap OK - We only ever create `Wayland` instances, and it's not possible
+        // for an externally created instance to get in here.
+        self.internal_id.unwrap_wl()
+    }
+}
+impl HasWlId for Ring {
+    type DoneError = std::convert::Infallible;
+    fn done(self) -> Result<Self, Self::DoneError> {
+        Ok(self)
+    }
+    fn new_default(id: ID) -> Self {
+        Ring {
+            internal_id: id.into(),
+            granularity: None,
+        }
+    }
+    fn id(&self) -> &ID {
+        // Unwrap OK - We only ever create `Wayland` instances, and it's not possible
+        // for an externally created instance to get in here.
+        self.internal_id.unwrap_wl()
+    }
+}
+impl HasWlId for Strip {
+    type DoneError = std::convert::Infallible;
+    fn done(self) -> Result<Self, Self::DoneError> {
+        Ok(self)
+    }
+    fn new_default(id: ID) -> Self {
+        Strip {
+            internal_id: id.into(),
+            granularity: None,
         }
     }
     fn id(&self) -> &ID {
@@ -178,33 +254,20 @@ struct RawSummary {
     time: FrameTimestamp,
 }
 
-#[derive(thiserror::Error, Debug)]
-enum WlConstructError {
-    /// Reported when a wayland event describing construction parameters is recieved after
-    /// the objects finalization. As far as I know, this indicates a server bug.
-    #[error("an object with this id is already constructed")]
-    AlreadyFinished,
-}
-
-/// Tracks objects which are created by a
+/// Tracks objects which are in the process of being created by a
 /// data burst followed by "done".
-pub(crate) struct WlCollection<T> {
+pub(crate) struct PartialVec<T> {
     pub(crate) constructing: Vec<T>,
-    pub(crate) finished: Vec<T>,
 }
-impl<T> Default for WlCollection<T> {
+impl<T> Default for PartialVec<T> {
     fn default() -> Self {
         Self {
             constructing: vec![],
-            finished: vec![],
         }
     }
 }
-impl<T: HasWlId> WlCollection<T> {
-    fn get_or_insert_ctor(&mut self, id: ID) -> Result<&mut T, WlConstructError> {
-        if self.finished.iter().any(|obj| obj.id() == &id) {
-            return Err(WlConstructError::AlreadyFinished);
-        }
+impl<T: HasWlId> PartialVec<T> {
+    fn get_or_insert_ctor(&mut self, id: ID) -> &mut T {
         let index = if let Some(found) = self.constructing.iter().position(|obj| obj.id() == &id) {
             found
         } else {
@@ -212,20 +275,20 @@ impl<T: HasWlId> WlCollection<T> {
             self.constructing.len() - 1
         };
 
-        Ok(&mut self.constructing[index])
+        &mut self.constructing[index]
     }
-    fn done(&mut self, id: &ID) {
+    /// Try to finish and return the object in progress. None if no such object, Some(Err) if the object
+    /// determined that it was not internally-consistent.
+    fn done(&mut self, id: &ID) -> Option<Result<T, T::DoneError>> {
         if let Some(finished_idx) = self.constructing.iter().position(|obj| obj.id() == id) {
-            let mut finished_obj = self.constructing.remove(finished_idx);
-            finished_obj.done();
-            // Ensure no item of this id currently exists.
-            self.finished.retain(|obj| obj.id() != id);
-            self.finished.push(finished_obj);
+            Some(self.constructing.remove(finished_idx).done())
+        } else {
+            None
         }
     }
+    /// Drop in-progress items.
     fn destroy(&mut self, id: &ID) {
         self.constructing.retain(|obj| obj.id() != id);
-        self.finished.retain(|obj| obj.id() != id);
     }
 }
 
@@ -254,23 +317,70 @@ struct FrameInProgress {
     buttons: smallvec::SmallVec<[(u32, bool); 1]>,
 }
 
+enum ConstructID {
+    Tablet(ID),
+    Pad(ID),
+    Tool(ID),
+}
+
 #[derive(Default)]
 struct TabletState {
+    // Internal goobers
     seat: Option<wl_seat::WlSeat>,
     manager: Option<wl_tablet::zwp_tablet_manager_v2::ZwpTabletManagerV2>,
     tablet_seat: Option<wl_tablet::zwp_tablet_seat_v2::ZwpTabletSeatV2>,
-    tablets: WlCollection<Tablet>,
-    tools: WlCollection<Tool>,
-    pads: WlCollection<Pad>,
-    _groups: WlCollection<Pad>,
+    // Space for in-progress constructor executions.
+    partial_tablets: PartialVec<Tablet>,
+    partial_tools: PartialVec<Tool>,
+    partial_pads: PartialVec<Pad>,
+    partial_groups: PartialVec<Group>,
+    // Completed constructions
+    tablets: Vec<Tablet>,
+    tools: Vec<Tool>,
+    pads: Vec<Pad>,
+    // Things to destroy:
+    destroy_next_frame: Vec<ConstructID>,
+    // Associations for which pad group each ring and strip are connected
+    // `{ring or strip} -> group`
+    ring_associations: std::collections::HashMap<ID, ID>,
+    strip_associations: std::collections::HashMap<ID, ID>,
+    // Associations for which pad each group is connected
+    // `group -> pad`
+    group_associations: std::collections::HashMap<ID, ID>,
+    // Partial and complete event/summary tracking.
     summary: Option<RawSummary>,
     frames_in_progress: Vec<FrameInProgress>,
     events: Vec<crate::events::raw::Event<ID>>,
 }
 impl TabletState {
-    fn drop_tool(&mut self, tool: &ID) {
-        self.tools.destroy(tool);
-        self.frames_in_progress.retain(|frame| &frame.tool != tool);
+    fn destroy_tool(&mut self, tool: ID) {
+        self.partial_tools.destroy(&tool);
+        // Defer destruction, that way `Removed` events can still refer by reference.
+        self.destroy_next_frame.push(ConstructID::Tool(tool));
+    }
+    fn destroy_tablet(&mut self, tablet: ID) {
+        self.partial_tablets.destroy(&tablet);
+        // Defer destruction, that way `Removed` events can still refer by reference.
+        self.destroy_next_frame.push(ConstructID::Tablet(tablet));
+    }
+    fn destroy_pad(&mut self, pad: ID) {
+        self.partial_pads.destroy(&pad);
+        // Defer destruction, that way `Removed` events can still refer by reference.
+        self.destroy_next_frame.push(ConstructID::Pad(pad));
+    }
+    // Start of a pump, clean up the leftover tasks from last pump:
+    fn cleanup_start(&mut self) {
+        self.events.clear();
+        for destroy in self.destroy_next_frame.drain(..) {
+            match destroy {
+                ConstructID::Pad(id) => self.pads.retain(|p| HasWlId::id(p) != &id),
+                ConstructID::Tablet(id) => self.tablets.retain(|t| HasWlId::id(t) != &id),
+                ConstructID::Tool(id) => {
+                    self.tools.retain(|t| HasWlId::id(t) != &id);
+                    self.frames_in_progress.retain(|f| f.tool != id);
+                }
+            }
+        }
     }
     // Create or get the partially built frame.
     fn frame_in_progress(&mut self, tool: ID) -> &mut FrameInProgress {
@@ -424,13 +534,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for TabletState {
                     this.seat = Some(registry.bind(name, version, qh, ()));
                     // Need a seat and a tablet manager to bind tablet seat.
                     this.try_acquire_tablet_seat(qh);
-                    println!("Bound seat.");
                 }
                 "zwp_tablet_manager_v2" => {
                     this.manager = Some(registry.bind(name, version, qh, ()));
                     // Need a seat and a tablet manager to bind tablet seat.
                     this.try_acquire_tablet_seat(qh);
-                    println!("Bound tablet id {}", this.manager.as_ref().unwrap().id());
                 }
                 _ => (),
             }
@@ -511,25 +619,27 @@ impl Dispatch<wl_tablet::zwp_tablet_v2::ZwpTabletV2, ()> for TabletState {
                     tablet: tablet.id(),
                     event: raw_events::TabletEvent::Added,
                 });
-                this.tablets.done(&tablet.id());
+                if let Some(Ok(tablet)) = this.partial_tablets.done(&tablet.id()) {
+                    this.tablets.push(tablet);
+                }
             }
             Event::Id { vid, pid } => {
                 // Convert to u16s (have been crammed into u32s...) and set, if any.
-                this.tablets.get_or_insert_ctor(tablet.id()).unwrap().usb_id = u16::try_from(vid)
+                this.partial_tablets.get_or_insert_ctor(tablet.id()).usb_id = u16::try_from(vid)
                     .ok()
                     .zip(u16::try_from(pid).ok())
                     .map(|(vid, pid)| UsbId { vid, pid });
             }
             Event::Name { name } => {
-                this.tablets.get_or_insert_ctor(tablet.id()).unwrap().name = name;
+                this.partial_tablets.get_or_insert_ctor(tablet.id()).name = name;
             }
             Event::Path { .. } => (),
             Event::Removed => {
+                this.destroy_tablet(tablet.id());
                 this.events.push(raw_events::Event::Tablet {
                     tablet: tablet.id(),
                     event: raw_events::TabletEvent::Removed,
                 });
-                this.tablets.destroy(&tablet.id());
             }
             // ne
             _ => (),
@@ -554,7 +664,7 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
                 capability: wayland_client::WEnum::Value(capability),
             } => {
                 use wl_tablet::zwp_tablet_tool_v2::Capability;
-                let ctor = this.tools.get_or_insert_ctor(tool.id()).unwrap();
+                let ctor = this.partial_tools.get_or_insert_ctor(tool.id());
                 match capability {
                     Capability::Distance => ctor.available_axes.insert(AvailableAxes::DISTANCE),
                     Capability::Pressure => ctor.available_axes.insert(AvailableAxes::PRESSURE),
@@ -570,14 +680,14 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
                 hardware_id_hi,
                 hardware_id_lo,
             } => {
-                let ctor = this.tools.get_or_insert_ctor(tool.id()).unwrap();
+                let ctor = this.partial_tools.get_or_insert_ctor(tool.id());
                 ctor.wacom_id = Some(u64::from(hardware_id_hi) << 32 | u64::from(hardware_id_lo));
             }
             Event::HardwareSerial {
                 hardware_serial_hi,
                 hardware_serial_lo,
             } => {
-                let ctor = this.tools.get_or_insert_ctor(tool.id()).unwrap();
+                let ctor = this.partial_tools.get_or_insert_ctor(tool.id());
                 ctor.hardware_id =
                     Some(u64::from(hardware_serial_hi) << 32 | u64::from(hardware_serial_lo));
             }
@@ -586,7 +696,7 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
             } => {
                 use crate::tool::Type;
                 use wl_tablet::zwp_tablet_tool_v2::Type as WlType;
-                let ctor = this.tools.get_or_insert_ctor(tool.id()).unwrap();
+                let ctor = this.partial_tools.get_or_insert_ctor(tool.id());
                 match tool_type {
                     WlType::Airbrush => ctor.tool_type = Some(Type::Airbrush),
                     WlType::Brush => ctor.tool_type = Some(Type::Brush),
@@ -605,14 +715,16 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
                     tool: tool.id(),
                     event: raw_events::ToolEvent::Added,
                 });
-                this.tools.done(&tool.id());
+                if let Some(Ok(tool)) = this.partial_tools.done(&tool.id()) {
+                    this.tools.push(tool);
+                }
             }
             Event::Removed => {
+                this.destroy_tool(tool.id());
                 this.events.push(raw_events::Event::Tool {
                     tool: tool.id(),
                     event: raw_events::ToolEvent::Removed,
                 });
-                this.drop_tool(&tool.id());
             }
             // ======== Interaction data =========
             Event::ProximityIn { tablet, .. } => {
@@ -778,26 +890,67 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for TabletState 
         #[allow(clippy::match_same_arms)]
         match event {
             // ======= Constructor databurst =========
-            Event::Group { .. } => (),
+            Event::Group { pad_group } => {
+                let ctor = this.partial_pads.get_or_insert_ctor(pad.id());
+                ctor.groups.push(Group::new_default(pad_group.id()));
+                // Remember that this group id is associated with this pad.
+                this.group_associations.insert(pad_group.id(), pad.id());
+            }
             Event::Path { .. } => (),
             Event::Buttons { buttons } => {
-                let ctor = this.pads.get_or_insert_ctor(pad.id()).unwrap();
-                ctor.button_count = buttons;
+                let ctor = this.partial_pads.get_or_insert_ctor(pad.id());
+                ctor.total_buttons = buttons;
             }
             Event::Done => {
-                this.pads.done(&pad.id());
+                let pad_id = pad.id();
+                if let Some(Ok(pad)) = this.partial_pads.done(&pad_id) {
+                    this.pads.push(pad);
+                    this.events.push(raw_events::Event::Pad {
+                        pad: pad_id,
+                        event: raw_events::PadEvent::Added,
+                    });
+                }
             }
             Event::Removed => {
-                this.pads.destroy(&pad.id());
+                this.destroy_pad(pad.id());
+                this.events.push(raw_events::Event::Pad {
+                    pad: pad.id(),
+                    event: raw_events::PadEvent::Removed,
+                });
             }
             // ======== Interaction data =========
-            Event::Button { .. } => (),
-            Event::Enter { .. } => (),
-            Event::Leave { .. } => (),
+            Event::Button {
+                button,
+                state,
+                time, //left to warn on purpose - use me!
+            } => {
+                let pressed = matches!(
+                    state,
+                    wayland_client::WEnum::Value(
+                        wl_tablet::zwp_tablet_pad_v2::ButtonState::Pressed
+                    )
+                );
+                this.events.push(raw_events::Event::Pad {
+                    pad: pad.id(),
+                    event: raw_events::PadEvent::Button {
+                        button_idx: button,
+                        pressed,
+                    },
+                });
+            }
+            Event::Enter { tablet, .. } => this.events.push(raw_events::Event::Pad {
+                pad: pad.id(),
+                event: raw_events::PadEvent::Enter {
+                    tablet: tablet.id(),
+                },
+            }),
+            Event::Leave { .. } => this.events.push(raw_events::Event::Pad {
+                pad: pad.id(),
+                event: raw_events::PadEvent::Exit,
+            }),
             // ne
             _ => (),
         }
-        println!("pad {event:?}");
     }
     wayland_client::event_created_child!(
         TabletState,
@@ -809,14 +962,104 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for TabletState 
 }
 impl Dispatch<wl_tablet::zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, ()> for TabletState {
     fn event(
-        _: &mut Self,
-        _group: &wl_tablet::zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2,
+        this: &mut Self,
+        group: &wl_tablet::zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2,
         event: wl_tablet::zwp_tablet_pad_group_v2::Event,
         (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        println!("pad group {event:?}");
+        // Everything (aside from the ctor databurst) needs this. Hoist it out for less code duplication...
+        let pad_id = this.group_associations.get(&group.id()).cloned();
+        #[allow(clippy::match_same_arms)]
+        match event {
+            // ======= Constructor databurst =========
+            wl_tablet::zwp_tablet_pad_group_v2::Event::Buttons { buttons } => {
+                // Buttons *seems* to be a byte array, where each chunk of 4 is a `u32` in native endian order,
+                // listing the indices of the global pad buttons that are uniquely owned by this group.
+                // This is all just my best guess! Ahh!
+                // Truncates to four byte chunks. That seems like a server error if my interpretation of the arcane
+                // values are correct.
+                let to_u32 = buttons.chunks_exact(4).map(|bytes| {
+                    let Ok(bytes): Result<[u8; 4], _> = bytes.try_into() else {
+                        // Guaranteed by chunks exact but not shown at a type-level.
+                        unreachable!()
+                    };
+                    u32::from_ne_bytes(bytes)
+                });
+                let ctor = this.partial_groups.get_or_insert_ctor(group.id());
+                ctor.buttons.extend(to_u32);
+                // Make some adjustments to be slightly more reasonable to use x3
+                // These collections will be trivially tiny so this is fine to do.
+                ctor.buttons.sort_unstable();
+                ctor.buttons.dedup();
+            }
+            wl_tablet::zwp_tablet_pad_group_v2::Event::Modes { modes } => {
+                // This event only sent when modes > 0.
+                let ctor = this.partial_groups.get_or_insert_ctor(group.id());
+                // Will always be Some(modes), but panicless in the case of a server impl bug.
+                ctor.mode_count = std::num::NonZeroU32::new(modes);
+            }
+            wl_tablet::zwp_tablet_pad_group_v2::Event::Ring { ring } => {
+                this.ring_associations.insert(ring.id(), group.id());
+                let ctor = this.partial_groups.get_or_insert_ctor(group.id());
+                ctor.rings.push(Ring {
+                    granularity: None,
+                    internal_id: ring.id().into(),
+                });
+            }
+            wl_tablet::zwp_tablet_pad_group_v2::Event::Strip { strip } => {
+                this.strip_associations.insert(strip.id(), group.id());
+                let ctor = this.partial_groups.get_or_insert_ctor(group.id());
+                ctor.strips.push(Strip {
+                    granularity: None,
+                    internal_id: strip.id().into(),
+                });
+            }
+            wl_tablet::zwp_tablet_pad_group_v2::Event::Done => {
+                // Finish the group and add it the associated pad.
+                // *Confused screaming*
+                let group_id = group.id();
+                if let Some(Ok(group)) = this.partial_groups.done(&group_id) {
+                    if let Some(pad_id) = pad_id {
+                        // Pad may be finished already or still in construction.
+                        let pad = if let Some(pad) =
+                            this.pads.iter_mut().find(|p| HasWlId::id(*p) == &pad_id)
+                        {
+                            pad
+                        } else {
+                            this.partial_pads.get_or_insert_ctor(pad_id)
+                        };
+                        // Replace existing group of this id, or add new.
+                        // This is all weird hacky ctor ordering nonsense...
+                        if let Some(pos) =
+                            pad.groups.iter().position(|g| HasWlId::id(g) == &group_id)
+                        {
+                            pad.groups[pos] = group;
+                        } else {
+                            pad.groups.push(group);
+                        }
+                    }
+                }
+            }
+            // ======== Interaction data =========
+            wl_tablet::zwp_tablet_pad_group_v2::Event::ModeSwitch {
+                mode,
+                time, //left to warn on purpose - use me!
+                ..
+            } => {
+                let Some(pad) = pad_id else { return };
+                this.events.push(raw_events::Event::Pad {
+                    pad,
+                    event: raw_events::PadEvent::Group {
+                        group: group.id(),
+                        event: raw_events::PadGroupEvent::Mode(mode),
+                    },
+                });
+            }
+            // ne
+            _ => (),
+        }
     }
     wayland_client::event_created_child!(
         TabletState,
@@ -829,25 +1072,183 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, ()> for T
 }
 impl Dispatch<wl_tablet::zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2, ()> for TabletState {
     fn event(
-        _: &mut Self,
-        _ring: &wl_tablet::zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2,
+        this: &mut Self,
+        ring: &wl_tablet::zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2,
         event: wl_tablet::zwp_tablet_pad_ring_v2::Event,
         (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        println!("ring {event:?}");
+        let Some(group) = this.ring_associations.get(&ring.id()).cloned() else {
+            return;
+        };
+        let Some(pad) = this.group_associations.get(&group).cloned() else {
+            return;
+        };
+        #[allow(clippy::match_same_arms)]
+        match event {
+            #[allow(clippy::cast_possible_truncation)]
+            wl_tablet::zwp_tablet_pad_ring_v2::Event::Angle { degrees } => {
+                if degrees.is_nan() {
+                    return;
+                }
+                let degrees = degrees as f32;
+                let radians = degrees.to_radians();
+                this.events.push(raw_events::Event::Pad {
+                    pad,
+                    event: raw_events::PadEvent::Group {
+                        group,
+                        event: raw_events::PadGroupEvent::Ring {
+                            ring: ring.id(),
+                            event: crate::events::TouchStripEvent::Pose(radians),
+                        },
+                    },
+                });
+            }
+            wl_tablet::zwp_tablet_pad_ring_v2::Event::Frame { time } => {
+                this.events.push(raw_events::Event::Pad {
+                    pad,
+                    event: raw_events::PadEvent::Group {
+                        group,
+                        event: raw_events::PadGroupEvent::Ring {
+                            ring: ring.id(),
+                            event: crate::events::TouchStripEvent::Frame(Some(FrameTimestamp(
+                                std::time::Duration::from_millis(u64::from(time)),
+                            ))),
+                        },
+                    },
+                });
+            }
+            wl_tablet::zwp_tablet_pad_ring_v2::Event::Source { source } => {
+                // Convert source, or skip if not known.
+                let source = match source {
+                    wayland_client::WEnum::Value(v) => {
+                        match v {
+                            wl_tablet::zwp_tablet_pad_ring_v2::Source::Finger => {
+                                TouchSource::Finger
+                            }
+                            // ne
+                            _ => return,
+                        }
+                    }
+                    wayland_client::WEnum::Unknown(_) => return,
+                };
+                this.events.push(raw_events::Event::Pad {
+                    pad,
+                    event: raw_events::PadEvent::Group {
+                        group,
+                        event: raw_events::PadGroupEvent::Ring {
+                            ring: ring.id(),
+                            event: crate::events::TouchStripEvent::Source(source),
+                        },
+                    },
+                });
+            }
+            wl_tablet::zwp_tablet_pad_ring_v2::Event::Stop => {
+                this.events.push(raw_events::Event::Pad {
+                    pad,
+                    event: raw_events::PadEvent::Group {
+                        group,
+                        event: raw_events::PadGroupEvent::Ring {
+                            ring: ring.id(),
+                            event: crate::events::TouchStripEvent::Up,
+                        },
+                    },
+                });
+            }
+            // ne
+            _ => (),
+        }
     }
 }
 impl Dispatch<wl_tablet::zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2, ()> for TabletState {
     fn event(
-        _: &mut Self,
-        _ring: &wl_tablet::zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2,
+        this: &mut Self,
+        strip: &wl_tablet::zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2,
         event: wl_tablet::zwp_tablet_pad_strip_v2::Event,
         (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        println!("strip {event:?}");
+        // BIIGGGG code duplication with Ring, i don't know how to fix that because this all comes from different modules and thus
+        // is actually different types......
+        let Some(group) = this.strip_associations.get(&strip.id()).cloned() else {
+            return;
+        };
+        let Some(pad) = this.strip_associations.get(&group).cloned() else {
+            return;
+        };
+        #[allow(clippy::match_same_arms)]
+        match event {
+            #[allow(clippy::cast_possible_truncation)]
+            wl_tablet::zwp_tablet_pad_strip_v2::Event::Position { position } => {
+                // Saturating-as (guaranteed by the protocol spec to be 0..=65535)
+                let position = u16::try_from(position).unwrap_or(65535);
+                let position = f32::from(position) / 65535.0;
+                this.events.push(raw_events::Event::Pad {
+                    pad,
+                    event: raw_events::PadEvent::Group {
+                        group,
+                        event: raw_events::PadGroupEvent::Strip {
+                            strip: strip.id(),
+                            event: crate::events::TouchStripEvent::Pose(position),
+                        },
+                    },
+                });
+            }
+            wl_tablet::zwp_tablet_pad_strip_v2::Event::Frame { time } => {
+                this.events.push(raw_events::Event::Pad {
+                    pad,
+                    event: raw_events::PadEvent::Group {
+                        group,
+                        event: raw_events::PadGroupEvent::Strip {
+                            strip: strip.id(),
+                            event: crate::events::TouchStripEvent::Frame(Some(FrameTimestamp(
+                                std::time::Duration::from_millis(u64::from(time)),
+                            ))),
+                        },
+                    },
+                });
+            }
+            wl_tablet::zwp_tablet_pad_strip_v2::Event::Source { source } => {
+                // Convert source, or skip if not known.
+                let source = match source {
+                    wayland_client::WEnum::Value(v) => {
+                        match v {
+                            wl_tablet::zwp_tablet_pad_strip_v2::Source::Finger => {
+                                TouchSource::Finger
+                            }
+                            // ne
+                            _ => return,
+                        }
+                    }
+                    wayland_client::WEnum::Unknown(_) => return,
+                };
+                this.events.push(raw_events::Event::Pad {
+                    pad,
+                    event: raw_events::PadEvent::Group {
+                        group,
+                        event: raw_events::PadGroupEvent::Strip {
+                            strip: strip.id(),
+                            event: crate::events::TouchStripEvent::Source(source),
+                        },
+                    },
+                });
+            }
+            wl_tablet::zwp_tablet_pad_strip_v2::Event::Stop => {
+                this.events.push(raw_events::Event::Pad {
+                    pad,
+                    event: raw_events::PadEvent::Group {
+                        group,
+                        event: raw_events::PadGroupEvent::Strip {
+                            strip: strip.id(),
+                            event: crate::events::TouchStripEvent::Up,
+                        },
+                    },
+                });
+            }
+            // ne
+            _ => (),
+        }
     }
 }

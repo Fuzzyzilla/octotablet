@@ -15,8 +15,8 @@ event-based access to user input.
 | Android                              |     Help needed |
 | Windows (`wintab`, proprietary)      |     Not planned |
 
-[^1]: Compositor support/conformance for this protocol is hit or miss and some features may not work (to be expected from an unstable API I guess!)
-[^2]: Pads and associated hardware are not exposed by the Ink API. Unsure where this information *is* reported, if anywhere.
+[^1]: Compositor support/conformance for this protocol is hit or miss and some features may not work (to be expected from an unstable protocol I guess!)
+[^2]: Only Tablets and Tools - Pads and associated hardware are not exposed by the Ink API. Unsure where this information *is* reported, if anywhere.
 
 ## Device Support
 So far, tested on:

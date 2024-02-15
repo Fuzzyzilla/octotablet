@@ -11,16 +11,10 @@ use std::fmt::Debug;
 pub(crate) mod raw;
 pub mod summary;
 
-use crate::{
-    pad::{Group, Pad},
-    platform::PlatformImpl,
-    tablet::Tablet,
-    tool::Tool,
-    Manager,
-};
+use crate::{pad, platform::PlatformImpl, tablet::Tablet, tool::Tool, Manager};
 
 /// An opaque, monotonic timestamp with unspecified epoch.
-/// The precision of this is given by [`crate::Manager::timestamp_resolution`].
+/// The precision of this is given by [`crate::Manager::timestamp_granularity`].
 ///
 /// Subtract two timestamps to get the duration between them, with [`FrameTimestamp::epoch`]
 /// being the somewhat-meaningless starting point.
@@ -45,6 +39,7 @@ impl std::ops::Sub for FrameTimestamp {
 
 #[derive(thiserror::Error, Debug)]
 pub enum NicheF32Error {
+    /// Attempted to make a non-NaN value our of NaN.
     #[error("provided value was NaN")]
     NaN,
 }
@@ -270,23 +265,67 @@ pub enum PadEvent<'a> {
     Added,
     /// Unplugged or otherwise becomes unavailable. The pad will be removed from the hardware report.
     Removed,
+    /// Group-specific events
     Group {
-        group: &'a Group,
-        event: PadGroupEvent,
-    }, //Enter,
-       //Exit,
+        group: &'a pad::Group,
+        event: PadGroupEvent<'a>,
+    },
+    /// A pad button was pressed or released. The button is a zero-based index.
+    Button {
+        button_idx: u32,
+        pressed: bool,
+        /// The group that claims ownership of the button, if any.
+        group: Option<&'a pad::Group>,
+    },
+    /// The pad has become associated with the given tablet.
+    ///
+    /// On some hardware, the physical association with a tablet is dynamic, such as the *Wacom ExpressKey Remote*.
+    /// On others, this could be a more permanent association due to it being, well, physically affixed to this tablet!
+    Enter { tablet: &'a Tablet },
+    /// The pad has lost it's tablet association.
+    Exit,
 }
-/// Events associated with a specific `Pad`.
+/// Events associated with a specific group within a larger Pad.
 #[derive(Clone, Copy, Debug)]
-pub enum PadGroupEvent {
-    /// The tablet is new. May be enumerated at the start of the program,
-    /// may be newly plugged in, or sent immediately before its first use.
-    Added,
-    /// Unplugged or otherwise becomes unavailable. The tablet will be removed from the hardware report.
-    Removed,
-    //Enter,
-    //Exit,
+pub enum PadGroupEvent<'a> {
+    /// A ring was interacted.
+    Ring {
+        ring: &'a pad::Ring,
+        /// Contains the absolute angle, when changed.
+        event: TouchStripEvent,
+    },
+    /// A strip was interacted.
+    Strip {
+        strip: &'a pad::Strip,
+        /// Contains the absolute position, when changed.
+        event: TouchStripEvent,
+    },
+    /// The mode layer was changed to the given mode, zero-indexed. Modes are to be interpreted on a per-group basis, not per-pad.
+    ///
+    /// You may want to use this to re-interpret meaning to all members of this group, in order to have
+    /// several toggle-able layers of controls with a limited number of physical buttons/strips.
+    ///
+    /// See [`pad::Group::feedback`] for optionally communicating with the system your new usage intents.
+    Mode(u32),
 }
+/// Events for actions on a touch sensitive linear strip or circular ring.
+#[derive(Clone, Copy, Debug)]
+pub enum TouchStripEvent {
+    /// Single degree-of-freedom pose. Interpretation depends on the context under which this event was fired - if from a ring,
+    /// this is in radians clockwise from "logical north". If from a strip, it is 0..1 where 0 is "logical top or left".
+    Pose(f32),
+    /// Optionally sent with a frame to describe the cause of the events.
+    Source(pad::TouchSource),
+    /// End of a frame. See [`ToolEvent`] for a description of frames. This timestamp is not necessarily
+    /// coordinated with other types of `Frame`.
+    Frame(Option<FrameTimestamp>),
+    /// The interaction is over. This is not guaranteed to be sent at any point.
+    ///
+    /// This can be used to separate different interactions on the same strip or ring, which is useful for implementing
+    /// flick scrolling for example.
+    Up,
+}
+/// Enum over all possible event sources.
 #[derive(Clone, Copy, Debug)]
 pub enum Event<'a> {
     Tool {
@@ -298,7 +337,7 @@ pub enum Event<'a> {
         event: TabletEvent,
     },
     Pad {
-        pad: &'a Pad,
+        pad: &'a pad::Pad,
         event: PadEvent<'a>,
     },
 }
@@ -350,14 +389,16 @@ impl<'manager> EventIterator<'manager> {
     pub fn manager(&'_ self) -> &'manager Manager {
         self.manager
     }
-}
-impl<'manager> Iterator for EventIterator<'manager> {
-    type Item = Event<'manager>;
-    fn next(&mut self) -> Option<Self::Item> {
+    // Get the next, or Err to retry.
+    #[allow(clippy::too_many_lines)]
+    fn try_next(&mut self) -> Result<Option<<Self as Iterator>::Item>, ()> {
         use raw::{
             Event as RawEvent, PadEvent as RawPad, TabletEvent as RawTablet, ToolEvent as RawTool,
         };
-        Some(match self.raw.next()? {
+        let Some(next) = self.raw.next() else {
+            return Ok(None);
+        };
+        Ok(Some(match next {
             RawEvent::Tool { tool, event } => {
                 // A linear scan is gonna be much more efficient than the alternatives
                 // for any reasonable number of tools. If you have like.... 30 tools at once, then
@@ -367,7 +408,8 @@ impl<'manager> Iterator for EventIterator<'manager> {
                     .tools()
                     .iter()
                     .find(|t| t.internal_id == tool)
-                    .unwrap();
+                    // Fail out (essentially a `filter` for invalid commands...)
+                    .ok_or(())?;
                 Event::Tool {
                     tool,
                     event: match event {
@@ -398,7 +440,8 @@ impl<'manager> Iterator for EventIterator<'manager> {
                     .tablets()
                     .iter()
                     .find(|t| t.internal_id == tablet)
-                    .unwrap();
+                    // Fail out (essentially a `filter` for invalid commands...)
+                    .ok_or(())?;
                 Event::Tablet {
                     tablet,
                     event: match event {
@@ -413,16 +456,97 @@ impl<'manager> Iterator for EventIterator<'manager> {
                     .pads()
                     .iter()
                     .find(|t| t.internal_id == pad)
-                    .unwrap();
+                    // Fail out (essentially a `filter` for invalid commands...)
+                    .ok_or(())?;
                 Event::Pad {
                     pad,
                     event: match event {
                         RawPad::Added => PadEvent::Added,
-                        RawPad::Group { .. } => todo!(),
+                        RawPad::Group { group, event } => {
+                            let group = pad
+                                .groups
+                                .iter()
+                                .find(|g| g.internal_id == group)
+                                // Fail out (essentially a `filter` for invalid commands...)
+                                .ok_or(())?;
+                            PadEvent::Group {
+                                group,
+                                event: match event {
+                                    raw::PadGroupEvent::Mode(m) => PadGroupEvent::Mode(m),
+                                    raw::PadGroupEvent::Ring { ring, event } => {
+                                        let ring = group
+                                            .rings
+                                            .iter()
+                                            .find(|r| r.internal_id == ring)
+                                            // Fail out (essentially a `filter` for invalid commands...)
+                                            .ok_or(())?;
+                                        PadGroupEvent::Ring { ring, event }
+                                    }
+                                    raw::PadGroupEvent::Strip { strip, event } => {
+                                        let strip = group
+                                            .strips
+                                            .iter()
+                                            .find(|s| s.internal_id == strip)
+                                            // Fail out (essentially a `filter` for invalid commands...)
+                                            .ok_or(())?;
+                                        PadGroupEvent::Strip { strip, event }
+                                    }
+                                },
+                            }
+                        }
                         RawPad::Removed => PadEvent::Removed,
+                        RawPad::Button {
+                            button_idx,
+                            pressed,
+                        } => {
+                            // Find the group that owns this button, if any.
+                            // Not all buttons must be associated with a group!
+                            // Unsure of what hardware fits this description, if any...
+                            let group = pad.groups.iter().find(|group| {
+                                // Sorted, so we can use binary search owo
+                                // (tests show that binary search is somehow still more efficient than
+                                // linear scan even on trivially smol arrays hehe. this is pointless but fun)
+                                group.buttons.binary_search(&button_idx).is_ok()
+                            });
+                            PadEvent::Button {
+                                button_idx,
+                                pressed,
+                                group,
+                            }
+                        }
+                        RawPad::Enter { tablet } => {
+                            let tablet = self
+                                .manager
+                                .tablets()
+                                .iter()
+                                .find(|t| t.internal_id == tablet)
+                                // Fail out (essentially a `filter` for invalid commands...)
+                                .ok_or(())?;
+                            PadEvent::Enter { tablet }
+                        }
+                        RawPad::Exit => PadEvent::Exit,
                     },
                 }
             }
-        })
+        }))
+    }
+}
+impl<'manager> Iterator for EventIterator<'manager> {
+    type Item = Event<'manager>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut maybe_next = self.try_next();
+        // Infinite loop safety: the inner iter is a slice iter and thus
+        // finite in size. try_next always advances.
+        while maybe_next.is_err() {
+            // report impl bug.
+            #[cfg(debug_assertions)]
+            {
+                eprintln!("[octotablet] implementation bug! failed to build event, skipping");
+            }
+            maybe_next = self.try_next();
+        }
+        // While condition says it's Ok
+        // this will be Ok(None) on finish.
+        maybe_next.unwrap()
     }
 }
