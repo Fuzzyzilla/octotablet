@@ -39,8 +39,12 @@ struct Viewer {
     // Allow code to set a duration to poll events more rapidly.
     // Egui does not automatically update when the tablet does!
     poll_until: std::time::Instant,
+    // Show a toggle for whether to show the event queue, off by default.
     show_events: bool,
+    // The event queue in question:
     events_stream: std::collections::VecDeque<(String, Color32)>,
+    // a number that the user can scroll with rings or sliders.
+    pad_scroll: f32,
 }
 impl Viewer {
     fn new(context: &CreationContext<'_>) -> Self {
@@ -55,6 +59,7 @@ impl Viewer {
             poll_until: now,
             show_events: false,
             events_stream: std::collections::VecDeque::with_capacity(128),
+            pad_scroll: 0.0,
         }
     }
 }
@@ -143,7 +148,12 @@ impl eframe::App for Viewer {
         egui::TopBottomPanel::bottom("viewer")
             .exact_height(ctx.available_rect().height() / 2.0)
             .frame(Frame::canvas(&ctx.style()))
-            .show(ctx, |ui| ui.add(ShowPen { summary }));
+            .show(ctx, |ui| {
+                ui.add(ShowPen {
+                    summary,
+                    pad_scroll: &mut self.pad_scroll,
+                })
+            });
 
         // Show an info panel listing connected devices and their capabilities
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -442,9 +452,14 @@ fn pretty_print_event(event: octotablet::events::Event) -> (String, Color32) {
 /// Pen test area, showing off collected event data visually.
 struct ShowPen<'a> {
     summary: Summary<'a>,
+    pad_scroll: &'a mut f32,
 }
 impl egui::Widget for ShowPen<'_> {
     fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let Self {
+            summary,
+            pad_scroll,
+        } = self;
         let (resp, painter) = ui.allocate_painter(
             ui.available_size(),
             egui::Sense {
@@ -453,10 +468,11 @@ impl egui::Widget for ShowPen<'_> {
                 focusable: false,
             },
         );
+
         // Just play with the axes a bit to make something look nice :3
         // All of the math fiddling and constants are just for aesthetics, little of it means anything lol
         // Visualize as much as we can so we can tell at a glance everything is working.
-        if let ToolState::In(state) = self.summary.tool {
+        if let ToolState::In(state) = summary.tool {
             // ======= Interation text ======
             {
                 // Show the name
@@ -513,13 +529,12 @@ impl egui::Widget for ShowPen<'_> {
             // ======= Visualize Pose ======
             ui.ctx().set_cursor_icon(egui::CursorIcon::None);
             // Fade out with distance.
-            let opacity = 1.0
-                - state
-                    .pose
-                    .distance
-                    .get()
-                    .map(|v| v.powf(1.5))
-                    .unwrap_or(0.0);
+            let opacity = state
+                .pose
+                .distance
+                .get()
+                .map(|v| 1.0 - v.powf(1.5))
+                .unwrap_or(1.0);
 
             // Show an arrow in the direction of tilt.
             let tip_pos = egui::Pos2 {
@@ -561,6 +576,111 @@ impl egui::Widget for ShowPen<'_> {
                 Color32::WHITE,
             );
             ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+        }
+        // Pad stuffs!
+        // ============ Show a scroll wheel based on rings and strips, with absolute touch positions ==============
+        {
+            const SCROLL_CIRCLE_SIZE: f32 = 50.0;
+            const ABSOLUTE_CIRCLE_SIZE: f32 = 10.0;
+
+            let mut interacted = false;
+            let mut absolute_ring = None;
+            let mut absolute_strip = None;
+            // For every slider (ring or strip), update the delta.
+            for pad in &summary.pads {
+                for group in &pad.groups {
+                    for ring in &group.rings {
+                        if let Some(delta) = ring.delta_radians {
+                            *pad_scroll += delta;
+                            interacted = true;
+                        }
+                        // Pressed and absolute angle known
+                        if ring.touched_by.is_some() && ring.angle.is_some() {
+                            absolute_ring = Some(ring.angle.unwrap());
+                        }
+                    }
+                    for strip in &group.strips {
+                        if let Some(delta) = strip.delta {
+                            *pad_scroll += delta;
+                            interacted = true;
+                        }
+                        // Pressed and absolute position known
+                        if strip.touched_by.is_some() && strip.position.is_some() {
+                            absolute_strip = Some(strip.position.unwrap());
+                        }
+                    }
+                }
+            }
+
+            let interacted =
+                ui.ctx()
+                    .animate_bool_with_time(egui::Id::new("scroll-opacity"), interacted, 2.0);
+
+            let color = Color32::WHITE.gamma_multiply(interacted * 0.75 + 0.25);
+            let stroke = Stroke::new(interacted * 3.0 + 2.0, color);
+
+            // 0 is north, radians CW
+            // Convert to 0 is East, radians CW.
+            let angled =
+                Vec2::angled(-std::f32::consts::FRAC_PI_2 + *pad_scroll) * SCROLL_CIRCLE_SIZE;
+            // bottom corner with margin.
+            let center = resp.rect.expand(-SCROLL_CIRCLE_SIZE * 1.2).left_bottom();
+            // Base circle shape
+            painter.circle_stroke(center, SCROLL_CIRCLE_SIZE, stroke);
+            // Line showing current scroll position
+            painter.line_segment([center + angled, center + angled * 0.5], stroke);
+            // Circle showing absolute touch position
+            if let Some(absolute_ring) = absolute_ring {
+                let angled = Vec2::angled(-std::f32::consts::FRAC_PI_2 + absolute_ring)
+                    * (SCROLL_CIRCLE_SIZE - ABSOLUTE_CIRCLE_SIZE);
+                painter.circle_filled(center + angled * 0.9, ABSOLUTE_CIRCLE_SIZE, color);
+            }
+            // Vertical slider showing absolute strip position. (we don't know if this is a horizontal or
+            // vertical strip, just gotta make this assumption)
+            if let Some(absolute_strip) = absolute_strip {
+                // Start to the top right of the scroll circle
+                let start_pos = center
+                    + Vec2::new(
+                        SCROLL_CIRCLE_SIZE * 1.1,
+                        -SCROLL_CIRCLE_SIZE + ABSOLUTE_CIRCLE_SIZE,
+                    );
+                // Move down two units over a swipe.
+                let length_vec =
+                    Vec2::new(0.0, SCROLL_CIRCLE_SIZE * 2.0 - ABSOLUTE_CIRCLE_SIZE * 2.0);
+
+                painter.line_segment([start_pos, start_pos + length_vec], stroke);
+                painter.circle_filled(
+                    start_pos + absolute_strip * length_vec,
+                    ABSOLUTE_CIRCLE_SIZE,
+                    color,
+                );
+            }
+        }
+        // ================ Show buttons ===================
+        {
+            const BUTTON_CIRCLE_SIZE: f32 = 15.0;
+            // Each pad with buttons gets it's own column in a square grid
+            for (x, buttons) in summary
+                .pads
+                .iter()
+                .filter_map(|pad| (!pad.buttons.is_empty()).then_some(&pad.buttons))
+                .enumerate()
+            {
+                // Each button goes down in the column
+                for (y, button) in buttons.iter().enumerate() {
+                    let center = resp.rect.right_top()
+                        + Vec2::new(-(x as f32 + 0.5), y as f32 + 0.5) * BUTTON_CIRCLE_SIZE * 2.5;
+                    painter.add(if button.currently_pressed {
+                        Shape::circle_filled(center, BUTTON_CIRCLE_SIZE, Color32::WHITE)
+                    } else {
+                        Shape::circle_stroke(
+                            center,
+                            BUTTON_CIRCLE_SIZE,
+                            Stroke::new(2.0, Color32::from_white_alpha(128)),
+                        )
+                    });
+                }
+            }
         }
         resp
     }

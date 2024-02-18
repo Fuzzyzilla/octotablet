@@ -78,10 +78,11 @@ pub mod group {
     crate::macro_bits::impl_get_id!(ID for Group);
 }
 
-/// The cause of a ring or strip interaction, if known
+/// The cause of a ring or strip interaction.
 #[derive(Eq, PartialEq, Copy, Clone, Debug, Hash)]
 pub enum TouchSource {
-    /// Touch was reported due to a finger touching the surface.
+    Unknown,
+    /// A finger is touching the surface.
     Finger,
 }
 pub mod ring {
