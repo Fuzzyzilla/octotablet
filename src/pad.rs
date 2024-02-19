@@ -11,80 +11,103 @@
 //!
 //! ## Quirks
 //! Not every tablet with buttons or other extra features reports pads. Some *Gaomon* and *XPPEN* tablets, for example,
-//! merely emulate keypresses in the driver in response to button clicks, which is transparent to the client and thus not
+//! emulate keypresses in the driver in response to button clicks, which is transparent to the client and thus not able to be
 //! reported by this crate.
 
-/// After the user switches to the given mode index, provide feedback to the OS as to the roles
-/// of buttons, sliders, and rings. Called potentially many times per switch.
-pub type FeedbackFn = dyn FnMut(&Pad, u32, ElementType) -> String;
-pub enum ElementType {
-    Button,
-    Ring,
-    Slider,
-}
+pub use group::Group;
+pub use ring::Ring;
+pub use strip::Strip;
 
+#[derive(Debug)]
 pub struct Pad {
-    pub(crate) obj_id: crate::InternalID,
-    pub button_count: u32,
+    pub(crate) internal_id: crate::InternalID,
+    /// How many buttons total are on this pad? Buttons may be further reserved by groups, see [`Group::buttons`] for associating
+    /// a button with it's group.
+    pub total_buttons: u32,
+    /// Groups within this pad. Always at least one.
+    // (todo: make that a type-level guarantee)
+    pub groups: Vec<Group>,
 }
-impl std::fmt::Debug for Pad {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut this = fmt.debug_struct("Pad");
-        let _ = self.obj_id;
-        this.field("button_count", &self.button_count);
-        this.finish()
+crate::macro_bits::impl_get_id!(ID for Pad);
+// Submodules for nicer ID names.
+pub mod group {
+    /// The type of interactable being queried in a [`FeedbackFn`]
+    #[derive(Copy, Clone)]
+    pub enum FeedbackElement<'a> {
+        /// The [button](super::Pad::total_buttons) with the given pad index. This will only
+        /// be called with buttons [owned](Group::buttons) by the relevant group.
+        Button(u32),
+        Ring(&'a super::Ring),
+        Strip(&'a super::Strip),
     }
+
+    /// After the group switches to the given mode index, provide feedback to the OS as to the roles
+    /// of buttons, sliders, and rings within the group. Called potentially many times per switch.
+    pub type FeedbackFn = dyn FnMut(&Group, u32, FeedbackElement<'_>) -> String;
+
+    pub struct Group {
+        pub(crate) internal_id: crate::InternalID,
+        /// How many mode layers does this group cycle through?
+        /// If None, the group does not expose the ability to shift through modes.
+        pub mode_count: Option<std::num::NonZeroU32>,
+        /// Sorted list of the pad button indices that are owned by this group.
+        /// This is some subset of the [buttons reported by the Pad](super::Pad::total_buttons).
+        pub buttons: Vec<u32>,
+        pub rings: Vec<super::Ring>,
+        pub strips: Vec<super::Strip>,
+        /// Called synchronously for each group element (buttons, rings, and strips) after a modeswitch on supporting platforms.
+        /// Provides new description text for the roles of each element, which may be shown by on-screen displays or other means.
+        ///
+        /// *This is not guaranteed to be called at any point!*
+        pub feedback: Option<Box<FeedbackFn>>,
+    }
+    // Manual impl since `feedback` is !Debug
+    impl std::fmt::Debug for Group {
+        fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let mut this = fmt.debug_struct("PadGroup");
+            this.field("internal_id", &self.internal_id);
+            this.field("mode_count", &self.mode_count);
+            this.field("buttons", &self.buttons);
+            this.field("rings", &self.rings);
+            this.field("strips", &self.strips);
+            // !Debug, so just opaquely show whether it's some or None
+            this.field("feeback", &self.feedback.as_ref().map(|_| "..."));
+            this.finish()
+        }
+    }
+    crate::macro_bits::impl_get_id!(ID for Group);
 }
 
-pub struct Group {
-    pub(crate) obj_id: crate::InternalID,
-    pub mode_count: u32,
-    /// Called synchronously for each element after a modeswitch on supporting platforms. Provides new description text
-    /// for the roles of each element, which may be shown by on-screen displays or other means.
-    pub feedback: Option<Box<FeedbackFn>>,
+/// The cause of a ring or strip interaction.
+#[derive(Eq, PartialEq, Copy, Clone, Debug, Hash)]
+pub enum TouchSource {
+    Unknown,
+    /// A finger is touching the surface.
+    Finger,
 }
-impl std::fmt::Debug for Group {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut this = fmt.debug_struct("PadGroup");
-        let _ = self.obj_id;
-        this.field("mode_count", &self.mode_count);
-        let _ = self.feedback;
-        this.finish()
+pub mod ring {
+    /// A continuous circular touch-sensitive area or scrollwheel, reporting absolute position in radians clockwise from "logical north."
+    #[derive(Debug)]
+    pub struct Ring {
+        pub(crate) internal_id: crate::InternalID,
+        /// Granularity of the reported angle, if known. This does not affect the range of values.
+        ///
+        /// For example, if the ring reports a granularity of `32,768`, there are
+        /// `32,768` unique angle values between `0` and `TAU` radians.
+        pub granularity: Option<u32>,
     }
+    crate::macro_bits::impl_get_id!(ID for Ring);
 }
-
-/// A continuous circular touch-sensitive area or scrollwheel, reporting absolute position in radians clockwise from "logical north."
-pub struct Ring {
-    pub(crate) obj_id: crate::InternalID,
-    /// Granularity of the reported angle, if known. This does not affect the range of values.
-    ///
-    /// For example, if the ring reports a granularity of `32,768`, there are
-    /// `32,768` unique angle values between `0` and `TAU` radians.
-    pub granularity: Option<u32>,
-}
-impl std::fmt::Debug for Ring {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut this = fmt.debug_struct("PadRing");
-        let _ = self.obj_id;
-        this.field("granularity", &self.granularity);
-        this.finish()
+pub mod strip {
+    /// A touch-sensitive strip or slider, reporting absolute position in `0..=1` where 0 is "logical top/left."
+    #[derive(Debug)]
+    pub struct Strip {
+        pub(crate) internal_id: crate::InternalID,
+        /// Granularity of the reported linear position, if known. This does not affect the range of values.
+        ///
+        /// For example, if the ring reports a granularity of `32,768`, there are
+        /// `32,768` unique slider position values between `0` and `1`.
+        pub granularity: Option<u32>,
     }
-}
-
-/// A touch-sensitive strip or slider, reporting absolute position in `0..=1` where 0 is "logical top/left."
-pub struct Strip {
-    pub(crate) obj_id: crate::InternalID,
-    /// Granularity of the reported linear position, if known. This does not affect the range of values.
-    ///
-    /// For example, if the ring reports a granularity of `32,768`, there are
-    /// `32,768` unique slider position values between `0` and `1`.
-    pub granularity: Option<u32>,
-}
-impl std::fmt::Debug for Strip {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut this = fmt.debug_struct("PadStrip");
-        let _ = self.obj_id;
-        this.field("granularity", &self.granularity);
-        this.finish()
-    }
+    crate::macro_bits::impl_get_id!(ID for Strip);
 }

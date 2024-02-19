@@ -17,8 +17,6 @@
 
 use std::fmt::Debug;
 
-use crate::platform::InternalID;
-
 bitflags::bitflags! {
     /// Bitflags describing all supported Axes. See [`Axis`] for descriptions.
     #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -80,7 +78,7 @@ impl From<Axis> for AvailableAxes {
     }
 }
 
-#[derive(Clone, Copy, Debug, strum::AsRefStr)]
+#[derive(Clone, Copy, Debug, strum::AsRefStr, PartialEq, Eq)]
 pub enum Type {
     Pen,
     Pencil,
@@ -106,8 +104,7 @@ pub enum DistanceUnit {
     #[default]
     Unitless,
     /// The distance is reported as an absolute distance in centimeters.
-    /// The maximum sensed distance in cm is included, if available.
-    Cm { max: Option<f32> },
+    Cm,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -122,7 +119,7 @@ pub struct AxisInfo {
 /// Description of the capabilities of a tool.
 pub struct Tool {
     /// Platform internal ID.
-    pub(crate) obj_id: InternalID,
+    pub(crate) internal_id: crate::InternalID,
     /// An identifier that is baked into the hardware of the tool.
     /// Likely to remain stable over executions, and unique across even devices of the same model.
     /// It is usable to save per-tool configurations to disk, for example.
@@ -133,7 +130,7 @@ pub struct Tool {
     /// If this is present, it's also a hint that the tool may be allowed to freely roam between
     /// several connected tablets. Otherwise, the pen is considered tied to the first tablet it comes
     /// [in proximity](crate::events::ToolEvent::In) to.
-    pub id: Option<u64>,
+    pub hardware_id: Option<u64>,
     /// A unique tool type reported by wacom devices. With a lookup table of wacom hardware,
     /// it is possible to find the specific model and additional capabilities of the device.
     pub wacom_id: Option<u64>,
@@ -150,8 +147,8 @@ pub struct Tool {
 impl Debug for Tool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut this = f.debug_struct("Tool");
-        let _ = self.obj_id;
-        this.field("id", &self.id);
+        let _ = self.internal_id;
+        this.field("id", &self.hardware_id);
         this.field("wacom_id", &self.wacom_id);
         this.field("tool_type", &self.tool_type);
         this.field("available_axes", &self.available_axes);
@@ -185,3 +182,5 @@ impl Tool {
             .then_some(self.distance_unit)
     }
 }
+
+crate::macro_bits::impl_get_id!(ID for Tool);

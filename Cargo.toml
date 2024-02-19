@@ -36,6 +36,7 @@ enum_dispatch = "0.3.12"
 raw-window-handle = "0.6.0"
 strum = { version = "0.25.0", features = ["derive"] }
 thiserror = "1.0.56"
+smallvec = "1.13.1"
 
 # Wayland `tablet_unstable_v2` deps.
 # Crazy `cfg` stolen verbatim from winit's Cargo.toml as I assume they have more wisdom than I

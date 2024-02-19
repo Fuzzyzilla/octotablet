@@ -2013,6 +2013,7 @@ dependencies = [
  "eframe",
  "enum_dispatch",
  "raw-window-handle 0.6.0",
+ "smallvec",
  "softbuffer",
  "strum",
  "thiserror",
