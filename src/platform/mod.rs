@@ -80,7 +80,7 @@ pub(crate) enum RawEventsIter<'a> {
     #[cfg(wl_tablet)]
     Wayland(std::slice::Iter<'a, crate::events::raw::Event<wl::ID>>),
     #[cfg(ink_rts)]
-    Ink(std::slice::Iter<'a, raw::Event<ink::ID>>),
+    Ink(std::slice::Iter<'a, crate::events::raw::Event<ink::ID>>),
 }
 impl Iterator for RawEventsIter<'_> {
     type Item = crate::events::raw::Event<InternalID>;

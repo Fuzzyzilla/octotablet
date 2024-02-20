@@ -51,9 +51,7 @@ impl Viewer {
         // Context gives us access to the handle, connect to the tablet server:
         Self {
             // Safety: Destroyed in `on_exit`, before we lose the display.
-            manager: unsafe {
-                Builder::new().build_raw(context.display_handle().unwrap().as_raw())
-            },
+            manager: unsafe { Builder::new().build_raw(context) },
             last_frame_time: now,
             poll_until: now,
             show_events: false,
