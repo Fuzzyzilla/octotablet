@@ -100,7 +100,8 @@ impl Builder {
                 {
                     Ok(crate::platform::PlatformManager::Ink(
                         // Safety: forwarded to this fn's contract.
-                        unsafe { crate::platform::ink::Manager::build_hwnd(wh.hwnd) },
+                        // Fixme: unwrap.
+                        unsafe { crate::platform::ink::Manager::build_hwnd(wh.hwnd).unwrap() },
                     ))
                 } else {
                     Err(BuildError::Unsupported)

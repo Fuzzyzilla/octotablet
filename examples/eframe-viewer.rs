@@ -166,7 +166,7 @@ impl eframe::App for Viewer {
 
                     ui.label("Tablets");
                     for (idx, tablet) in manager.tablets().iter().enumerate() {
-                        egui::CollapsingHeader::new(&tablet.name)
+                        egui::CollapsingHeader::new(tablet.name.as_deref().unwrap_or("Unknown Tablet"))
                             .id_source((&tablet.name, idx))
                             .show(ui, |ui| {
                                 // Pretty-print the USBID
@@ -483,7 +483,7 @@ impl egui::Widget for ShowPen<'_> {
                 let rect = painter.text(
                     cursor,
                     Align2::LEFT_TOP,
-                    format!("{pen_name} on {}", state.tablet.name),
+                    format!("{pen_name} on {}", state.tablet.name.as_deref().unwrap_or("Unknown Tablet")),
                     FontId::default(),
                     Color32::WHITE,
                 );

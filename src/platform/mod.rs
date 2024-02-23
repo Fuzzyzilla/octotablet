@@ -54,7 +54,7 @@ impl InternalID {
     }
     #[cfg(ink_rts)]
     #[inline]
-    pub(crate) fn unwrap_ink(&self) -> &u32 {
+    pub(crate) fn unwrap_ink(&self) -> &ink::ID {
         #[allow(unreachable_patterns)]
         #[allow(clippy::match_wildcard_for_single_variants)]
         match self {

@@ -133,3 +133,11 @@ pub struct Summary<'a> {
     /// A report for each pad, giving final positions of sliders and rings, current modes, and counts of button presses during the frame.
     pub pads: Vec<PadState<'a>>,
 }
+impl Summary<'_> {
+    pub(crate) fn empty() -> Self {
+        Self {
+            tool: ToolState::Out,
+            pads: Vec::new(),
+        }
+    }
+}

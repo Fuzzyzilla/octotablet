@@ -130,7 +130,7 @@ impl HasWlId for Tablet {
     fn new_default(id: ID) -> Self {
         Tablet {
             internal_id: id.into(),
-            name: String::new(),
+            name: None,
             usb_id: None,
         }
     }
@@ -599,7 +599,7 @@ impl Dispatch<wl_tablet::zwp_tablet_v2::ZwpTabletV2, ()> for TabletState {
                     .map(|(vid, pid)| UsbId { vid, pid });
             }
             Event::Name { name } => {
-                this.partial_tablets.get_or_insert_ctor(tablet.id()).name = name;
+                this.partial_tablets.get_or_insert_ctor(tablet.id()).name = Some(name);
             }
             Event::Path { .. } => (),
             Event::Removed => {

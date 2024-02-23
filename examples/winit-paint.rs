@@ -114,7 +114,13 @@ fn main() {
 
             if let Event::WindowEvent { event, .. } = e {
                 match event {
-                    WindowEvent::CloseRequested => target.exit(),
+                    // Esc pressed or system-specific close event .
+                    WindowEvent::KeyboardInput {
+                        event: winit::event::KeyEvent{
+                            physical_key: winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape),
+                            state: winit::event::ElementState::Pressed,
+                        ..},
+                    .. }  | WindowEvent::CloseRequested => target.exit(),
                     WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                         if scale_factor != 1.0 {
                             // Nothing to test this on, so it's hard to write the transform math... Fixme!
@@ -160,7 +166,7 @@ fn main() {
                                 let r = from.red();
                                 let g = from.green();
                                 let b = from.blue();
-                                // softbuffer requires `0000'0000'rrrr'rrrr'gggbg'gggg'bbb'bbbb` format
+                                // softbuffer requires `0000'0000'rrrr'rrrr'gggg'gggg'bbbb'bbbb` format
                                 *into = (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b));
                             });
                         buffer.present().unwrap();
@@ -176,6 +182,7 @@ fn main() {
         // Events are reported upwards of 1000 per second, so much detail!
         let events = manager.pump().unwrap();
         for event in events {
+            println!("{event:?}");
             // We only care about tool events...
             if let octotablet::events::Event::Tool { tool, event } = event {
                 // We're already listening on a different tool...
