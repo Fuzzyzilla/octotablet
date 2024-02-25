@@ -134,6 +134,8 @@ pub struct Summary<'a> {
     pub pads: Vec<PadState<'a>>,
 }
 impl Summary<'_> {
+    // Hmmst
+    #[cfg_attr(not(ink_rts), allow(dead_code))]
     pub(crate) fn empty() -> Self {
         Self {
             tool: ToolState::Out,

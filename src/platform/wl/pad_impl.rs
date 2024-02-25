@@ -51,7 +51,7 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for TabletState 
             Event::Button {
                 button,
                 state,
-                time, //use me!
+                time: _, //use me!
             } => {
                 let pressed = matches!(
                     state,

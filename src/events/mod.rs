@@ -7,11 +7,10 @@
 //! In general, if you're making a drawing app, use events to inspect the exact path taken during the frame.
 //! If you're using the tools as a mouse-with-extras and only care about the final position, use summaries.
 
-use std::fmt::Debug;
 pub(crate) mod raw;
 pub mod summary;
 
-use crate::{pad, platform::PlatformImpl, tablet::Tablet, tool::Tool, Manager};
+use crate::{axis::Pose, pad, platform::PlatformImpl, tablet::Tablet, tool::Tool, Manager};
 
 /// An opaque, monotonic timestamp with unspecified epoch.
 /// The precision of this is given by [`crate::Manager::timestamp_granularity`].
@@ -34,161 +33,6 @@ impl std::ops::Sub for FrameTimestamp {
     type Output = std::time::Duration;
     fn sub(self, rhs: Self) -> Self::Output {
         self.0 - rhs.0
-    }
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum NicheF32Error {
-    /// Attempted to make a non-NaN value our of NaN.
-    #[error("provided value was NaN")]
-    NaN,
-}
-
-/// An Option type where NaN is the niche.
-// Todo: manual Ord that makes it not partial.
-#[derive(Copy, Clone, PartialOrd)]
-pub struct NicheF32(f32);
-impl NicheF32 {
-    pub const NONE: NicheF32 = NicheF32(f32::NAN);
-    /// Wrap a float in this niche, `NaN` coercing to `None`.
-    // Not pub cause it might be a footgun lol
-    #[must_use]
-    const fn wrap(value: f32) -> Self {
-        Self(value)
-    }
-    /// Wrap a non-`NaN` value. Fails with `None` if the value was `NaN`.
-    #[must_use]
-    pub fn new_some(value: f32) -> Option<Self> {
-        (!value.is_nan()).then_some(Self::wrap(value))
-    }
-    /// Get a `None` niche.
-    #[must_use]
-    pub const fn new_none() -> Self {
-        Self::NONE
-    }
-    /// Get the optional value within. If `Some`, guaranteed to not be `NaN`.
-    #[must_use]
-    pub fn get(self) -> Option<f32> {
-        (!self.0.is_nan()).then_some(self.0)
-    }
-    /// Create from an [`Option`]. `Some` and `None` variants will correspond exactly with return value of `self.get()`.
-    /// # Safety
-    /// The value must not be `Some(NaN)`.
-    #[must_use]
-    pub unsafe fn from_option_unchecked(value: Option<f32>) -> Self {
-        unsafe { value.try_into().unwrap_unchecked() }
-    }
-}
-impl TryFrom<Option<f32>> for NicheF32 {
-    type Error = NicheF32Error;
-    fn try_from(value: Option<f32>) -> Result<Self, Self::Error> {
-        if value.is_some_and(f32::is_nan) {
-            Err(NicheF32Error::NaN)
-        } else {
-            // Not Some(NAN), so we can convert.
-            Ok(NicheF32(value.unwrap_or(f32::NAN)))
-        }
-    }
-}
-impl Default for NicheF32 {
-    fn default() -> Self {
-        // Not a zero-pattern which is typical of most primitives,
-        // but more reasonable than Some(0.0) being the default.
-        Self::new_none()
-    }
-}
-impl Debug for NicheF32 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.get())
-    }
-}
-impl PartialEq for NicheF32 {
-    fn eq(&self, other: &Self) -> bool {
-        // All NaNs are filtered to None (and considered to be equal here)
-        // The remaining f32 comp is Full.
-        self.get() == other.get()
-    }
-}
-// One side being non-nan makes it no longer partial!
-impl Eq for NicheF32 {}
-impl PartialEq<f32> for NicheF32 {
-    fn eq(&self, other: &f32) -> bool {
-        if let Some(value) = self.get() {
-            value == *other
-        } else {
-            false
-        }
-    }
-}
-impl PartialEq<NicheF32> for f32 {
-    fn eq(&self, other: &NicheF32) -> bool {
-        other == self
-    }
-}
-
-/// Represents the state of all axes of a tool at some snapshot in time.
-///
-/// Interpretations of some axes require querying the `Tool` that generated this pose.
-///
-/// # Quirks
-/// There may be axis values reported that the tool does *not* advertise as available,
-/// and axes it does advertise may be missing. These should not necessarily be written off entirely -
-/// sometimes it truly has the capability and just fails to advertise it!
-// I would *REALLY* like to make the fact that these f32's are non-NaN and finite an invariant, but I literally
-// cannot figure out an ergonomic way to do that. Private fields + read-only accessors is one way, but it sucks to use
-// for the client. Unsafe wrapper type feels terrible too. Weh!
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
-pub struct Pose {
-    /// X, Y position, in pixels from the top left of the associated compositor surface.
-    /// This may have subpixel precision, and may exceed your window size in the negative or
-    /// positive directions.
-    pub position: [f32; 2],
-    /// Distance from the surface of the tablet, if available. See the tool's
-    /// [`distance_unit`](crate::tool::Tool::distance_unit) for interpretation of the value.
-    ///
-    /// If `DistanceUnit::Unitless`, this is a normalized `0..=1` value,
-    /// otherwise it is unbounded.
-    ///
-    /// # Quirks
-    /// This will not necessarily be zero when in contact with the device, and may
-    /// stop updating after contact is reported.
-    pub distance: NicheF32,
-    /// Perpindicular pressure, if available. `0..=1`
-    ///
-    /// # Quirks
-    /// * Pressure is often non-linear, as configured by the user in the driver software.
-    /// * Full pressure may not correspond to `1.0`.
-    pub pressure: NicheF32,
-    /// Absolute tilt in radians from perpendicular in the X and Y directions. That is, the first angle
-    /// describes the angle between the pen and the Z (perpendicular to the surface) axis along the XZ plane,
-    /// and the second angle describes the angle between the pen and Z on the YZ plane.
-    ///
-    /// `[+,+]` is right+towards user, and `[-,-]` is left+away from user.
-    /// # Quirks
-    /// In theory the vector `[sin x, sin y]` should describe a projection of the pen's body down on the page,
-    /// with length <= 1. However in practice, reported values may break this trigonometric invariant.
-    pub tilt: Option<[f32; 2]>,
-    /// Absolute roll in radians, if available, around the tool's long axis. `0..<2pi`, where zero is a
-    /// hardware-determined "natural" zero-point.
-    pub roll: NicheF32,
-    /// Absolute scroll wheel angle and clicks in radians, unspecified range or zero-point.
-    /// Note that the clicks are *not* a delta.
-    pub wheel: Option<(f32, i32)>,
-    /// Absolute slider position, if available. `-1..=1`, where zero is the "natural" position.
-    pub slider: NicheF32,
-}
-impl Pose {
-    pub(crate) fn debug_assert_not_nan(&self) {
-        #[cfg(debug_assertions)]
-        {
-            assert!(!self.position[0].is_nan() && !self.position[1].is_nan());
-            if let Some(tilt) = self.tilt {
-                assert!(!tilt[0].is_nan() && !tilt[1].is_nan());
-            }
-            if let Some(wheel) = self.wheel {
-                assert!(!wheel.0.is_nan());
-            }
-        }
     }
 }
 

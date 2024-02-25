@@ -1,7 +1,7 @@
 //! Dispatch impls for Tool-related events.
 use super::{
-    raw_events, summary::Tool, wl_tablet, AvailableAxes, Connection, Dispatch, FrameState,
-    NicheF32, Pose, Proxy, QueueHandle, TabletState,
+    raw_events, summary::Tool, wl_tablet, Connection, Dispatch, FrameState, NicheF32, Pose, Proxy,
+    QueueHandle, TabletState,
 };
 
 impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletState {
@@ -21,15 +21,53 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
             Event::Capability {
                 capability: wayland_client::WEnum::Value(capability),
             } => {
+                use crate::axis::{self, unit};
                 use wl_tablet::zwp_tablet_tool_v2::Capability;
                 let ctor = this.partial_tools.get_or_insert_ctor(tool.id());
+                // The wayland protocol makes blanket guarantees about the precise aspects of the ranges
+                // and units of these axes, they are not dynamic per-device.
+                // We don't report the "65535" granularities since they would be highly misleading to the user.
                 match capability {
-                    Capability::Distance => ctor.available_axes.insert(AvailableAxes::DISTANCE),
-                    Capability::Pressure => ctor.available_axes.insert(AvailableAxes::PRESSURE),
-                    Capability::Rotation => ctor.available_axes.insert(AvailableAxes::ROLL),
-                    Capability::Slider => ctor.available_axes.insert(AvailableAxes::SLIDER),
-                    Capability::Tilt => ctor.available_axes.insert(AvailableAxes::TILT),
-                    Capability::Wheel => ctor.available_axes.insert(AvailableAxes::WHEEL),
+                    Capability::Distance => {
+                        ctor.axes.distance = Some(axis::LinearInfo {
+                            unit: unit::Linear::Unitless,
+                            info: axis::Info {
+                                limits: Some(axis::Limits { min: 0.0, max: 1.0 }),
+                                granularity: None,
+                            },
+                        });
+                    }
+                    Capability::Pressure => {
+                        ctor.axes.pressure = Some(axis::ForceInfo {
+                            info: axis::Info {
+                                limits: Some(axis::Limits { min: 0.0, max: 1.0 }),
+                                granularity: None,
+                            },
+                            unit: unit::Force::Unitless,
+                        });
+                    }
+                    Capability::Rotation => ctor.axes.roll = Some(axis::Info::default()),
+                    Capability::Slider => {
+                        ctor.axes.slider = Some(axis::Info {
+                            limits: Some(axis::Limits {
+                                min: 1.0,
+                                max: -1.0,
+                            }),
+                            granularity: None,
+                        });
+                    }
+                    Capability::Tilt => {
+                        ctor.axes.tilt = Some(axis::AngleInfo {
+                            info: axis::Info::default(),
+                            unit: unit::Angle::Radians,
+                        });
+                    }
+                    Capability::Wheel => {
+                        ctor.axes.wheel = Some(axis::AngleInfo {
+                            info: axis::Info::default(),
+                            unit: unit::Angle::Radians,
+                        });
+                    }
                     // ne
                     _ => (),
                 }

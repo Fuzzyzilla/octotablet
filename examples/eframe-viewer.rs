@@ -5,10 +5,10 @@ use eframe::{
     CreationContext,
 };
 use octotablet::{
+    axis::AvailableAxes,
     builder::{BuildError, Builder},
     events::summary::{InState, Summary, ToolState},
     tablet::UsbId,
-    tool::{AvailableAxes, Axis},
     Manager,
 };
 
@@ -166,12 +166,14 @@ impl eframe::App for Viewer {
 
                     ui.label("Tablets");
                     for (idx, tablet) in manager.tablets().iter().enumerate() {
-                        egui::CollapsingHeader::new(tablet.name.as_deref().unwrap_or("Unknown Tablet"))
-                            .id_source((&tablet.name, idx))
-                            .show(ui, |ui| {
-                                // Pretty-print the USBID
-                                ui.label(RichText::new(format_id(tablet.usb_id)).monospace())
-                            });
+                        egui::CollapsingHeader::new(
+                            tablet.name.as_deref().unwrap_or("Unknown Tablet"),
+                        )
+                        .id_source((&tablet.name, idx))
+                        .show(ui, |ui| {
+                            // Pretty-print the USBID
+                            ui.label(RichText::new(format_id(tablet.usb_id)).monospace())
+                        });
                     }
                     if manager.tablets().is_empty() {
                         ui.label(RichText::new("No tablets...").weak());
@@ -247,18 +249,18 @@ impl eframe::App for Viewer {
                             .id_source((tool.hardware_id, tool.wacom_id, idx))
                             .show(ui, |ui| {
                                 ui.label(format!("Wacom ID: {:08X?}", tool.wacom_id,));
-                                for axis in tool.available_axes.iter_axes() {
+                                for axis in
+                                    <octotablet::axis::Axis as strum::IntoEnumIterator>::iter()
+                                {
+                                    // Todo: list units lol
                                     ui.label(format!(
-                                        "{} - {:?}",
+                                        " - {}: {}",
                                         axis.as_ref(),
-                                        tool.axis(axis).unwrap()
+                                        tool.axes.info(axis).map_or_else(
+                                            |_| "Unsupported".to_owned(),
+                                            |info| format!("{info:?}"),
+                                        ),
                                     ));
-                                    if axis == Axis::Distance {
-                                        ui.label(format!(
-                                            "    Distance units: {:?}",
-                                            tool.distance_unit().unwrap()
-                                        ));
-                                    }
                                 }
                             });
                     }
@@ -483,19 +485,26 @@ impl egui::Widget for ShowPen<'_> {
                 let rect = painter.text(
                     cursor,
                     Align2::LEFT_TOP,
-                    format!("{pen_name} on {}", state.tablet.name.as_deref().unwrap_or("Unknown Tablet")),
+                    format!(
+                        "{pen_name} on {}",
+                        state.tablet.name.as_deref().unwrap_or("Unknown Tablet")
+                    ),
                     FontId::default(),
                     Color32::WHITE,
                 );
                 cursor.y += rect.height();
                 // I can't visualize tools I can't test :V
+                // Let the user know if there's more available that are invisible.
+                let available_axes = state.tool.axes.available();
                 let visualized_axes =
                     AvailableAxes::PRESSURE | AvailableAxes::TILT | AvailableAxes::DISTANCE;
-                let seen_axes = state.tool.available_axes.intersection(visualized_axes);
-                let not_seen_axes = state.tool.available_axes.difference(visualized_axes);
+                let seen_axes = available_axes.intersection(visualized_axes);
+                let not_seen_axes = available_axes.difference(visualized_axes);
                 let axes = if !not_seen_axes.is_empty() {
                     // Pen supports axes not visualized.
-                    format!("Showing axes: {seen_axes:?}. No visualizers for {not_seen_axes:?}!")
+                    format!(
+                        "Showing axes: {seen_axes:?}. No visualizers for {not_seen_axes:?}, Fixme!"
+                    )
                 } else {
                     // We show all axes! yay!
                     format!("Showing all axes: {seen_axes:?}")

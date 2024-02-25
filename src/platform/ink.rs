@@ -26,6 +26,8 @@ const DESIRED_PACKET_DESCRIPTIONS: &[core::GUID] = &[
     tablet_pc::GUID_PACKETPROPERTY_GUID_X_TILT_ORIENTATION,
     tablet_pc::GUID_PACKETPROPERTY_GUID_Y_TILT_ORIENTATION,
     tablet_pc::GUID_PACKETPROPERTY_GUID_TWIST_ORIENTATION,
+    tablet_pc::GUID_PACKETPROPERTY_GUID_WIDTH,
+    tablet_pc::GUID_PACKETPROPERTY_GUID_HEIGHT,
     tablet_pc::GUID_PACKETPROPERTY_GUID_TIMER_TICK,
     // Packet status always reported last regardless of it's index into this list, but still must be requested.
     tablet_pc::GUID_PACKETPROPERTY_GUID_PACKET_STATUS,
@@ -54,6 +56,7 @@ impl Clone for DataFrame {
                 .map(|tool| crate::tool::Tool {
                     // Clone what needs to be:
                     internal_id: tool.internal_id.clone(),
+                    axes: tool.axes.clone(),
                     // Copy the rest:
                     ..*tool
                 }),
@@ -120,10 +123,7 @@ impl DataFrame {
                 hardware_id: None,
                 wacom_id: None,
                 tool_type: None,
-                available_axes: crate::tool::AvailableAxes::empty(),
-                position_info: crate::tool::AxisInfo { precision: None },
-                axis_info: Default::default(),
-                distance_unit: crate::tool::DistanceUnit::Unitless,
+                axes: crate::axis::FullInfo::default(),
             });
             self.tools.last_mut().unwrap()
         }
@@ -217,6 +217,7 @@ impl Plugin {
     }
 }
 impl tablet_pc::IStylusSyncPlugin_Impl for Plugin {}
+#[allow(non_snake_case)]
 impl tablet_pc::IStylusPlugin_Impl for Plugin {
     fn DataInterest(&self) -> WinResult<tablet_pc::RealTimeStylusDataInterest> {
         // Called on Add initially to deternine which of the below functions
@@ -550,6 +551,7 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
 /// This interface is something like "has a marshaler" and every method is supposed to delegate
 /// directly to the owned marshaler. This is what i've done here, but it's reallllyy weird and the types don't
 /// quite line up as well as they did in the more "raw" implementation from the issue. Please review me.
+#[allow(non_snake_case)]
 impl com::Marshal::IMarshal_Impl for Plugin {
     fn DisconnectObject(&self, dwreserved: u32) -> WinResult<()> {
         unsafe { self.marshaler.get().unwrap().DisconnectObject(dwreserved) }

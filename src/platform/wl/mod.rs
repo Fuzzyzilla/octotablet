@@ -14,10 +14,12 @@ use wayland_client::{
 use wayland_protocols::wp::tablet::zv2::client as wl_tablet;
 
 use crate::{
-    events::{FrameTimestamp, NicheF32, Pose},
+    axis::Pose,
+    events::FrameTimestamp,
     pad::Pad,
     tablet::{Tablet, UsbId},
-    tool::{AvailableAxes, AxisInfo, Tool},
+    tool::Tool,
+    util::NicheF32,
 };
 
 use super::InternalID;
@@ -108,12 +110,8 @@ impl HasWlId for Tool {
             internal_id: id.into(),
             hardware_id: None,
             wacom_id: None,
-            available_axes: AvailableAxes::empty(),
             tool_type: None,
-            // Unfortunately, Wayland doesn't enumerate axis precision info. :<
-            axis_info: Default::default(),
-            position_info: AxisInfo::default(),
-            distance_unit: crate::tool::DistanceUnit::Unitless,
+            axes: crate::axis::FullInfo::default(),
         }
     }
     fn id(&self) -> &ID {
@@ -417,9 +415,9 @@ impl TabletState {
                     slider: frame.slider.try_into().unwrap_or(NicheF32::NONE),
                     tilt: frame.tilt.filter(|[x, y]| !x.is_nan() && !y.is_nan()),
                     wheel: frame.wheel.filter(|(delta, _)| !delta.is_nan()),
+                    button_pressure: NicheF32::NONE,
+                    contact_size: None,
                 };
-                // Make double extra sure!
-                pose.debug_assert_not_nan();
 
                 self.events.push(raw_events::Event::Tool {
                     tool: tool.clone(),

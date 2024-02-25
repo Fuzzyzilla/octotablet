@@ -33,16 +33,18 @@
 #![warn(clippy::pedantic)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+mod platform;
+use platform::{InternalID, PlatformImpl};
+
+pub mod axis;
 pub mod builder;
 pub mod events;
 pub mod pad;
-mod platform;
-use platform::InternalID;
 pub mod tablet;
 pub mod tool;
+pub mod util;
 pub use builder::Builder;
 use events::Events;
-use platform::PlatformImpl;
 
 pub(crate) mod macro_bits {
     /// Implements an public opaque ID,

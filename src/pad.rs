@@ -90,11 +90,8 @@ pub mod ring {
     #[derive(Debug)]
     pub struct Ring {
         pub(crate) internal_id: crate::InternalID,
-        /// Granularity of the reported angle, if known. This does not affect the range of values.
-        ///
-        /// For example, if the ring reports a granularity of `32,768`, there are
-        /// `32,768` unique angle values between `0` and `TAU` radians.
-        pub granularity: Option<u32>,
+        /// Granularity of the reported angle, if known.
+        pub granularity: Option<crate::axis::Granularity>,
     }
     crate::macro_bits::impl_get_id!(ID for Ring);
 }
@@ -103,11 +100,8 @@ pub mod strip {
     #[derive(Debug)]
     pub struct Strip {
         pub(crate) internal_id: crate::InternalID,
-        /// Granularity of the reported linear position, if known. This does not affect the range of values.
-        ///
-        /// For example, if the ring reports a granularity of `32,768`, there are
-        /// `32,768` unique slider position values between `0` and `1`.
-        pub granularity: Option<u32>,
+        /// Granularity of the reported linear position, if known.
+        pub granularity: Option<crate::axis::Granularity>,
     }
     crate::macro_bits::impl_get_id!(ID for Strip);
 }
