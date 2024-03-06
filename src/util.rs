@@ -11,6 +11,7 @@ pub enum NicheF32Error {
 pub struct NicheF32(f32);
 impl NicheF32 {
     pub const NONE: NicheF32 = NicheF32(f32::NAN);
+    pub const ZERO: NicheF32 = NicheF32(0.0);
     /// Wrap a float in this niche, `NaN` coercing to `None`.
     // Not pub cause it might be a footgun lol
     #[must_use]

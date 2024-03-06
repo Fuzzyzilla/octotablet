@@ -124,13 +124,11 @@ pub mod unit {
     }
 }
 
-/// Granularity of an axis, if known. This does not affect the range of values.
-///
-/// For example, if pressure reports a granularity of `32,768`, there are
-/// `32,768` unique pressure values between 0.0 and 1.0.
-#[derive(Clone, Copy, Debug, Default)]
+/// Granularity of an axis. This does not affect the range of values.
+/// Describes the number of unique values between `0` and `1` of the associated unit.
+#[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
-pub struct Granularity(pub u32);
+pub struct Granularity(pub std::num::NonZeroU32);
 
 /// Limits of an axis's reported value.
 /// # Quirks
@@ -169,16 +167,16 @@ pub struct Info {
 
 /// A report of the limits and capabilities of all axes, or None if the axis is
 /// not supported by the device.
-// !Copy since it's LARGE AS HECK and thus implicit copying *should* be an error to
+// !Copy since it's pretty big and thus implicit copying *should* be an error to
 // bonk you gently into using a ref instead.
 #[derive(Debug, Clone, Default)]
 pub struct FullInfo {
     // Fixed unit axes
-    /// The X, Y axes are always supported, and with units of logical pixels.
+    /// The X and Y axes - always supported, and with units of logical pixels.
     // This explicitly denies the existance of Centimeter based coordinates, which
     // could be used for apps that want that kind of physical accuracy. Idk how to make
     // both possibilities play nicely, however.
-    pub position: Info,
+    pub position: [Info; 2],
     /// A unitless normalized value in [-1, 1]
     pub slider: Option<Info>,
     /// Always radians.

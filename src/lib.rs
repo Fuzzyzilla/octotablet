@@ -87,16 +87,14 @@ enum Backing {
     Raw,
 }
 #[derive(Clone, Copy, Debug)]
+// Some are never constructed due to disabled features/target platform.
+#[allow(dead_code)]
 pub enum Backend {
     /// [`tablet_unstable_v2`](https://wayland.app/protocols/tablet-unstable-v2)
     ///
     /// **Note**: "unstable" here refers to the protocol itself, not to the stability of its integration into this crate!
-    #[cfg(wl_tablet)]
     WaylandTabletUnstableV2,
     /// [`RealTimeStylus`](https://learn.microsoft.com/en-us/windows/win32/tablet/realtimestylus-reference)
-    // [https://learn.microsoft.com/en-us/windows/win32/api/msinkaut/]
-    // [https://learn.microsoft.com/en-us/windows/win32/tablet/packetpropertyguids-constants]
-    #[cfg(ink_rts)]
     WindowsInkRealTimeStylus,
 }
 /// Errors that may occur during even pumping.

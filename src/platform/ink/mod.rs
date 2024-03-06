@@ -3,6 +3,8 @@ use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_POINTER, HANDLE_PTR, PO
 use windows::Win32::System::Com as com;
 use windows::Win32::UI::TabletPC as tablet_pc;
 
+mod packet;
+
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub struct ID {
     /// The actual `tcid` or `cid` ect from windows
@@ -11,27 +13,6 @@ pub struct ID {
     /// For example, tip and eraser are the same ID, use this to differentiate.
     data: u32,
 }
-
-/// All the axes we care about ([`crate::tool::Axis`])
-/// (There are Azimuth and altitude axes that can be used to derive X/Y Tilt.
-/// Are there any devices that report azimuth/altitude and NOT x/y? shoud i implement that?)
-const DESIRED_PACKET_DESCRIPTIONS: &[core::GUID] = &[
-    // X, Y always reported regardless of if they're requested, and always in first and second positions
-    // tablet_pc::GUID_PACKETPROPERTY_GUID_X,
-    // tablet_pc::GUID_PACKETPROPERTY_GUID_Y,
-    // Other axes follow their indices into this list to determine where they lay in the resulting packets
-    tablet_pc::GUID_PACKETPROPERTY_GUID_Z,
-    tablet_pc::GUID_PACKETPROPERTY_GUID_DEVICE_CONTACT_ID,
-    tablet_pc::GUID_PACKETPROPERTY_GUID_NORMAL_PRESSURE,
-    tablet_pc::GUID_PACKETPROPERTY_GUID_X_TILT_ORIENTATION,
-    tablet_pc::GUID_PACKETPROPERTY_GUID_Y_TILT_ORIENTATION,
-    tablet_pc::GUID_PACKETPROPERTY_GUID_TWIST_ORIENTATION,
-    tablet_pc::GUID_PACKETPROPERTY_GUID_WIDTH,
-    tablet_pc::GUID_PACKETPROPERTY_GUID_HEIGHT,
-    tablet_pc::GUID_PACKETPROPERTY_GUID_TIMER_TICK,
-    // Packet status always reported last regardless of it's index into this list, but still must be requested.
-    tablet_pc::GUID_PACKETPROPERTY_GUID_PACKET_STATUS,
-];
 
 /// The full inner state
 struct DataFrame {
@@ -142,53 +123,6 @@ enum StylusPhase {
     TouchLeave,
 }
 
-#[derive(Copy, Clone, Debug)]
-struct Packet<'a> {
-    position: [i32; 2],
-    props: &'a [i32],
-    status: i32,
-}
-struct PacketIter<'a> {
-    props: &'a [i32],
-    props_per_packet: usize,
-}
-impl<'a> PacketIter<'a> {
-    /// Create an iterator over the packets of a slice of data. `None` if the `props_per_packet` is insufficient
-    /// for a full packet to be constructed (< 3).
-    fn new(props: &'a [i32], props_per_packet: usize) -> Option<Self> {
-        if props_per_packet < 3 {
-            return None;
-        }
-        // Round down to nearest whole packet
-        let trim = (props.len() / props_per_packet) * props_per_packet;
-        let props = &props[..trim];
-        Some(Self {
-            props,
-            props_per_packet,
-        })
-    }
-}
-impl<'a> Iterator for PacketIter<'a> {
-    type Item = Packet<'a>;
-    fn next(&mut self) -> Option<Self::Item> {
-        // Ctor postcondition:
-        assert!(self.props_per_packet >= 3);
-        // Get the next words...
-        let packet = self.props.get(..self.props_per_packet)?;
-        // Trim the words from input array... (wont panic, as above would have
-        // short-circuited)
-        self.props = &self.props[self.props_per_packet..];
-        Some(Packet {
-            // X, Y guaranteed by RTS to be first
-            position: [packet[0], packet[1]],
-            // May be empty, but never panics.
-            props: &packet[2..packet.len() - 1],
-            // Status guaranteed by RTS to be last
-            status: *packet.last().unwrap(),
-        })
-    }
-}
-
 #[windows::core::implement(tablet_pc::IStylusSyncPlugin, com::Marshal::IMarshal)]
 struct Plugin {
     shared_frame: std::sync::Arc<std::sync::Mutex<DataFrame>>,
@@ -205,15 +139,6 @@ impl Plugin {
         props: &[i32],
         phase: StylusPhase,
     ) {
-        // Iterate over the packets, or None if no packets or invalid.
-        let packets = usize::try_from(num_packets)
-            .ok()
-            .and_then(|num_packets| props.len().checked_div(num_packets))
-            .and_then(|props_per_packet| PacketIter::new(props, props_per_packet));
-
-        if let Some(packets) = packets {
-            println!("{phase:?} {:#?}", &packets.collect::<Vec<_>>());
-        }
     }
 }
 impl tablet_pc::IStylusSyncPlugin_Impl for Plugin {}
@@ -662,7 +587,7 @@ impl Manager {
             // Many settings must have the rts disabled
             rts.SetEnabled(false)?;
             // Request all our supported axes
-            rts.SetDesiredPacketDescription(DESIRED_PACKET_DESCRIPTIONS)?;
+            rts.SetDesiredPacketDescription(packet::DESIRED_PACKET_DESCRIPTIONS)?;
             // Safety: Must survive as long as `rts`. deferred to this fn's contract.
             rts.SetHWND(hwnd)?;
 
@@ -706,6 +631,33 @@ impl Manager {
             rts.AddStylusSyncPlugin(0, &plugin)?;
             // We're ready, startup async event collection!
             rts.SetEnabled(true)?;
+
+            let tablets = unsafe {
+                // Query the size and pointer of the internal array of IDs.
+                let mut count = 0u32;
+                let mut id_array = std::ptr::null_mut();
+                rts.GetAllTabletContextIds(
+                    std::ptr::addr_of_mut!(count),
+                    std::ptr::addr_of_mut!(id_array),
+                )?;
+
+                // There's probably a more correct HRESULT for this
+                // but after a few minutes of searching i gave up.
+                let count = usize::try_from(count).map_err(|_| E_FAIL)?;
+
+                // Turn it into a slice!
+                if count == 0 || id_array.is_null() {
+                    &[]
+                } else {
+                    std::slice::from_raw_parts(id_array, count)
+                }
+            };
+            for &tablet_id in tablets {
+                if let Ok(tablet) = rts.GetTabletFromTabletContextId(tablet_id) {
+                    todo!()
+                    //let _ = unsafe { query_axis_info(tablet) }.unwrap();
+                }
+            }
 
             Ok(Self {
                 _rts: rts,

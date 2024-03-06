@@ -249,6 +249,7 @@ impl eframe::App for Viewer {
                             .id_source((tool.hardware_id, tool.wacom_id, idx))
                             .show(ui, |ui| {
                                 ui.label(format!("Wacom ID: {:08X?}", tool.wacom_id,));
+                                ui.label(format!(" - [X, Y]: {:?}", tool.axes.position));
                                 for axis in
                                     <octotablet::axis::Axis as strum::IntoEnumIterator>::iter()
                                 {
