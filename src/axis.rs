@@ -138,7 +138,17 @@ pub struct Limits {
     pub min: f32,
     pub max: f32,
 }
-
+impl Into<std::ops::RangeInclusive<f32>> for Limits {
+    fn into(self) -> std::ops::RangeInclusive<f32> {
+        self.min..=self.max
+    }
+}
+impl From<std::ops::RangeInclusive<f32>> for Limits {
+    fn from(value: std::ops::RangeInclusive<f32>) -> Self {
+        let (min, max) = value.into_inner();
+        Self { min, max }
+    }
+}
 // hm.. this isn't great x3
 // being generic over unit type, limited to the three types, would probably be extra trouble, though.
 #[derive(Clone, Copy, Debug, Default)]
