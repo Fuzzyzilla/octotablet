@@ -126,7 +126,7 @@ pub mod unit {
 
 /// Granularity of an axis. This does not affect the range of values.
 /// Describes the number of unique values between `0` and `1` of the associated unit.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct Granularity(pub std::num::NonZeroU32);
 
@@ -173,6 +173,25 @@ pub struct AngleInfo {
 pub struct Info {
     pub limits: Option<Limits>,
     pub granularity: Option<Granularity>,
+}
+impl Info {
+    /// Returns a new Info with the most extreme properties of each.
+    /// (`Limits::min` is the lowest of the two, `limits::max` the highest, etc.)
+    pub(crate) fn union(self, other: Self) -> Self {
+        Self {
+            // This checks out! Some is greater than all Nones,
+            // and two Somes take their max. Great!
+            granularity: self.granularity.max(other.granularity),
+            limits: match (self.limits, other.limits) {
+                (Some(x), Some(y)) => Some(Limits {
+                    min: x.min.min(y.min),
+                    max: x.max.max(y.max),
+                }),
+                (Some(x), None) | (None, Some(x)) => Some(x),
+                (None, None) => None,
+            },
+        }
+    }
 }
 
 /// A report of the limits and capabilities of all axes, or None if the axis is

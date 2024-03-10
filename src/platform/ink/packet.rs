@@ -1,6 +1,18 @@
 use super::{core, tablet_pc, WinResult, E_FAIL, E_INVALIDARG};
 use crate::{axis, events, util::NicheF32};
 
+trait ArrayMap2: Sized {
+    // Can't be generic over array length in stable :V
+    type From;
+    fn map<T>(self, f: impl FnMut(Self::From) -> T) -> [T; 2];
+}
+impl<From> ArrayMap2 for [From; 2] {
+    type From = From;
+    fn map<T>(self, mut f: impl FnMut(Self::From) -> T) -> [T; 2] {
+        let [a, b] = self;
+        [f(a), f(b)]
+    }
+}
 /// All the axes we care about ([`crate::tool::Axis`])
 /// (There are Azimuth and altitude axes that can be used to derive X/Y Tilt.
 /// Are there any devices that report azimuth/altitude and NOT x/y? shoud i implement that?)
@@ -567,21 +579,21 @@ unsafe fn query_packet_specification(
 
         // If X and/or Y tilt is supported, claim support for both with the missing axis (if any) defaulted.
         // (does one of the option adapters do this for me?)
-        let tilt = (
+        let tilt = [
             get_property_info(tablet.clone(), tablet_pc::STR_GUID_XTILTORIENTATION)?
                 .and_then(normalize_half_angle),
             get_property_info(tablet.clone(), tablet_pc::STR_GUID_YTILTORIENTATION)?
                 .and_then(normalize_half_angle),
-        );
+        ];
 
         // If X and/or Y contact size is supported, claim support for both with the missing axis (if any) defaulted.
         // (does one of the option adapters do this for me?)
-        let contact_size = (
+        let contact_size = [
             get_property_info(tablet.clone(), tablet_pc::STR_GUID_WIDTH)?
                 .and_then(normalize_linear),
             get_property_info(tablet.clone(), tablet_pc::STR_GUID_HEIGHT)?
                 .and_then(normalize_linear),
-        );
+        ];
 
         // The value if the `RawPropertyRange` here is meaningless to us, we care only if it's
         // reported at all.
@@ -595,27 +607,67 @@ unsafe fn query_packet_specification(
 
         Ok((
             PacketInterpreter {
+                // We *can't* fill this in yet, don't know the scalefactor!
                 position: [Scaler {
                     multiply: 0.0,
                     bias: 0,
                 }; 2],
                 z: z.map_read(|(a, _)| a),
-                tilt: todo!(),
+                tilt: tilt.map(|tri| tri.map_read(|(a, _)| a)),
                 twist: twist.map_read(|(a, _)| a),
                 normal_pressure: normal_pressure.map_read(|(a, _)| a),
                 button_pressure: button_pressure.map_read(|(a, _)| a),
-                contact_size: todo!(),
+                contact_size: tilt.map(|tri| tri.map_read(|(a, _)| a)),
                 timer,
             },
             axis::FullInfo {
-                position: [axis::Info::default(); 2],
+                // This will need to be updated as well when we fetch the scale factor.
+                position: position.map(|raw| axis::Info {
+                    limits: raw.calc_limits(1.0),
+                    granularity: raw.calc_granularity(1.0),
+                }),
                 distance: z.read().map(|(_, b)| b),
                 pressure: normal_pressure.read().map(|(_, b)| b),
                 button_pressure: button_pressure.read().map(|(_, b)| b),
-                tilt: todo!(),
+                // We must collapse the info of both axis down to one axis info!
+                tilt: match (tilt[0], tilt[1]) {
+                    // Both are known. Take the max.
+                    (Tristate::Read((_, a)), Tristate::Read((_, b))) => {
+                        Some(axis::AngleInfo {
+                            unit: match (a.unit, b.unit) {
+                                // If both are unitless, the whole is unitless.
+                                (axis::unit::Angle::Unitless, axis::unit::Angle::Unitless) => {
+                                    axis::unit::Angle::Unitless
+                                }
+                                _ => axis::unit::Angle::Radians,
+                            },
+                            info: a.info.union(b.info),
+                        })
+                    }
+                    // One is known, report verbatim
+                    (Tristate::Read((_, x)), _) | (_, Tristate::Read((_, x))) => Some(x),
+                    _ => None,
+                },
                 // Required to be radians, so we discard the unit.
                 roll: twist.read().map(|(_, b)| b.info),
-                contact_size: todo!(),
+                contact_size: match (contact_size[0], contact_size[1]) {
+                    // Both are known. Take the max.
+                    (Tristate::Read((_, a)), Tristate::Read((_, b))) => {
+                        Some(axis::LinearInfo {
+                            unit: match (a.unit, b.unit) {
+                                // If both are unitless, the whole is unitless.
+                                (axis::unit::Linear::Unitless, axis::unit::Linear::Unitless) => {
+                                    axis::unit::Linear::Unitless
+                                }
+                                _ => axis::unit::Linear::Centimeters,
+                            },
+                            info: a.info.union(b.info),
+                        })
+                    }
+                    // One is known, report verbatim
+                    (Tristate::Read((_, x)), _) | (_, Tristate::Read((_, x))) => Some(x),
+                    _ => None,
+                },
                 // Unsupported by the Ink RTS api
                 wheel: None,
                 slider: None,

@@ -127,6 +127,7 @@ enum StylusPhase {
 struct Plugin {
     shared_frame: std::sync::Arc<std::sync::Mutex<DataFrame>>,
     marshaler: std::rc::Rc<std::cell::OnceCell<com::Marshal::IMarshal>>,
+    rts_sync: Option<tablet_pc::IRealTimeStylusSynchronization>,
 }
 impl Plugin {
     fn handle_packets(
@@ -141,6 +142,7 @@ impl Plugin {
     ) {
     }
 }
+
 impl tablet_pc::IStylusSyncPlugin_Impl for Plugin {}
 #[allow(non_snake_case)]
 impl tablet_pc::IStylusPlugin_Impl for Plugin {
@@ -591,6 +593,24 @@ impl Manager {
             // Safety: Must survive as long as `rts`. deferred to this fn's contract.
             rts.SetHWND(hwnd)?;
 
+            // Query for Sync support. What to do if this fails??? Do I even need this??!? *scree*
+            let rts_sync: Option<tablet_pc::IRealTimeStylusSynchronization> = {
+                use core::ComInterface;
+                use core::Interface;
+
+                let unknown: core::IUnknown = std::mem::transmute_copy(&rts);
+
+                let mut rts_sync = std::ptr::null_mut();
+                let is_ok = (unknown.vtable().QueryInterface)(
+                    std::mem::transmute_copy(&unknown),
+                    &tablet_pc::IRealTimeStylusSynchronization::IID,
+                    &mut rts_sync,
+                )
+                .is_ok();
+                // Interface passed the implement check.
+                is_ok.then(|| std::mem::transmute_copy(&rts_sync))
+            };
+
             // Rc to lazily set the marshaler once we have it - struct needs to be made in order to create a marshaler,
             // but struct also needs to have the marshaler inside of it! We don't need thread safety,
             // since the refcount only changes during creation, which is single-threaded.
@@ -599,6 +619,7 @@ impl Manager {
             let plugin = tablet_pc::IStylusSyncPlugin::from(Plugin {
                 marshaler: inner_marshaler.clone(),
                 shared_frame: shared_frame.clone(),
+                rts_sync,
             });
 
             // Create a concretely typed marshaler, insert it into the plugin so that it may
@@ -632,7 +653,10 @@ impl Manager {
             // We're ready, startup async event collection!
             rts.SetEnabled(true)?;
 
-            let tablets = unsafe {
+            // Do we need to lock the RTS during this via the RealTimeStylusSynchronizationo interface?
+            // Otherwise, the pointer and length here have unbounded lifetime and that don't make
+            // no sense.
+            let tablets = {
                 // Query the size and pointer of the internal array of IDs.
                 let mut count = 0u32;
                 let mut id_array = std::ptr::null_mut();
@@ -653,7 +677,7 @@ impl Manager {
                 }
             };
             for &tablet_id in tablets {
-                if let Ok(tablet) = rts.GetTabletFromTabletContextId(tablet_id) {
+                if let Ok(_tablet) = rts.GetTabletFromTabletContextId(tablet_id) {
                     todo!()
                     //let _ = unsafe { query_axis_info(tablet) }.unwrap();
                 }
