@@ -677,9 +677,9 @@ impl Manager {
                 }
             };
             for &tablet_id in tablets {
-                if let Ok(_tablet) = rts.GetTabletFromTabletContextId(tablet_id) {
-                    todo!()
-                    //let _ = unsafe { query_axis_info(tablet) }.unwrap();
+                if let Ok(tablet) = rts.GetTabletFromTabletContextId(tablet_id) {
+                    let (state, info) = packet::query_packet_specification(tablet).unwrap();
+                    println!("{state:#?}\n{info:#?}");
                 }
             }
 

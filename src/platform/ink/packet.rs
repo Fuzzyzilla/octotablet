@@ -33,13 +33,14 @@ pub const DESIRED_PACKET_DESCRIPTIONS: &[core::GUID] = &[
     tablet_pc::GUID_PACKETPROPERTY_GUID_HEIGHT,
     tablet_pc::GUID_PACKETPROPERTY_GUID_TIMER_TICK,
     // Packet status always reported last regardless of it's index into this list, but still must be requested.
+    // Guaranteed by the Ink API to be supported.s
     tablet_pc::GUID_PACKETPROPERTY_GUID_PACKET_STATUS,
 ];
 
 /// Describes the transform from raw property packet value to reported value. Works in double precision
 /// due to the possibility of absurd ranges that we gotta squash down to reasonable range precisely.
 /// (ie, `(value + bias) * multiplier = reported value`)
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct Scaler {
     /// Integer bias prior to scaling, calculated precisely without overflow.
     bias: i32,
@@ -71,7 +72,7 @@ impl Scaler {
 }
 
 /// Describes the state of an optional packet property.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum Tristate<T> {
     /// Don't consume a property value and don't report any value.
     Missing,
@@ -135,7 +136,7 @@ pub enum FilterError {
 
 /// Describes the state of all optional packet properties, allowing dynamically structured packets in the form of
 /// `[i32]` to be interpreted.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PacketInterpreter {
     pub position: [Scaler; 2],
     pub normal_pressure: Tristate<Scaler>,
@@ -271,7 +272,7 @@ impl<'a> Iterator for PacketIter<'a> {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 struct RawPropertyRange {
     /// Quirks: Sometimes < 0 for units where that's meaningless
     min: i32,
@@ -344,10 +345,13 @@ unsafe fn get_property_info(
             std::ptr::addr_of_mut!(info.unit),
             std::ptr::addr_of_mut!(info.resolution),
         ) {
-            Ok(()) => Ok(Tristate::Read(info)),
+            Ok(()) => {
+                println!("- {prop:?} - {info:?}");
+                Ok(Tristate::Read(info))
+            }
             // Not supported by the implementor driver/hardware - still a success, just report none.
             Err(e) if e.code() == TPC_E_UNKNOWN_PROPERTY || e.code() == E_INVALIDARG => {
-                println!("{prop:?} unsupported");
+                println!("- {prop:?} unsupported");
                 // *was* reported as included, but failed to query.
                 // Thus, we have to pull it from the packets, but ignore it.
                 Ok(Tristate::Skip)
@@ -528,7 +532,7 @@ fn force_scale_factor(unit: tablet_pc::TabletPropertyMetricUnit) -> Option<f32> 
 /// All errors from `GetPropertyMetrics` that are not `TPC_E_UNKNOWN_PROPERTY` are forwarded.
 /// # Safety
 /// ¯\\\_(ツ)\_/¯
-unsafe fn query_packet_specification(
+pub unsafe fn query_packet_specification(
     tablet: tablet_pc::IInkTablet,
 ) -> WinResult<(PacketInterpreter, axis::FullInfo)> {
     unsafe {
