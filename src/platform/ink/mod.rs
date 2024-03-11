@@ -1,4 +1,4 @@
-use windows::core::{self, Result as WinResult};
+use windows::core::{self, w, Result as WinResult};
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_POINTER, HANDLE_PTR, POINT};
 use windows::Win32::System::Com as com;
 use windows::Win32::UI::TabletPC as tablet_pc;
@@ -676,8 +676,21 @@ impl Manager {
                     std::slice::from_raw_parts(id_array, count)
                 }
             };
+            println!("DPI: {}", windows::Win32::UI::HiDpi::GetDpiForSystem());
             for &tablet_id in tablets {
                 if let Ok(tablet) = rts.GetTabletFromTabletContextId(tablet_id) {
+                    let mut x_scale = 0.0;
+                    let mut y_scale = 0.0;
+                    let mut count = 0;
+                    let mut array = std::ptr::null_mut();
+                    rts.GetPacketDescriptionData(
+                        tablet_id,
+                        Some(std::ptr::addr_of_mut!(x_scale)),
+                        Some(std::ptr::addr_of_mut!(y_scale)),
+                        std::ptr::addr_of_mut!(count),
+                        std::ptr::addr_of_mut!(array),
+                    )?;
+                    println!("Factors: {x_scale}x{y_scale}");
                     let (state, info) = packet::query_packet_specification(tablet).unwrap();
                     println!("{state:#?}\n{info:#?}");
                 }

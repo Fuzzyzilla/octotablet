@@ -52,6 +52,7 @@ optional = true
 features = [
     "implement",
     "Win32_UI_TabletPC",
+    "Win32_UI_HiDpi",
     "Win32_System_Com_Marshal",
     "Win32_Foundation",
 ]
