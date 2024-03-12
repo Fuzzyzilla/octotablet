@@ -19,6 +19,7 @@ struct DataFrame {
     tools: Vec<crate::tool::Tool>,
     tablets: Vec<crate::tablet::Tablet>,
     events: Vec<crate::events::raw::Event<ID>>,
+    phase: Option<StylusPhase>,
 }
 impl Clone for DataFrame {
     fn clone(&self) -> Self {
@@ -60,6 +61,7 @@ impl Clone for DataFrame {
         );
 
         self.events.clone_from(&source.events);
+        self.phase.clone_from(&source.phase);
     }
 }
 impl DataFrame {
@@ -68,6 +70,7 @@ impl DataFrame {
             tools: Vec::new(),
             tablets: Vec::new(),
             events: Vec::new(),
+            phase: None,
         }
     }
     fn pads(_: &Self) -> &[crate::pad::Pad] {
@@ -140,12 +143,75 @@ impl Plugin {
         props: &[i32],
         phase: StylusPhase,
     ) {
+        use crate::util::NicheF32;
+        const NULL_ID: ID = ID { data: 0, id: 0 };
+
+        // Just take first packet which is always lead with x,y
+        let &[x, y, ..] = props else {
+            return;
+        };
+
+        // Stinky! Lock in hi-pri thread!!
+        let mut shared = self.shared_frame.lock().unwrap();
+
+        // If changed, report new state. Note we never go out lmao.
+        if Some(phase) != shared.phase {
+            // First event, mark in
+            if shared.phase.is_none() {
+                shared.events.push(crate::events::raw::Event::Tool {
+                    tool: NULL_ID,
+                    event: crate::events::raw::ToolEvent::In { tablet: NULL_ID },
+                });
+            }
+
+            match phase {
+                StylusPhase::TouchEnter | StylusPhase::Touched => {
+                    shared.events.push(crate::events::raw::Event::Tool {
+                        tool: NULL_ID,
+                        event: crate::events::raw::ToolEvent::Down,
+                    });
+                }
+                StylusPhase::TouchLeave | StylusPhase::InAir => {
+                    shared.events.push(crate::events::raw::Event::Tool {
+                        tool: NULL_ID,
+                        event: crate::events::raw::ToolEvent::Up,
+                    });
+                }
+            }
+
+            shared.phase = Some(phase);
+        }
+
+        shared.events.push(crate::events::raw::Event::Tool {
+            tool: NULL_ID,
+            event: crate::events::raw::ToolEvent::Pose(crate::axis::Pose {
+                position: [x as f32 / 21.16, y as f32 / 21.16],
+                distance: NicheF32::NONE,
+                pressure: NicheF32::NONE,
+                tilt: None,
+                roll: NicheF32::NONE,
+                wheel: None,
+                slider: NicheF32::NONE,
+                button_pressure: NicheF32::NONE,
+                contact_size: None,
+            }),
+        });
+
+        shared.events.push(crate::events::raw::Event::Tool {
+            tool: NULL_ID,
+            event: crate::events::raw::ToolEvent::Frame(None),
+        });
     }
 }
 
 impl tablet_pc::IStylusSyncPlugin_Impl for Plugin {}
 #[allow(non_snake_case)]
 impl tablet_pc::IStylusPlugin_Impl for Plugin {
+    // Important: This is a *sync* plugin, meaning it is called directly in the system's own
+    // high-priority event processing loop. Keep it quick, consequences are dire!
+    // Async plugins are called in application space so that limit is lifted, but I haven't
+    // been able to figure out synchronization with the RTS object yet.
+
     fn DataInterest(&self) -> WinResult<tablet_pc::RealTimeStylusDataInterest> {
         // Called on Add initially to deternine which of the below functions
         // are to be called.
@@ -575,6 +641,7 @@ impl Manager {
     /// Creates a tablet manager with from the given `HWND`.
     /// # Safety
     /// The given `HWND` must be valid as long as the returned `Manager` is alive.
+    #[allow(clippy::too_many_lines)]
     pub(crate) unsafe fn build_hwnd(hwnd: std::num::NonZeroIsize) -> WinResult<Self> {
         // Safety: Uhh..
         unsafe {
@@ -614,7 +681,21 @@ impl Manager {
             // Rc to lazily set the marshaler once we have it - struct needs to be made in order to create a marshaler,
             // but struct also needs to have the marshaler inside of it! We don't need thread safety,
             // since the refcount only changes during creation, which is single-threaded.
-            let shared_frame = std::sync::Arc::new(std::sync::Mutex::new(DataFrame::empty()));
+            let shared_frame = std::sync::Arc::new(std::sync::Mutex::new(DataFrame {
+                tablets: vec![crate::tablet::Tablet {
+                    internal_id: crate::platform::InternalID::Ink(ID { id: 0, data: 0 }),
+                    name: None,
+                    usb_id: None,
+                }],
+                tools: vec![crate::tool::Tool {
+                    internal_id: crate::platform::InternalID::Ink(ID { id: 0, data: 0 }),
+                    hardware_id: None,
+                    wacom_id: None,
+                    tool_type: None,
+                    axes: crate::axis::FullInfo::default(),
+                }],
+                ..DataFrame::empty()
+            }));
             let inner_marshaler = std::rc::Rc::new(std::cell::OnceCell::new());
             let plugin = tablet_pc::IStylusSyncPlugin::from(Plugin {
                 marshaler: inner_marshaler.clone(),
@@ -751,7 +832,8 @@ impl super::PlatformImpl for Manager {
         super::RawEventsIter::Ink(
             self.local_frame
                 .as_ref()
-                .map_or(&[][..], DataFrame::raw_events)
+                // Events if available, fallback on default (empty) slice.
+                .map_or(Default::default(), DataFrame::raw_events)
                 .iter(),
         )
     }

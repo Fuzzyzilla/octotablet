@@ -182,7 +182,6 @@ fn main() {
         // Events are reported upwards of 1000 per second, so much detail!
         let events = manager.pump().unwrap();
         for event in events {
-            println!("{event:?}");
             // We only care about tool events...
             if let octotablet::events::Event::Tool { tool, event } = event {
                 // We're already listening on a different tool...

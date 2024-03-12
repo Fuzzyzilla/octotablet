@@ -1,3 +1,9 @@
+-- EUREKA! The scale factors are useless don't look at them!!
+-- The X,Y coordinates are *ALREADY* in a physical screen space in the form of HIMETRIC units.
+-- The scale factors are from working *backwards* from this HIMETRIC to physical Centimeters, hence why they differ per tablet.
+
+TRUE SCALE FACTORS: HIMETRIC/system dpi (2540/96 in this case!!!)
+
 DPI: 96
 Factors: 0.037795275x0.037795275
 Querying Ok(\\.\DISPLAY1)
