@@ -1,9 +1,38 @@
-use windows::core::{self, w, Result as WinResult};
-use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_POINTER, HANDLE_PTR, POINT};
+//! Implementation details for Window's Ink `RealTimeStylus` interface.
+//!
+//! Within this module, it is sound to assume `cfg(ink_rts) == true`
+//! (compiling for a wayland target + has deps, or is building docs).
+
+use windows::core::{self, Result as WinResult};
+use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_POINTER, HANDLE_PTR, HWND, POINT};
 use windows::Win32::System::Com as com;
 use windows::Win32::UI::TabletPC as tablet_pc;
 
+const HIMETRIC_PER_INCH: f32 = 2540.0;
+
 mod packet;
+
+/// Multiplier to get from HIMETRIC physical units to logical pixel space for the given window. This should be re-called frequently
+/// to handle dynamic DPI (icky, but that's [microsoft's word](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdpiforsystem#remarks) not mine!)
+/// # Safety
+/// `hwnd` must be a valid window handle.
+#[allow(clippy::cast_precision_loss)]
+unsafe fn fetch_himetric_to_logical_pixel(hwnd: HWND) -> f32 {
+    // The value of this call depends on the *thread's* DPI awareness registration with the system.
+    // That's left to the calling thread, but this *should* always work on any of the awareness settings.
+
+    // Safety: idk. It's not about whether `hwnd` is valid, but idk what it *is* about :P
+    let mut dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+
+    // Uh oh, failed to fetch... Try for system instead.
+    if dpi == 0 {
+        // Safety: lmao
+        dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() };
+    }
+
+    // Rounding is ok - in practice, this is really not a large value. Will never be NaN or INF which is the real problem.
+    (dpi as f32) / HIMETRIC_PER_INCH
+}
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub struct ID {
@@ -16,7 +45,11 @@ pub struct ID {
 
 /// The full inner state
 struct DataFrame {
+    /// cached value from [`fetch_himetric_to_logical_pixel`], updated frequently.
+    himetric_to_logical_pixel: f32,
     tools: Vec<crate::tool::Tool>,
+    /// Tablets *in initialization order*.
+    /// This is important, since notifications may refer to a tablet by it's index.
     tablets: Vec<crate::tablet::Tablet>,
     events: Vec<crate::events::raw::Event<ID>>,
     phase: Option<StylusPhase>,
@@ -24,11 +57,20 @@ struct DataFrame {
 impl Clone for DataFrame {
     fn clone(&self) -> Self {
         // I hope the compiler makes this implementation less stupid :D
-        let mut clone = Self::empty();
+        let mut clone = Self {
+            himetric_to_logical_pixel: 0.0,
+            // Empty vecs don't alloc, this is ok.
+            tools: vec![],
+            tablets: vec![],
+            events: vec![],
+            phase: None,
+        };
+
         clone.clone_from(self);
         clone
     }
     fn clone_from(&mut self, source: &Self) {
+        self.himetric_to_logical_pixel = source.himetric_to_logical_pixel;
         self.tools.clear();
         self.tools.extend(
             source
@@ -38,7 +80,6 @@ impl Clone for DataFrame {
                 .map(|tool| crate::tool::Tool {
                     // Clone what needs to be:
                     internal_id: tool.internal_id.clone(),
-                    axes: tool.axes.clone(),
                     // Copy the rest:
                     ..*tool
                 }),
@@ -65,14 +106,6 @@ impl Clone for DataFrame {
     }
 }
 impl DataFrame {
-    fn empty() -> Self {
-        Self {
-            tools: Vec::new(),
-            tablets: Vec::new(),
-            events: Vec::new(),
-            phase: None,
-        }
-    }
     fn pads(_: &Self) -> &[crate::pad::Pad] {
         // Ink doesn't report any of these capabilities or events :<
         &[]
@@ -82,9 +115,6 @@ impl DataFrame {
     }
     fn tablets(&self) -> &[crate::tablet::Tablet] {
         &self.tablets
-    }
-    fn make_summary(&self) -> crate::events::summary::Summary {
-        crate::events::summary::Summary::empty()
     }
     fn raw_events(&self) -> &[crate::events::raw::Event<ID>] {
         &self.events
@@ -112,6 +142,23 @@ impl DataFrame {
             self.tools.last_mut().unwrap()
         }
     }
+    #[allow(clippy::needless_pass_by_value)]
+    fn append_tablet(&mut self, tablet: tablet_pc::IInkTablet, tcid: u32) -> WinResult<()> {
+        let id = ID { id: tcid, data: 0 };
+
+        let tablet = crate::tablet::Tablet {
+            internal_id: id.into(),
+            name: Some(unsafe { tablet.Name() }?.to_string()),
+            usb_id: None,
+        };
+
+        self.tablets.push(tablet);
+        self.events.push(crate::events::raw::Event::Tablet {
+            tablet: id,
+            event: crate::events::raw::TabletEvent::Added,
+        });
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -120,9 +167,9 @@ enum StylusPhase {
     InAir,
     /// Physically against the surface
     Touched,
-    /// Going from any to `Touched``
+    /// Going from any to `Touched`
     TouchEnter,
-    /// Going from `Touched` to any`
+    /// Going from `Touched` to any
     TouchLeave,
 }
 
@@ -130,15 +177,14 @@ enum StylusPhase {
 struct Plugin {
     shared_frame: std::sync::Arc<std::sync::Mutex<DataFrame>>,
     marshaler: std::rc::Rc<std::cell::OnceCell<com::Marshal::IMarshal>>,
-    rts_sync: Option<tablet_pc::IRealTimeStylusSynchronization>,
 }
 impl Plugin {
     fn handle_packets(
         &self,
-        rts: Option<&tablet_pc::IRealTimeStylus>,
-        stylus_info: tablet_pc::StylusInfo,
+        _rts: Option<&tablet_pc::IRealTimeStylus>,
+        _stylus_info: tablet_pc::StylusInfo,
         // Number of packets packed into `props``
-        num_packets: u32,
+        _num_packets: u32,
         // Some number of words per packet, times number of packets.
         props: &[i32],
         phase: StylusPhase,
@@ -147,12 +193,13 @@ impl Plugin {
         const NULL_ID: ID = ID { data: 0, id: 0 };
 
         // Just take first packet which is always lead with x,y
-        let &[x, y, ..] = props else {
+        let &[x, y, pressure, ..] = props else {
             return;
         };
 
         // Stinky! Lock in hi-pri thread!!
         let mut shared = self.shared_frame.lock().unwrap();
+        let himetric_to_logical_pixel = shared.himetric_to_logical_pixel;
 
         // If changed, report new state. Note we never go out lmao.
         if Some(phase) != shared.phase {
@@ -182,12 +229,16 @@ impl Plugin {
             shared.phase = Some(phase);
         }
 
+        #[allow(clippy::cast_precision_loss)]
         shared.events.push(crate::events::raw::Event::Tool {
             tool: NULL_ID,
             event: crate::events::raw::ToolEvent::Pose(crate::axis::Pose {
-                position: [x as f32 / 21.16, y as f32 / 21.16],
+                position: [
+                    x as f32 * himetric_to_logical_pixel,
+                    y as f32 * himetric_to_logical_pixel,
+                ],
                 distance: NicheF32::NONE,
-                pressure: NicheF32::NONE,
+                pressure: NicheF32::new_some(pressure as f32 / 4095.0).unwrap(),
                 tilt: None,
                 roll: NicheF32::NONE,
                 wheel: None,
@@ -219,7 +270,8 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         // no impl BitOr for this bitflag newtype?!??!!?!? lol
         Ok(tablet_pc::RealTimeStylusDataInterest(
             // Devices added/removed
-            tablet_pc::RTSDI_StylusNew.0
+            tablet_pc::RTSDI_RealTimeStylusEnabled.0
+                | tablet_pc::RTSDI_StylusNew.0
                 | tablet_pc::RTSDI_TabletAdded.0
                 | tablet_pc::RTSDI_TabletRemoved.0
                 // In/Out
@@ -430,83 +482,66 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         let rts = rts.ok_or(E_POINTER)?;
         let tablet = tablet.ok_or(E_POINTER)?;
 
-        let id = unsafe { rts.GetTabletContextIdFromTablet(tablet)? };
-        let id = ID { id, data: 0 };
-
-        let tablet = crate::tablet::Tablet {
-            internal_id: id.into(),
-            name: Some(unsafe { tablet.Name() }?.to_string()),
-            usb_id: None,
-        };
+        let tcid = unsafe { rts.GetTabletContextIdFromTablet(tablet) }?;
 
         let mut lock = self.shared_frame.lock().map_err(|_| E_FAIL)?;
-        lock.tablets.push(tablet);
-        lock.events.push(crate::events::raw::Event::Tablet {
-            tablet: id,
-            event: crate::events::raw::TabletEvent::Added,
-        });
-
-        Ok(())
+        lock.append_tablet(tablet.clone(), tcid)
     }
 
     fn TabletRemoved(
         &self,
-        rts: Option<&tablet_pc::IRealTimeStylus>,
+        _rts: Option<&tablet_pc::IRealTimeStylus>,
         tablet_idx: i32,
     ) -> WinResult<()> {
-        let rts = rts.ok_or(E_POINTER)?;
         let tablet_idx = usize::try_from(tablet_idx).map_err(|_| E_INVALIDARG)?;
 
-        // This assumes the ID is removed from the internal collection *after* this TabletRemoved
-        // callback. That would make sense, but is it correct?
-        // How is this not a massive race condition? lmao
-        let tablets = unsafe {
-            // Query the size and pointer of the internal array of IDs.
-            let mut count = 0u32;
-            let mut id_array = std::ptr::null_mut();
-            rts.GetAllTabletContextIds(
-                std::ptr::addr_of_mut!(count),
-                std::ptr::addr_of_mut!(id_array),
-            )?;
-
-            // There's probably a more correct HRESULT for this
-            // but after a few minutes of searching i gave up.
-            let count = usize::try_from(count).map_err(|_| E_FAIL)?;
-
-            // Turn it into a slice!
-            if count == 0 || id_array.is_null() {
-                &[]
-            } else {
-                std::slice::from_raw_parts(id_array, count)
-            }
-        };
-
-        let Some(&removed_id) = tablets.get(tablet_idx) else {
-            return Ok(());
-        };
-        let removed_id = ID {
-            id: removed_id,
-            data: 0,
-        };
-
         let mut lock = self.shared_frame.lock().map_err(|_| E_FAIL)?;
-        lock.tablets
-            .retain(|tab| tab.internal_id != removed_id.into());
+        if tablet_idx >= lock.tablets.len() {
+            return Err(E_INVALIDARG.into());
+        }
+        // Todo, this shoud be deferred to the next frame, not eagerly destroyed.
+        let removed = lock.tablets.remove(tablet_idx);
+
         lock.events.push(crate::events::raw::Event::Tablet {
-            tablet: removed_id,
+            tablet: *removed.internal_id.unwrap_ink(),
             event: crate::events::raw::TabletEvent::Removed,
         });
 
         Ok(())
     }
-
-    // ================= Dead code :V ==================
-    #[rustfmt::skip]
-    fn RealTimeStylusEnabled(&self, _: Option<&tablet_pc::IRealTimeStylus>,
-        _: u32, _: *const u32) -> WinResult<()> {
-        // UNREACHABLE, FILTERED BY DATAINTEREST
+    fn RealTimeStylusEnabled(
+        &self,
+        rts: Option<&tablet_pc::IRealTimeStylus>,
+        num_tablets: u32,
+        tcids: *const u32,
+    ) -> WinResult<()> {
+        let Some(rts) = rts else {
+            return Err(E_POINTER.into());
+        };
+        let tcids = unsafe {
+            match num_tablets {
+                0 => &[],
+                // Weird guarantee made by the docs, hm! What happens when you connect nine ink devices to
+                // a windows machine???
+                1..=8 => {
+                    if tcids.is_null() {
+                        return Err(E_POINTER.into());
+                    }
+                    // As cast ok - of course 8 is in range of usize :P
+                    std::slice::from_raw_parts(tcids, num_tablets as usize)
+                }
+                _ => return Err(E_INVALIDARG.into()),
+            }
+        };
+        let mut shared = self.shared_frame.lock().map_err(|_| E_FAIL)?;
+        for &tcid in tcids {
+            let tablet = unsafe { rts.GetTabletFromTabletContextId(tcid) }?;
+            shared.append_tablet(tablet, tcid)?;
+        }
         Ok(())
     }
+
+    // ================= Dead code :V ==================
     #[rustfmt::skip]
     fn RealTimeStylusDisabled(&self, _: Option<&tablet_pc::IRealTimeStylus>,
         _: u32, _: *const u32) -> WinResult<()> {
@@ -630,57 +665,44 @@ impl com::Marshal::IMarshal_Impl for Plugin {
 }
 
 pub struct Manager {
-    _rts: tablet_pc::IRealTimeStylus,
+    /// Invariant: valid for the lifetime of Self.
+    hwnd: HWND,
+    rts: tablet_pc::IRealTimeStylus,
     // Shared state, written asynchronously from the plugin.
     shared_frame: std::sync::Arc<std::sync::Mutex<DataFrame>>,
     // Cloned local copy of the shared state after a frame.
     local_frame: Option<DataFrame>,
-    _plugin: tablet_pc::IStylusSyncPlugin,
 }
 impl Manager {
     /// Creates a tablet manager with from the given `HWND`.
     /// # Safety
-    /// The given `HWND` must be valid as long as the returned `Manager` is alive.
-    #[allow(clippy::too_many_lines)]
-    pub(crate) unsafe fn build_hwnd(hwnd: std::num::NonZeroIsize) -> WinResult<Self> {
+    /// * The given `HWND` must be valid as long as the returned `Manager` is alive.
+    /// * Only *one* manager may exist for this `HWND`. Claims Ink for the entire window rectangle - No other Ink collection
+    ///   APIs should be enabled on this window while the returned manager exists.
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) unsafe fn build_hwnd(
+        opts: crate::builder::Builder,
+        hwnd: std::num::NonZeroIsize,
+    ) -> WinResult<Self> {
         // Safety: Uhh..
         unsafe {
-            // Bitwise cast from isize to usize.
-            let hwnd = HANDLE_PTR(std::mem::transmute::<isize, usize>(hwnd.get()));
+            let hwnd = HWND(hwnd.get());
+            // Bitwise cast from isize to usize. (`as` is not necessarily bitwise. on such platforms, is this even sound? ehhh)
+            let hwnd_handle = HANDLE_PTR(std::mem::transmute::<isize, usize>(hwnd.0));
 
             let rts: tablet_pc::IRealTimeStylus = com::CoCreateInstance(
                 std::ptr::from_ref(&tablet_pc::RealTimeStylus),
                 None,
                 com::CLSCTX_ALL,
             )?;
+
             // Many settings must have the rts disabled
             rts.SetEnabled(false)?;
             // Request all our supported axes
             rts.SetDesiredPacketDescription(packet::DESIRED_PACKET_DESCRIPTIONS)?;
             // Safety: Must survive as long as `rts`. deferred to this fn's contract.
-            rts.SetHWND(hwnd)?;
+            rts.SetHWND(hwnd_handle)?;
 
-            // Query for Sync support. What to do if this fails??? Do I even need this??!? *scree*
-            let rts_sync: Option<tablet_pc::IRealTimeStylusSynchronization> = {
-                use core::ComInterface;
-                use core::Interface;
-
-                let unknown: core::IUnknown = std::mem::transmute_copy(&rts);
-
-                let mut rts_sync = std::ptr::null_mut();
-                let is_ok = (unknown.vtable().QueryInterface)(
-                    std::mem::transmute_copy(&unknown),
-                    &tablet_pc::IRealTimeStylusSynchronization::IID,
-                    &mut rts_sync,
-                )
-                .is_ok();
-                // Interface passed the implement check.
-                is_ok.then(|| std::mem::transmute_copy(&rts_sync))
-            };
-
-            // Rc to lazily set the marshaler once we have it - struct needs to be made in order to create a marshaler,
-            // but struct also needs to have the marshaler inside of it! We don't need thread safety,
-            // since the refcount only changes during creation, which is single-threaded.
             let shared_frame = std::sync::Arc::new(std::sync::Mutex::new(DataFrame {
                 tablets: vec![crate::tablet::Tablet {
                     internal_id: crate::platform::InternalID::Ink(ID { id: 0, data: 0 }),
@@ -692,15 +714,24 @@ impl Manager {
                     hardware_id: None,
                     wacom_id: None,
                     tool_type: None,
-                    axes: crate::axis::FullInfo::default(),
+                    axes: crate::axis::FullInfo {
+                        pressure: Some(crate::axis::NormalizedInfo { granularity: None }),
+                        ..Default::default()
+                    },
                 }],
-                ..DataFrame::empty()
+                events: vec![],
+                phase: None,
+                himetric_to_logical_pixel: fetch_himetric_to_logical_pixel(hwnd),
             }));
+
+            // Rc to lazily set the marshaler once we have it - struct needs to be made in order to create a marshaler,
+            // but struct also needs to have the marshaler inside of it! We don't need thread safety,
+            // since the refcount only changes during creation, which is single-threaded.
             let inner_marshaler = std::rc::Rc::new(std::cell::OnceCell::new());
+
             let plugin = tablet_pc::IStylusSyncPlugin::from(Plugin {
                 marshaler: inner_marshaler.clone(),
                 shared_frame: shared_frame.clone(),
-                rts_sync,
             });
 
             // Create a concretely typed marshaler, insert it into the plugin so that it may
@@ -726,72 +757,53 @@ impl Manager {
                 .unwrap();
                 std::mem::transmute_copy(&marshaler)
             };
+
             // Infallible, this is the only instance of set being called.
             inner_marshaler.set(marshaler).unwrap();
 
             // Insert at the top of the plugin list.
             rts.AddStylusSyncPlugin(0, &plugin)?;
+
+            // Apply builder settings
+            {
+                let crate::builder::Builder {
+                    emulate_tool_from_mouse,
+                } = opts;
+
+                rts.SetAllTabletsMode(emulate_tool_from_mouse)?;
+            }
+
             // We're ready, startup async event collection!
             rts.SetEnabled(true)?;
 
-            // Do we need to lock the RTS during this via the RealTimeStylusSynchronizationo interface?
-            // Otherwise, the pointer and length here have unbounded lifetime and that don't make
-            // no sense.
-            let tablets = {
-                // Query the size and pointer of the internal array of IDs.
-                let mut count = 0u32;
-                let mut id_array = std::ptr::null_mut();
-                rts.GetAllTabletContextIds(
-                    std::ptr::addr_of_mut!(count),
-                    std::ptr::addr_of_mut!(id_array),
-                )?;
-
-                // There's probably a more correct HRESULT for this
-                // but after a few minutes of searching i gave up.
-                let count = usize::try_from(count).map_err(|_| E_FAIL)?;
-
-                // Turn it into a slice!
-                if count == 0 || id_array.is_null() {
-                    &[]
-                } else {
-                    std::slice::from_raw_parts(id_array, count)
-                }
-            };
-            println!("DPI: {}", windows::Win32::UI::HiDpi::GetDpiForSystem());
-            for &tablet_id in tablets {
-                if let Ok(tablet) = rts.GetTabletFromTabletContextId(tablet_id) {
-                    let mut x_scale = 0.0;
-                    let mut y_scale = 0.0;
-                    let mut count = 0;
-                    let mut array = std::ptr::null_mut();
-                    rts.GetPacketDescriptionData(
-                        tablet_id,
-                        Some(std::ptr::addr_of_mut!(x_scale)),
-                        Some(std::ptr::addr_of_mut!(y_scale)),
-                        std::ptr::addr_of_mut!(count),
-                        std::ptr::addr_of_mut!(array),
-                    )?;
-                    println!("Factors: {x_scale}x{y_scale}");
-                    let (state, info) = packet::query_packet_specification(tablet).unwrap();
-                    println!("{state:#?}\n{info:#?}");
-                }
-            }
-
             Ok(Self {
-                _rts: rts,
+                hwnd,
+                rts,
                 shared_frame,
                 local_frame: None,
-                _plugin: plugin,
             })
         }
     }
 }
+
+impl Drop for Manager {
+    fn drop(&mut self) {
+        unsafe {
+            // Disable and destroy the RTS and all plugins.
+            // This should hopefully cause the RTS and my plugin to be freed?
+            // It does, at the very least, prevent UB when a manager is dropped and another is re-made :3
+            let _ = self.rts.SetEnabled(false);
+            let _ = self.rts.RemoveAllStylusSyncPlugins();
+        }
+    }
+}
+
 impl super::PlatformImpl for Manager {
     fn pump(&mut self) -> Result<(), crate::PumpError> {
         // Lock and clone the inner state for this frame.
         // We clone since the user can borrow this data for unbounded amount of time before next frame,
         // and we don't want to lock out the callbacks from writing new data.
-        if let Ok(lock) = self.shared_frame.lock() {
+        if let Ok(mut lock) = self.shared_frame.lock() {
             if let Some(local_frame) = self.local_frame.as_mut() {
                 // Last frame exists, clone_from to reuse allocs
                 local_frame.clone_from(&lock);
@@ -799,6 +811,14 @@ impl super::PlatformImpl for Manager {
                 // Last frame doesn't exist, clone anew!
                 self.local_frame = Some(lock.clone());
             }
+
+            // While we have access, update the DPI. This is intended to not be cached and to be
+            // cheap to execute as per microsoft's docs, but I don't want to take any risks on the
+            // hi-priority system thread the plugin lives in!!
+            // Safety: invariant - hwnd always valid for lifetime of Self.
+            lock.himetric_to_logical_pixel = unsafe { fetch_himetric_to_logical_pixel(self.hwnd) };
+            // And consume all the events!
+            lock.events.clear();
         } else {
             // Failed to lock!
             self.local_frame = None;
@@ -823,10 +843,7 @@ impl super::PlatformImpl for Manager {
         self.local_frame.as_ref().map_or(&[], DataFrame::tablets)
     }
     fn make_summary(&self) -> crate::events::summary::Summary {
-        self.local_frame.as_ref().map_or_else(
-            crate::events::summary::Summary::empty,
-            DataFrame::make_summary,
-        )
+        crate::events::summary::Summary::empty()
     }
     fn raw_events(&self) -> super::RawEventsIter<'_> {
         super::RawEventsIter::Ink(

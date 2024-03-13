@@ -249,19 +249,39 @@ impl eframe::App for Viewer {
                             .id_source((tool.hardware_id, tool.wacom_id, idx))
                             .show(ui, |ui| {
                                 ui.label(format!("Wacom ID: {:08X?}", tool.wacom_id,));
-                                ui.label(format!(" - [X, Y]: {:?}", tool.axes.position));
+                                ui.label(format!(" ✅ Position: {:?}", tool.axes.position));
                                 for axis in
                                     <octotablet::axis::Axis as strum::IntoEnumIterator>::iter()
                                 {
                                     // Todo: list units lol
-                                    ui.label(format!(
-                                        " - {}: {}",
-                                        axis.as_ref(),
-                                        tool.axes.info(axis).map_or_else(
-                                            |_| "Unsupported".to_owned(),
-                                            |info| format!("{info:?}"),
-                                        ),
-                                    ));
+
+                                    if let Ok((limits, granularity)) =
+                                        tool.axes.limits(axis).and_then(|limits| {
+                                            Ok((limits, tool.axes.granularity(axis)?))
+                                        })
+                                    {
+                                        ui.label(format!(
+                                            " ✅ {}: {}, {}",
+                                            axis.as_ref(),
+                                            match limits {
+                                                Some(limits) => format!("{limits:?}"),
+                                                None => "Unknown range".to_owned(),
+                                            },
+                                            match granularity {
+                                                Some(granularity) => format!("{granularity:?}"),
+                                                None => "Unknown granularity".to_owned(),
+                                            },
+                                        ));
+                                    } else {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                " 🗙 {}: Unsupported",
+                                                axis.as_ref()
+                                            ))
+                                            .weak()
+                                            .italics(),
+                                        );
+                                    }
                                 }
                             });
                     }

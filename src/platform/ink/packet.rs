@@ -13,13 +13,14 @@ impl<From> ArrayMap2 for [From; 2] {
         [f(a), f(b)]
     }
 }
-/// All the axes we care about ([`crate::tool::Axis`])
+/// All the axes we care about ([`crate::axis::Axis`])
 /// (There are Azimuth and altitude axes that can be used to derive X/Y Tilt.
 /// Are there any devices that report azimuth/altitude and NOT x/y? shoud i implement that?)
 pub const DESIRED_PACKET_DESCRIPTIONS: &[core::GUID] = &[
     // X, Y always reported regardless of if they're requested, and always in first and second positions
-    // tablet_pc::GUID_PACKETPROPERTY_GUID_X,
-    // tablet_pc::GUID_PACKETPROPERTY_GUID_Y,
+    // (Included here for capability enumeration in `query_packet_specification`)
+    tablet_pc::GUID_PACKETPROPERTY_GUID_X,
+    tablet_pc::GUID_PACKETPROPERTY_GUID_Y,
     // Other axes follow their indices into this list to determine where they lay in the resulting packets
     // ======== ORDER IS IMPORTANT!! =======
     // If you change me, remember to change `PropertyFilters::consume` :3
@@ -272,105 +273,61 @@ impl<'a> Iterator for PacketIter<'a> {
     }
 }
 
-#[derive(Clone, Copy, Default, Debug)]
-struct RawPropertyRange {
-    /// Quirks: Sometimes < 0 for units where that's meaningless
-    min: i32,
-    max: i32,
-    /// Resultion, in points per <unit>
-    /// (so, resolution = 400, unit = inches, means 400 dpi)
-    /// Quirks: Sometimes zero
-    resolution: f32,
-    /// Quirks: *WHY DOES THE CINTIQ 16 LIST PRESSURE IN ANGULAR DEGREES*
-    unit: tablet_pc::TabletPropertyMetricUnit,
-}
-impl RawPropertyRange {
-    /// Calculates a Limits object based on the unit's scale factor. None if a arithmetic
-    /// error occurs.
-    pub fn calc_limits(self, scale_factor: f32) -> Option<axis::Limits> {
-        if scale_factor.is_nan() {
-            return None;
-        }
-        // Use f64 for exact precision on these integers
-        let scale_factor = f64::from(scale_factor);
-        let min = f64::from(self.min) * scale_factor;
-        let max = f64::from(self.max) * scale_factor;
+/// Calculates a Limits object based on the unit's scale factor. None if a arithmetic
+/// error occurs.
+pub fn calc_limits(
+    metrics: tablet_pc::PROPERTY_METRICS,
+    scale_factor: f32,
+) -> Option<axis::Limits> {
+    if scale_factor.is_nan() {
+        return None;
+    }
+    // Use f64 for exact precision on these integers
+    let scale_factor = f64::from(scale_factor);
+    let min = f64::from(metrics.nLogicalMin) * scale_factor;
+    let max = f64::from(metrics.nLogicalMax) * scale_factor;
 
-        // Try to convert back down to f32.
-        let min = min as f32;
-        let max = max as f32;
-        if min.is_infinite() || max.is_infinite() {
-            return None;
-        }
-        Some(axis::Limits { min, max })
+    // Try to convert back down to f32. Would be nice to round away-from-zero.
+    #[allow(clippy::cast_possible_truncation)]
+    let min = min as f32;
+    #[allow(clippy::cast_possible_truncation)]
+    let max = max as f32;
+    if min.is_infinite() || max.is_infinite() {
+        return None;
     }
-    /// Calculates the granularity based on the unit's scale factor. None if a arithmetic
-    /// error occurs.
-    pub fn calc_granularity(self, scale_factor: f32) -> Option<axis::Granularity> {
-        // Divide here, since the resolution is inversely related to the size of the unit.
-        // `(1 dots/inch) -> (1/2.45 dots/cm)`
-        let resolution = self.resolution / scale_factor;
-        // Saturate. Negative/NaN becomes 0 (invalid), over gets clamped down. Ok!!
-        let granularity = resolution.ceil() as u32;
-        std::num::NonZeroU32::new(granularity).map(axis::Granularity)
-    }
+    Some(axis::Limits { min, max })
+}
+/// Calculates the granularity based on the unit's scale factor. None if a arithmetic
+/// error occurs.
+pub fn calc_granularity(
+    metrics: tablet_pc::PROPERTY_METRICS,
+    scale_factor: f32,
+) -> Option<axis::Granularity> {
+    // Divide here, since the resolution is inversely related to the size of the unit.
+    // `(1 dots/inch) -> (1/2.45 dots/cm)`
+    let resolution = metrics.fResolution / scale_factor;
+    // Saturate. Negative/NaN becomes 0 (invalid), over gets clamped down. Ok!!
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let granularity = resolution.ceil() as u32;
+    std::num::NonZeroU32::new(granularity).map(axis::Granularity)
 }
 
-/// Get unit, min, max, resolution, or None if not supported.
-/// # Safety
-/// ¯\\\_(ツ)\_/¯
-///
-/// Preconditions managed by types, but calling into external code is inherently unsafe I suppose.
-unsafe fn get_property_info(
-    tablet: tablet_pc::IInkTablet,
-    prop_guid: core::PCWSTR,
-) -> WinResult<Tristate<RawPropertyRange>> {
-    unsafe {
-        use windows::Win32::Foundation::TPC_E_UNKNOWN_PROPERTY;
-        // Would be cool to re-use this alloc (every `prop` is necessarily the same length)
-        // but there isn't an api for it or.. anything else really. ough. ugh. ouch. oof. owie. heck.
-        let prop = core::BSTR::from_wide(prop_guid.as_wide())?;
-
-        if !tablet.IsPacketPropertySupported(&prop)?.as_bool() {
-            // Not included, don't try to read.
-            return Ok(Tristate::Missing);
-        }
-
-        let mut info = RawPropertyRange::default();
-
-        match tablet.GetPropertyMetrics(
-            &prop,
-            std::ptr::addr_of_mut!(info.min),
-            std::ptr::addr_of_mut!(info.max),
-            std::ptr::addr_of_mut!(info.unit),
-            std::ptr::addr_of_mut!(info.resolution),
-        ) {
-            Ok(()) => {
-                println!("- {prop:?} - {info:?}");
-                Ok(Tristate::Read(info))
-            }
-            // Not supported by the implementor driver/hardware - still a success, just report none.
-            Err(e) if e.code() == TPC_E_UNKNOWN_PROPERTY || e.code() == E_INVALIDARG => {
-                println!("- {prop:?} unsupported");
-                // *was* reported as included, but failed to query.
-                // Thus, we have to pull it from the packets, but ignore it.
-                Ok(Tristate::Skip)
-            }
-            // Unhandled err, bail
-            Err(e) => Err(e),
-        }
-    }
-}
-
-fn normalized(info: RawPropertyRange, onto: axis::Limits) -> Tristate<(Scaler, axis::Info)> {
+/// Attempt to squash the range down, regardless of unit.
+/// Returns [`Tristate::Skip`] if an arithmetic error occurs and the normalization cannot
+/// be performed.
+fn normalized(
+    metrics: tablet_pc::PROPERTY_METRICS,
+    onto: axis::Limits,
+) -> Tristate<(Scaler, axis::Info)> {
     // Range of integer values is a hint at precision! i64 to not overflow (real range is ~i33)
-    let from_width = i64::from(info.max) - i64::from(info.min);
+    let from_width = i64::from(metrics.nLogicalMax) - i64::from(metrics.nLogicalMin);
     // saturating as
     let granularity = u32::try_from(from_width.unsigned_abs()).unwrap_or(u32::MAX);
 
     if let Some(nonzero_granularity) = std::num::NonZeroU32::new(granularity) {
         // Width in nonzero
         // As-cast is lossless.
+        #[allow(clippy::cast_precision_loss)]
         let from_width = from_width as f64;
         let onto_width = f64::from(onto.max - onto.min);
         let multiplier = onto_width / from_width;
@@ -378,11 +335,12 @@ fn normalized(info: RawPropertyRange, onto: axis::Limits) -> Tristate<(Scaler, a
         // Solve for bias:
         // (info.min + bias) * multiplier == onto.min
         // bias == (onto.min / multiplier) - info.min
-        let bias = f64::from(onto.min) / multiplier - f64::from(info.min);
+        let bias = f64::from(onto.min) / multiplier - f64::from(metrics.nLogicalMin);
 
         if !bias.is_infinite() && !bias.is_nan() {
             // `as` is a saturating cast, when well-formed (checked above).
             // Do i need to handle bias < i32::MIN or bias > i32::MAX? egh.
+            #[allow(clippy::cast_possible_truncation)]
             let bias = bias as i32;
             Tristate::Read((
                 Scaler {
@@ -408,109 +366,67 @@ fn normalized(info: RawPropertyRange, onto: axis::Limits) -> Tristate<(Scaler, a
 
 /// Normalize a raw range into a linear unit. If unrecognized unit, fallback on a unitless normalized range.
 fn linear_or_normalize(
-    info: RawPropertyRange,
-    fallback_limits: axis::Limits,
-) -> Tristate<(Scaler, axis::LinearInfo)> {
-    match linear_scale_factor(info.unit) {
+    metrics: tablet_pc::PROPERTY_METRICS,
+) -> Tristate<(Scaler, axis::LengthInfo)> {
+    match linear_scale_factor(metrics.Units) {
         // Recognized unit! Report as-is and give the user some info about it.
         Some(scale) => Tristate::Read((
             Scaler {
                 multiply: f64::from(scale),
                 bias: 0,
             },
-            axis::LinearInfo {
-                unit: axis::unit::Linear::Centimeters,
-                info: axis::Info {
-                    granularity: info.calc_granularity(scale),
-                    limits: info.calc_limits(scale),
-                },
-            },
+            axis::LengthInfo::Centimeters(axis::Info {
+                granularity: calc_granularity(metrics, scale),
+                limits: calc_limits(metrics, scale),
+            }),
         )),
         // Unknown unit. Normalize it to something expected :3
-        None => normalized(info, fallback_limits).map_read(|(scaler, info)| {
+        None => normalized(metrics, (0.0..=1.0).into()).map_read(|(scaler, info)| {
             (
                 scaler,
-                axis::LinearInfo {
-                    unit: axis::unit::Linear::Unitless,
-                    info,
-                },
+                axis::LengthInfo::Normalized(axis::NormalizedInfo {
+                    granularity: info.granularity,
+                }),
             )
         }),
     }
 }
+
 /// Normalize a raw range into an angular unit. If unrecognized unit, fallback on a normalized range.
-fn angular_or_normalize(
-    info: RawPropertyRange,
-    fallback_limits: axis::Limits,
-    fallback_unit: axis::unit::Angle,
-) -> Tristate<(Scaler, axis::AngleInfo)> {
-    match angular_scale_factor(info.unit) {
+fn half_angle_or_normalize(metrics: tablet_pc::PROPERTY_METRICS) -> Tristate<(Scaler, axis::Info)> {
+    match angular_scale_factor(metrics.Units) {
         // Recognized unit! Report as-is and give the user some info about it.
         Some(scale) => Tristate::Read((
             Scaler {
                 multiply: f64::from(scale),
                 bias: 0,
             },
-            axis::AngleInfo {
-                unit: axis::unit::Angle::Radians,
-                info: axis::Info {
-                    granularity: info.calc_granularity(scale),
-                    limits: info.calc_limits(scale),
-                },
+            axis::Info {
+                granularity: calc_granularity(metrics, scale),
+                limits: calc_limits(metrics, scale),
             },
         )),
         // Unknown unit. Normalize it to something expected :3
-        None => normalized(info, fallback_limits).map_read(|(scaler, info)| {
-            (
-                scaler,
-                axis::AngleInfo {
-                    unit: fallback_unit,
-                    info,
-                },
-            )
-        }),
+        None => normalized(
+            metrics,
+            (-std::f32::consts::PI..=std::f32::consts::PI).into(),
+        )
+        .map_read(|(scaler, info)| (scaler, info)),
     }
 }
-/// Normalize a raw range into an angular unit. If unrecognized unit, fallback on a unitless normalized range.
-fn force_or_normalize(
-    info: RawPropertyRange,
-    fallback_limits: axis::Limits,
-) -> Tristate<(Scaler, axis::ForceInfo)> {
-    match force_scale_factor(info.unit) {
-        // Recognized unit! Report as-is and give the user some info about it.
-        Some(scale) => Tristate::Read((
-            Scaler {
-                multiply: f64::from(scale),
-                bias: 0,
-            },
-            axis::ForceInfo {
-                unit: axis::unit::Force::Grams,
-                info: axis::Info {
-                    granularity: info.calc_granularity(scale),
-                    limits: info.calc_limits(scale),
-                },
-            },
-        )),
-        // Unknown unit. Normalize it to something expected :3
-        None => normalized(info, fallback_limits).map_read(|(scaler, info)| {
-            (
-                scaler,
-                axis::ForceInfo {
-                    unit: axis::unit::Force::Unitless,
-                    info,
-                },
-            )
-        }),
-    }
-}
-fn linear_scale_factor(unit: tablet_pc::TabletPropertyMetricUnit) -> Option<f32> {
+
+fn linear_scale_factor(unit: tablet_pc::PROPERTY_UNITS) -> Option<f32> {
+    // Two types for the same enum..
+    let unit = tablet_pc::TabletPropertyMetricUnit(unit.0);
     match unit {
         tablet_pc::TPMU_Centimeters => Some(1.0),
         tablet_pc::TPMU_Inches => Some(2.54),
         _ => None,
     }
 }
-fn angular_scale_factor(unit: tablet_pc::TabletPropertyMetricUnit) -> Option<f32> {
+fn angular_scale_factor(unit: tablet_pc::PROPERTY_UNITS) -> Option<f32> {
+    // Two types for the same enum..
+    let unit = tablet_pc::TabletPropertyMetricUnit(unit.0);
     match unit {
         tablet_pc::TPMU_Radians => Some(1.0),
         tablet_pc::TPMU_Degrees => Some(1.0f32.to_radians()),
@@ -518,164 +434,115 @@ fn angular_scale_factor(unit: tablet_pc::TabletPropertyMetricUnit) -> Option<f32
         _ => None,
     }
 }
-fn force_scale_factor(unit: tablet_pc::TabletPropertyMetricUnit) -> Option<f32> {
-    match unit {
-        tablet_pc::TPMU_Grams => Some(1.0),
-        tablet_pc::TPMU_Pounds => Some(453.59237),
-        _ => None,
+
+mod util {
+    pub struct OwnedCoTaskMemSlice<T> {
+        ptr: *const T,
+        len: usize,
+    }
+    impl<T> OwnedCoTaskMemSlice<T> {
+        /// Transfer ownership the pointer, will be `CoTaskMemFree`'d on drop.
+        /// Safety:
+        /// * ptr must be allocated with CoTaskMemAlloc
+        /// * if len is not zero, ptr must be well-aligned for T
+        /// * ptr must be valid for reads for `len * sizeof T` bytes.
+        pub unsafe fn new(ptr: *const T, len: usize) -> Self {
+            if len != 0 {
+                debug_assert!(!ptr.is_null());
+                debug_assert!(ptr as usize % std::mem::align_of::<T>() == 0);
+            }
+            OwnedCoTaskMemSlice { ptr, len }
+        }
+    }
+    impl<T> AsRef<[T]> for OwnedCoTaskMemSlice<T> {
+        fn as_ref(&self) -> &[T] {
+            if self.len == 0 {
+                // self ptr is allowed to be null or unaligned if len is zero. short circuit this
+                // with a known-good empty slice
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+            }
+        }
+    }
+    impl<'a, T> IntoIterator for &'a OwnedCoTaskMemSlice<T> {
+        type IntoIter = std::slice::Iter<'a, T>;
+        type Item = &'a T;
+        fn into_iter(self) -> Self::IntoIter {
+            self.as_ref().into_iter()
+        }
+    }
+    impl<T> std::ops::Deref for OwnedCoTaskMemSlice<T> {
+        type Target = [T];
+        fn deref(&self) -> &Self::Target {
+            self.as_ref()
+        }
+    }
+    impl<T> Drop for OwnedCoTaskMemSlice<T> {
+        fn drop(&mut self) {
+            if !self.ptr.is_null() {
+                unsafe { super::super::com::CoTaskMemFree(Some(self.ptr.cast())) };
+            }
+        }
     }
 }
 
-/// Query everything about a tablet needed to parse packets and convert them to [`Pose`]s
+/// Query everything about a tablet needed to parse packets and convert them to [`crate::axis::Pose`]s
 ///
 /// # Errors
 /// All errors from `GetPropertyMetrics` that are not `TPC_E_UNKNOWN_PROPERTY` are forwarded.
 /// # Safety
 /// ¯\\\_(ツ)\_/¯
+#[allow(clippy::needless_pass_by_value)]
 pub unsafe fn query_packet_specification(
-    tablet: tablet_pc::IInkTablet,
+    rts: tablet_pc::IRealTimeStylus,
+    tcid: u32,
 ) -> WinResult<(PacketInterpreter, axis::FullInfo)> {
-    unsafe {
-        println!("Querying {:?}", tablet.Name());
-        // Normalize for force, 0..1
-        let normalize_force = |r: RawPropertyRange| force_or_normalize(r, (0.0..=1.0).into());
-        // Normalize for tilts, -PI..PI
-        let normalize_half_angle = |r: RawPropertyRange| {
-            angular_or_normalize(
-                r,
-                (-std::f32::consts::PI..=std::f32::consts::PI).into(),
-                axis::unit::Angle::Radians,
-            )
-        };
-        // Normalize for rotations, 0..TAU
-        let normalize_full_angle = |r: RawPropertyRange| {
-            angular_or_normalize(
-                r,
-                (0.0..=std::f32::consts::TAU).into(),
-                axis::unit::Angle::Radians,
-            )
-        };
-        // Normalize for distances, 0..1
-        let normalize_linear = |r: RawPropertyRange| linear_or_normalize(r, (0.0..=1.0).into());
+    let properties = unsafe {
+        let mut num_properties = 0;
+        let mut properties = std::ptr::null_mut();
+        rts.GetPacketDescriptionData(
+            tcid,
+            None,
+            None,
+            std::ptr::addr_of_mut!(num_properties),
+            std::ptr::addr_of_mut!(properties),
+        )?;
+        // Place it in a wrapper to free on drop!
+        util::OwnedCoTaskMemSlice::new(properties, num_properties as usize)
+    };
 
-        // Get the position properties. Both MUST be included and not skipped!
-        // Problem: We cannot query the relationship between these units and logical or phsical
-        // screen pixels. As far as I understand, we must determine empirically, oof!
-        let position = [
-            get_property_info(tablet.clone(), tablet_pc::STR_GUID_X)?
-                .read()
-                .ok_or(E_FAIL)?,
-            get_property_info(tablet.clone(), tablet_pc::STR_GUID_Y)?
-                .read()
-                .ok_or(E_FAIL)?,
-        ];
+    // We need to find which of `DESIRED_PACKET_DESCRIPTIONS` is actually reflected in `properties`.
+    // Guaranteed to be the same order and to be a subset, but some may be missing.
+    let mut desired_idx = 0;
 
-        let normal_pressure =
-            get_property_info(tablet.clone(), tablet_pc::STR_GUID_NORMALPRESSURE)?
-                .and_then(normalize_force);
-        let z = get_property_info(tablet.clone(), tablet_pc::STR_GUID_Z)?
-            .and_then(|r| linear_or_normalize(r, (0.0..=1.0).into()));
-        let twist = get_property_info(tablet.clone(), tablet_pc::STR_GUID_TWISTORIENTATION)?
-            .and_then(normalize_full_angle);
-        let button_pressure =
-            get_property_info(tablet.clone(), tablet_pc::STR_GUID_BUTTONPRESSURE)?
-                .and_then(|r| force_or_normalize(r, (0.0..=1.0).into()));
-
-        // If X and/or Y tilt is supported, claim support for both with the missing axis (if any) defaulted.
-        // (does one of the option adapters do this for me?)
-        let tilt = [
-            get_property_info(tablet.clone(), tablet_pc::STR_GUID_XTILTORIENTATION)?
-                .and_then(normalize_half_angle),
-            get_property_info(tablet.clone(), tablet_pc::STR_GUID_YTILTORIENTATION)?
-                .and_then(normalize_half_angle),
-        ];
-
-        // If X and/or Y contact size is supported, claim support for both with the missing axis (if any) defaulted.
-        // (does one of the option adapters do this for me?)
-        let contact_size = [
-            get_property_info(tablet.clone(), tablet_pc::STR_GUID_WIDTH)?
-                .and_then(normalize_linear),
-            get_property_info(tablet.clone(), tablet_pc::STR_GUID_HEIGHT)?
-                .and_then(normalize_linear),
-        ];
-
-        // The value if the `RawPropertyRange` here is meaningless to us, we care only if it's
-        // reported at all.
-        let timer = matches!(
-            get_property_info(tablet, tablet_pc::STR_GUID_TIMERTICK)?,
-            Tristate::Read(_) | Tristate::Skip
-        );
-
-        // todo: use this :3
-        // let caps = tablet.HardwareCapabilities()?;
-
-        Ok((
-            PacketInterpreter {
-                // We *can't* fill this in yet, don't know the scalefactor!
-                position: [Scaler {
-                    multiply: 0.0,
-                    bias: 0,
-                }; 2],
-                z: z.map_read(|(a, _)| a),
-                tilt: tilt.map(|tri| tri.map_read(|(a, _)| a)),
-                twist: twist.map_read(|(a, _)| a),
-                normal_pressure: normal_pressure.map_read(|(a, _)| a),
-                button_pressure: button_pressure.map_read(|(a, _)| a),
-                contact_size: tilt.map(|tri| tri.map_read(|(a, _)| a)),
-                timer,
-            },
-            axis::FullInfo {
-                // This will need to be updated as well when we fetch the scale factor.
-                position: position.map(|raw| axis::Info {
-                    limits: raw.calc_limits(1.0),
-                    granularity: raw.calc_granularity(1.0),
-                }),
-                distance: z.read().map(|(_, b)| b),
-                pressure: normal_pressure.read().map(|(_, b)| b),
-                button_pressure: button_pressure.read().map(|(_, b)| b),
-                // We must collapse the info of both axis down to one axis info!
-                tilt: match (tilt[0], tilt[1]) {
-                    // Both are known. Take the max.
-                    (Tristate::Read((_, a)), Tristate::Read((_, b))) => {
-                        Some(axis::AngleInfo {
-                            unit: match (a.unit, b.unit) {
-                                // If both are unitless, the whole is unitless.
-                                (axis::unit::Angle::Unitless, axis::unit::Angle::Unitless) => {
-                                    axis::unit::Angle::Unitless
-                                }
-                                _ => axis::unit::Angle::Radians,
-                            },
-                            info: a.info.union(b.info),
-                        })
-                    }
-                    // One is known, report verbatim
-                    (Tristate::Read((_, x)), _) | (_, Tristate::Read((_, x))) => Some(x),
-                    _ => None,
-                },
-                // Required to be radians, so we discard the unit.
-                roll: twist.read().map(|(_, b)| b.info),
-                contact_size: match (contact_size[0], contact_size[1]) {
-                    // Both are known. Take the max.
-                    (Tristate::Read((_, a)), Tristate::Read((_, b))) => {
-                        Some(axis::LinearInfo {
-                            unit: match (a.unit, b.unit) {
-                                // If both are unitless, the whole is unitless.
-                                (axis::unit::Linear::Unitless, axis::unit::Linear::Unitless) => {
-                                    axis::unit::Linear::Unitless
-                                }
-                                _ => axis::unit::Linear::Centimeters,
-                            },
-                            info: a.info.union(b.info),
-                        })
-                    }
-                    // One is known, report verbatim
-                    (Tristate::Read((_, x)), _) | (_, Tristate::Read((_, x))) => Some(x),
-                    _ => None,
-                },
-                // Unsupported by the Ink RTS api
-                wheel: None,
-                slider: None,
-            },
-        ))
+    for property in &properties {
+        // Scan forward until found
+        while property.guid != DESIRED_PACKET_DESCRIPTIONS[desired_idx] {
+            desired_idx += 1;
+            if desired_idx == DESIRED_PACKET_DESCRIPTIONS.len() {
+                // UH OH! Either the tablet properties are not a subset of `DESIRED_PACKET_DESCRIPTIONS` or
+                // they're in the wrong order. Either way that's an invalid API result.
+                return Err(E_FAIL.into());
+            }
+        }
+        todo!()
     }
+
+    Ok((
+        PacketInterpreter {
+            position: [Scaler {
+                bias: 0,
+                multiply: 0.0,
+            }; 2],
+            normal_pressure: Tristate::Missing,
+            tilt: [Tristate::Missing; 2],
+            z: Tristate::Missing,
+            twist: Tristate::Missing,
+            button_pressure: Tristate::Missing,
+            contact_size: [Tristate::Missing; 2],
+            timer: false,
+        },
+        axis::FullInfo::default(),
+    ))
 }

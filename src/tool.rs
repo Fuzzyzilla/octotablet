@@ -35,6 +35,8 @@ pub enum Type {
     Mouse,
     /// A mouse-like device that rests on the surface with a transparent crosshair for precise selection.
     Lens,
+    /// A virtual tool emulated from conventional mouse or touch input. See [`crate::builder::Builder::emulate_tool_from_mouse`].
+    Emulated,
 }
 
 /// Description of the capabilities of a tool.

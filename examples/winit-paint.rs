@@ -13,6 +13,7 @@ fn main() {
     let window = std::sync::Arc::new(
         winit::window::WindowBuilder::default()
             .with_inner_size(PhysicalSize::new(512u32, 512u32))
+            .with_title("octotablet paint demo")
             .build(&event_loop)
             .unwrap(),
     );
@@ -169,6 +170,8 @@ fn main() {
                                 // softbuffer requires `0000'0000'rrrr'rrrr'gggg'gggg'bbbb'bbbb` format
                                 *into = (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b));
                             });
+
+                        window.pre_present_notify();
                         buffer.present().unwrap();
                     }
                     _ => (),

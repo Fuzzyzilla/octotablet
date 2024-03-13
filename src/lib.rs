@@ -1,16 +1,18 @@
 //! # Cross-platform [Tablet](tablet), [Pad](pad), and [Stylus](tool) API 🐙✨
 //!
-//! Current plans are Wayland's *`tablet_unstable_v2`*, Windows Ink's `RealTimeStylus`, and X11's *`xinput`*, but aims to
-//! provide a unified API for tablet access across more platforms in the future. Additionally, rather than providing the intersection
-//! of these platforms' capabilities, it aims to expose the union of them such that no features are lost to abstraction.
+//! A platform abstraction across stylus APIs, aiming to provide the *union* of platform feature sets so that no
+//! expressiveness is lost in translation.
 //!
-//! This library requires low-level access to the windowing server, which is provided
-//! by many windowing abstractions through the [`raw_window_handle`](https://crates.io/crates/raw-window-handle) crate.
+//! This crate requires low-level access to the windowing server, which is provided by many windowing abstractions
+//! such as `eframe` and `winit` through the [`raw_window_handle`](https://crates.io/crates/raw-window-handle) crate.
 //!
 //! To get started, create a [`Builder`].
 //!
-//! ## Hardware support
-//! Aims to support a wide range of devices, as long as they use standard platform APIs (ie, no tablet-specific APIs).
+//! ## Supported platforms
+//! See the [`Backend`] enum and [`README.md`](https://github.com/Fuzzyzilla/octotablet/blob/master/README.md)
+//!
+//! ## Supported Hardware
+//! Aims to support a wide range of devices, as long as they use standard platform APIs (ie, no tablet-specific APIs will be implemented).
 //!
 //! During development, tested on:
 //! * *Wacom Cintiq 16* \[DTK-1660\]
@@ -20,17 +22,20 @@
 //! * *Wacom Pro Pen 2k*
 //! * *XP-Pen Deco-01*
 //!
-//! **Note:** Nearly every graphics tablet/driver has no shortage of quirks. Some platforms try to correct for that,
+//! ## Quirks
+//! Graphics tablets, drivers, and system compositors have no shortage of quirks. Some platforms try to correct for that,
 //! some dont. While API-level quirks are smoothed out by this crate, per-device quirk correction is beyond the scope
 //! of this project and quirked values are reported as-is. Where possible, documentation notes are included to warn
-//! where quirks are known to occur. If you encounter additional quirks, please submit a PR documenting them.
+//! where quirks are known to occur. If you encounter additional issues, please submit a PR documenting them.
 //! **Guarantees are made only when explicitly stated so!**
 //!
 //! ## Examples
 //! See [the examples directory](https://github.com/Fuzzyzilla/octotablet/tree/master/examples) for how
-//! this can be integrated into `winit` or `eframe` projects.
+//! this can be integrated into `winit` or `eframe` projects and demos of the kind of hardware
+//! capabilities this crate exposes.
 
 #![warn(clippy::pedantic)]
+#![warn(rustdoc::all)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 mod platform;
@@ -95,6 +100,10 @@ pub enum Backend {
     /// **Note**: "unstable" here refers to the protocol itself, not to the stability of its integration into this crate!
     WaylandTabletUnstableV2,
     /// [`RealTimeStylus`](https://learn.microsoft.com/en-us/windows/win32/tablet/realtimestylus-reference)
+    ///
+    /// The use of this interface avoids some common problems with the use of Windows Ink in drawing applications,
+    /// such as stippling motions resulting in lost clicks or some motions being interpreted as scrolling or flicking gestures.
+    /// Through use of this interface, this gesture recognition is bypassed to the greatest extent possible.
     WindowsInkRealTimeStylus,
 }
 /// Errors that may occur during even pumping.
@@ -116,9 +125,7 @@ pub struct Manager {
     pub(crate) _backing: Backing,
 }
 impl Manager {
-    /// Parse pending events. Will update the hardware reports, as well as collecting inputs.
-    /// Assumes another client on this connection is performing reads, which will be the case
-    /// if you're using `winit` or `eframe`.
+    /// Dispatch pending events without blocking, updating hardware reports and returning an [`IntoIterator`] containing the events.
     #[allow(clippy::missing_errors_doc)]
     pub fn pump(&mut self) -> Result<Events<'_>, PumpError> {
         self.internal.pump()?;
@@ -144,15 +151,19 @@ impl Manager {
     }
     /// Access pad information. Pads are the physical object that you draw on,
     /// and may have touch support, an inbuilt display, lights, buttons, rings, and/or sliders.
+    /// Hardware reports are updated on each call to [`Manager::pump`].
     ///
     /// Pads are ordered arbitrarily.
+    ///
+    /// # Platform support
+    /// * Wayland only.
     #[must_use]
     pub fn pads(&self) -> &[pad::Pad] {
         self.internal.pads()
     }
     /// Access tool information. Tools are styluses or other hardware that
     /// communicate with one or more pads, and are responsible for reporting movements, pressure, etc.,
-    /// and may have multiple buttons.
+    /// and may have multiple buttons. Hardware reports are updated on each call to [`Manager::pump`].
     ///
     /// Tools are ordered arbitrarily.
     #[must_use]
@@ -160,7 +171,7 @@ impl Manager {
         self.internal.tools()
     }
     /// A tablet is the entry point for interactive devices, and the top level of the hierarchy
-    /// which may expose several pads or tools.
+    /// which may expose several pads or tools. Hardware reports are updated on each call to [`Manager::pump`].
     ///
     /// Tablets are ordered arbitrarily.
     #[must_use]

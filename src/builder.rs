@@ -22,14 +22,37 @@ impl From<raw_window_handle::HandleError> for BuildError {
 }
 
 /// Pre-construction configuration for a [`Manager`].
-#[derive(Default)]
-pub struct Builder {}
+pub struct Builder {
+    pub(crate) emulate_tool_from_mouse: bool,
+}
+impl Default for Builder {
+    fn default() -> Self {
+        Self {
+            emulate_tool_from_mouse: true,
+        }
+    }
+}
 
 /// # Configuration
+#[allow(clippy::needless_update)]
 impl Builder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+    /// Set whether an emulated tablet and tool should be created from mouse input.
+    /// This functionality is *not* provided by this crate, but by the system backend.
+    ///
+    /// Defaults to `true`.
+    ///
+    /// # Supprted platforms
+    /// * Windows Ink
+    #[must_use]
+    pub fn emulate_tool_from_mouse(self, emulate: bool) -> Self {
+        Self {
+            emulate_tool_from_mouse: emulate,
+            ..self
+        }
     }
 }
 /// # Finishing
@@ -87,6 +110,7 @@ impl Builder {
                     // Safety: forwarded to this fn's contract.
                     unsafe {
                         crate::platform::wl::Manager::build_wayland_display(
+                            self,
                             wlh.display.as_ptr().cast(),
                         )
                     },
@@ -101,7 +125,9 @@ impl Builder {
                     Ok(crate::platform::PlatformManager::Ink(
                         // Safety: forwarded to this fn's contract.
                         // Fixme: unwrap.
-                        unsafe { crate::platform::ink::Manager::build_hwnd(wh.hwnd).unwrap() },
+                        unsafe {
+                            crate::platform::ink::Manager::build_hwnd(self, wh.hwnd).unwrap()
+                        },
                     ))
                 } else {
                     Err(BuildError::Unsupported)
@@ -109,9 +135,6 @@ impl Builder {
             }
             _ => Err(BuildError::Unsupported),
         }?;
-
-        // Dummy!
-        let Self {} = self;
 
         Ok(Manager {
             internal,

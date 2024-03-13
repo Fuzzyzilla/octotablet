@@ -21,52 +21,33 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
             Event::Capability {
                 capability: wayland_client::WEnum::Value(capability),
             } => {
-                use crate::axis::{self, unit};
+                use crate::axis;
                 use wl_tablet::zwp_tablet_tool_v2::Capability;
                 let ctor = this.partial_tools.get_or_insert_ctor(tool.id());
+
                 // The wayland protocol makes blanket guarantees about the precise aspects of the ranges
-                // and units of these axes, they are not dynamic per-device.
-                // We don't report the "65535" granularities since they would be highly misleading to the user.
+                // and units of these axes, they are not dynamic per-device. We don't report the "65535" granularities
+                // since they would be highly misleading to the user - we don't know that the device *actually* reports
+                // that finely (unlikely).
                 match capability {
                     Capability::Distance => {
-                        ctor.axes.distance = Some(axis::LinearInfo {
-                            unit: unit::Linear::Unitless,
-                            info: axis::Info {
-                                limits: Some(axis::Limits { min: 0.0, max: 1.0 }),
-                                granularity: None,
-                            },
-                        });
+                        ctor.axes.distance = Some(axis::LengthInfo::default());
                     }
                     Capability::Pressure => {
-                        ctor.axes.pressure = Some(axis::ForceInfo {
-                            info: axis::Info {
-                                limits: Some(axis::Limits { min: 0.0, max: 1.0 }),
-                                granularity: None,
-                            },
-                            unit: unit::Force::Unitless,
-                        });
+                        ctor.axes.pressure = Some(axis::NormalizedInfo::default());
                     }
-                    Capability::Rotation => ctor.axes.roll = Some(axis::Info::default()),
+                    Capability::Rotation => ctor.axes.roll = Some(axis::CircularInfo::default()),
                     Capability::Slider => {
-                        ctor.axes.slider = Some(axis::Info {
-                            limits: Some(axis::Limits {
-                                min: 1.0,
-                                max: -1.0,
-                            }),
+                        ctor.axes.slider = Some(axis::SliderInfo::default());
+                    }
+                    Capability::Tilt => {
+                        ctor.axes.tilt = Some(axis::Info {
+                            limits: Some((-std::f32::consts::PI..=std::f32::consts::PI).into()),
                             granularity: None,
                         });
                     }
-                    Capability::Tilt => {
-                        ctor.axes.tilt = Some(axis::AngleInfo {
-                            info: axis::Info::default(),
-                            unit: unit::Angle::Radians,
-                        });
-                    }
                     Capability::Wheel => {
-                        ctor.axes.wheel = Some(axis::AngleInfo {
-                            info: axis::Info::default(),
-                            unit: unit::Angle::Radians,
-                        });
+                        ctor.axes.wheel = Some(axis::CircularInfo::default());
                     }
                     // ne
                     _ => (),
