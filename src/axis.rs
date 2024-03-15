@@ -85,17 +85,45 @@ impl From<Axis> for AvailableAxes {
         }
     }
 }
+
+pub(crate) trait Union {
+    /// Take the union of two iteems, returning the widest spreading of both.
+    #[must_use = "doesn't modify self, returns a new Info representing the union"]
+    fn union(&self, other: &Self) -> Self;
+}
+impl<U: Union + Clone> Union for Option<U> {
+    fn union(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Some(a), Some(b)) => Some(a.union(b)),
+            (Some(x), None) | (None, Some(x)) => Some(x.clone()),
+            (None, None) => None,
+        }
+    }
+}
+
 /// Granularity of an axis. This does not affect the range of values.
 /// Describes the number of unique values between `0` and `1` of the associated unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct Granularity(pub std::num::NonZeroU32);
 
+impl Union for Granularity {
+    fn union(&self, other: &Self) -> Self {
+        Self(self.0.max(other.0))
+    }
+}
+
 /// Granularity of a position axis. Since the bounds of the range of positions are not known,
 /// this instead represents as "dots per logical pixel" contrary to other axes' [`Granularity`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct PositionGranularity(pub std::num::NonZeroU32);
+
+impl Union for PositionGranularity {
+    fn union(&self, other: &Self) -> Self {
+        Self(self.0.max(other.0))
+    }
+}
 
 /// Limits of an axis's reported value.
 /// # Quirks
@@ -116,12 +144,27 @@ impl From<std::ops::RangeInclusive<f32>> for Limits {
         Self { min, max }
     }
 }
+impl Union for Limits {
+    fn union(&self, other: &Self) -> Self {
+        Self {
+            min: self.min.min(other.min),
+            max: self.max.max(other.max),
+        }
+    }
+}
 
 /// Represents a normalized axis, always in the range `0..=1`
 /// Since the min and max are fixed, only the granularity is given, if known.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NormalizedInfo {
     pub granularity: Option<Granularity>,
+}
+impl Union for NormalizedInfo {
+    fn union(&self, other: &Self) -> Self {
+        Self {
+            granularity: self.granularity.union(&other.granularity),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -149,10 +192,9 @@ impl LengthInfo {
             Self::Centimeters(c) => c.granularity,
         }
     }
-    /// Returns a new Info with the most extreme properties of each.
-    /// (`Limits::min` is the lowest of the two, `limits::max` the highest, etc.)
-    #[must_use = "doesn't modify self, returns a new Info representing the union"]
-    pub(crate) fn union(self, other: Self) -> Self {
+}
+impl Union for LengthInfo {
+    fn union(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Centimeters(a), Self::Centimeters(b)) => Self::Centimeters(a.union(b)),
             (Self::Normalized(a), Self::Normalized(b)) => Self::Normalized(NormalizedInfo {
@@ -181,23 +223,11 @@ pub struct Info {
     pub limits: Option<Limits>,
     pub granularity: Option<Granularity>,
 }
-impl Info {
-    /// Returns a new Info with the most extreme properties of each.
-    /// (`Limits::min` is the lowest of the two, `limits::max` the highest, etc.)
-    #[must_use = "doesn't modify self, returns a new Info representing the union"]
-    pub(crate) fn union(self, other: Self) -> Self {
+impl Union for Info {
+    fn union(&self, other: &Self) -> Self {
         Self {
-            // This checks out! Some is greater than all Nones,
-            // and two Somes take their max. Great!
-            granularity: self.granularity.max(other.granularity),
-            limits: match (self.limits, other.limits) {
-                (Some(x), Some(y)) => Some(Limits {
-                    min: x.min.min(y.min),
-                    max: x.max.max(y.max),
-                }),
-                (Some(x), None) | (None, Some(x)) => Some(x),
-                (None, None) => None,
-            },
+            granularity: self.granularity.union(&other.granularity),
+            limits: self.limits.union(&other.limits),
         }
     }
 }
@@ -207,17 +237,38 @@ impl Info {
 pub struct PositionInfo {
     pub granularity: Option<PositionGranularity>,
 }
+impl Union for PositionInfo {
+    fn union(&self, other: &Self) -> Self {
+        Self {
+            granularity: self.granularity.union(&other.granularity),
+        }
+    }
+}
 
 /// Information about a circular axis, always reporting in the range of `0..TAU`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CircularInfo {
     pub granularity: Option<Granularity>,
 }
+impl Union for CircularInfo {
+    fn union(&self, other: &Self) -> Self {
+        Self {
+            granularity: self.granularity.union(&other.granularity),
+        }
+    }
+}
 
 /// Information about a slider axis, always reporting in the range of `-1..=1` with zero being the resting point.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SliderInfo {
     pub granularity: Option<Granularity>,
+}
+impl Union for SliderInfo {
+    fn union(&self, other: &Self) -> Self {
+        Self {
+            granularity: self.granularity.union(&other.granularity),
+        }
+    }
 }
 
 /// A report of the limits and capabilities of all axes, or None if the axis is
@@ -238,6 +289,25 @@ pub struct FullInfo {
     pub wheel: Option<CircularInfo>,
     pub distance: Option<LengthInfo>,
     pub contact_size: Option<LengthInfo>,
+}
+// I wish i wasn't so lazy that this isn't a field-wise procmacro :P
+impl Union for FullInfo {
+    fn union(&self, other: &Self) -> Self {
+        Self {
+            position: [
+                self.position[0].union(&other.position[0]),
+                self.position[1].union(&other.position[1]),
+            ],
+            slider: self.slider.union(&other.slider),
+            roll: self.roll.union(&other.roll),
+            pressure: self.pressure.union(&other.pressure),
+            button_pressure: self.button_pressure.union(&other.button_pressure),
+            tilt: self.tilt.union(&other.tilt),
+            wheel: self.wheel.union(&other.wheel),
+            distance: self.distance.union(&other.distance),
+            contact_size: self.contact_size.union(&other.contact_size),
+        }
+    }
 }
 
 #[derive(thiserror::Error, Debug, Copy, Clone, PartialEq, Eq, Hash)]

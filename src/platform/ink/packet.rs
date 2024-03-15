@@ -40,7 +40,7 @@ impl<'a, T> SlicePop for &'a [T] {
     type Item = &'a T;
     fn pop_front(&mut self) -> Option<Self::Item> {
         let item = self.first()?;
-        *self = &self[..];
+        *self = &self[1..];
         Some(item)
     }
 }
@@ -164,14 +164,14 @@ impl Interpreter {
         let pose = axis::Pose {
             #[allow(clippy::cast_precision_loss)]
             position: [
-                *props
+                *(props
                     .pop_front()
-                    .ok_or(InterpretError::Filter(FilterError::NotEnoughData))?
+                    .ok_or(InterpretError::Filter(FilterError::NotEnoughData))?)
                     as f32
                     * himetric_to_logical_pixels,
-                *props
+                *(props
                     .pop_front()
-                    .ok_or(InterpretError::Filter(FilterError::NotEnoughData))?
+                    .ok_or(InterpretError::Filter(FilterError::NotEnoughData))?)
                     as f32
                     * himetric_to_logical_pixels,
             ],
@@ -273,6 +273,7 @@ impl<'a> Iterator for Iter<'a> {
         self.props = &self.props[self.props_per_packet..];
 
         let &status = packet.last()?;
+        // Last word is handled specially, parse the rest.
         let packet = &packet[..packet.len() - 1];
 
         match self.filters.consume(self.himetric_to_logical_pixel, packet) {
@@ -508,6 +509,7 @@ pub unsafe fn make_interpreter(
     rts: &tablet_pc::IRealTimeStylus,
     tcid: u32,
 ) -> WinResult<(Interpreter, axis::FullInfo)> {
+    use crate::axis::Union;
     let properties = unsafe {
         let mut num_properties = 0;
         let mut properties = std::ptr::null_mut();
@@ -556,7 +558,7 @@ pub unsafe fn make_interpreter(
     // Check required and guaranteed to be supported properties, X Y and STATUS
     if properties.len() < 3
         || properties[0].guid != DESIRED_PACKET_DESCRIPTIONS[0]
-        || properties[0].guid != DESIRED_PACKET_DESCRIPTIONS[1]
+        || properties[1].guid != DESIRED_PACKET_DESCRIPTIONS[1]
         || properties.last().unwrap().guid != *DESIRED_PACKET_DESCRIPTIONS.last().unwrap()
     {
         return Err(E_FAIL.into());
@@ -612,7 +614,7 @@ pub unsafe fn make_interpreter(
                     // Extend the tilt with our new one.
                     info.tilt = match info.tilt {
                         // Already had, take the "best" properties of both.
-                        Some(t) => Some(t.union(new_info)),
+                        Some(t) => Some(t.union(&new_info)),
                         // Didn't have, replace.
                         None => Some(new_info),
                     };
@@ -653,7 +655,7 @@ pub unsafe fn make_interpreter(
                     // Extend the tilt with our new one.
                     info.contact_size = match info.contact_size {
                         // Already had, take the "best" properties of both.
-                        Some(t) => Some(t.union(new_info)),
+                        Some(t) => Some(t.union(&new_info)),
                         // Didn't have, replace.
                         None => Some(new_info),
                     };

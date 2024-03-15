@@ -62,6 +62,7 @@ pub enum Type {
 pub struct Tool {
     /// Platform internal ID.
     pub(crate) internal_id: crate::InternalID,
+    pub name: Option<String>,
     /// Identifier uniquely represinting this tool hardware. See [`HardwareID`] for more info.
     ///
     /// If this is present, it's also a hint that the tool may be allowed to freely roam between

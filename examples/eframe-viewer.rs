@@ -19,11 +19,12 @@ fn main() {
         // Im stupid and don't want to figure out how to make the
         // colors dynamic, they only work on Dark lol
         default_theme: eframe::Theme::Dark,
+        follow_system_theme: false,
         ..Default::default()
     };
     // Startup!
     eframe::run_native(
-        "example-tablet-viewer",
+        "octotablet viewer",
         native_options,
         Box::new(|context| Box::new(Viewer::new(context))),
     )

@@ -111,6 +111,7 @@ impl HasWlId for Tool {
     fn new_default(id: ID) -> Self {
         Tool {
             internal_id: id.into(),
+            name: None,
             hardware_id: None,
             wacom_id: None,
             tool_type: None,

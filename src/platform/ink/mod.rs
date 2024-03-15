@@ -10,6 +10,8 @@ use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_POINTER, HANDLE_PTR, HW
 use windows::Win32::System::Com as com;
 use windows::Win32::UI::TabletPC as tablet_pc;
 
+use crate::axis::Union;
+
 const HIMETRIC_PER_INCH: f32 = 2540.0;
 
 mod packet;
@@ -40,8 +42,8 @@ unsafe fn fetch_himetric_to_logical_pixel(hwnd: HWND) -> f32 {
 pub enum ID {
     /// "Tablet contextual ID" (`tcid`)
     Tablet(u32),
-    /// "Stylus ID" (`sid`) + is eraser
-    Stylus(u32, bool),
+    /// IInkCursor ID
+    Stylus { sid: u32, cursor_id: Option<i32> },
 }
 
 #[derive(Copy, Clone, Hash, PartialEq, Eq)]
@@ -74,7 +76,8 @@ impl Ord for ButtonID {
 struct RawTablet {
     interpreter: packet::Interpreter,
     // In Ink, the axis capabilities are a property of the *tablet*, not the tool.
-    info: crate::axis::FullInfo,
+    // To bridge this gap, this field will be virally spread to any tool that interacts with this tablet.
+    axes: crate::axis::FullInfo,
     tcid: u32,
 }
 
@@ -161,6 +164,7 @@ impl Clone for DataFrame {
                 .map(|tool| crate::tool::Tool {
                     // Clone what needs to be:
                     internal_id: tool.internal_id.clone(),
+                    name: tool.name.clone(),
                     // Copy the rest:
                     ..*tool
                 }),
@@ -232,6 +236,58 @@ impl DataFrame {
                 .retain(|tab| *tab.internal_id.unwrap_ink() != ID::Tablet(tcid));
         }
     }
+    /// From the given collection of tools, find the tool under `sid` or insert a newly populated one.
+    /// (can't take a self param due to borrowing crimes.)
+    fn get_or_insert_tool<'tool>(
+        tools: &'tool mut Vec<crate::tool::Tool>,
+        rts: &tablet_pc::IRealTimeStylus,
+        sid: u32,
+    ) -> WinResult<&'tool mut crate::tool::Tool> {
+        if let Some(pos) = tools
+            .iter()
+            .position(|tool| matches!(tool.internal_id.unwrap_ink(), ID::Stylus { sid: this_sid, .. } if *this_sid == sid)) {
+                // use `position` instead of find because of borrow issues.
+                return Ok(&mut tools[pos]);
+            };
+        // Not found, make one!
+        unsafe {
+            // About cursors!
+            // https://learn.microsoft.com/en-us/windows/win32/api/msinkaut/nn-msinkaut-iinkcursor
+            // Each cursor represents *one end* of a stylus, with implications of it being hardware unique ID (note from future:
+            // this implication is false). Problem is, tip and eraser have *different* hardware ids with no way to re-correlate them.
+            // Sadness!
+            // We can also query the number of buttons! However, tip and eraser are also considered buttons with no way
+            // to differentiate them, so that's not much use.
+
+            let cursor = rts.GetStylusForId(sid)?;
+            let cursor_id = cursor.Id().ok();
+
+            let tool = crate::tool::Tool {
+                internal_id: ID::Stylus { sid, cursor_id }.into(),
+                name: cursor.Name().ok().as_ref().map(ToString::to_string),
+                // Very intentional cast. We just want *uniqueness* of each number.
+                #[allow(clippy::cast_sign_loss)]
+                hardware_id: cursor_id.map(|id| crate::tool::HardwareID(id as u64)),
+                wacom_id: None,
+                tool_type: match cursor
+                    .Inverted()
+                    .map(windows::Win32::Foundation::VARIANT_BOOL::as_bool)
+                {
+                    Ok(false) => Some(crate::tool::Type::Pen),
+                    Ok(true) => Some(crate::tool::Type::Eraser),
+                    Err(_) => None,
+                },
+                axes: crate::axis::FullInfo::default(),
+            };
+            tools.push(tool);
+            Ok(tools.last_mut().unwrap())
+        }
+    }
+    fn get_tool(&self, sid: u32) -> Option<&crate::tool::Tool> {
+        self.tools
+            .iter()
+            .find(|tool| matches!(tool.internal_id.unwrap_ink(), ID::Stylus { sid: this_sid, .. } if *this_sid == sid))
+    }
     /// Insert a tablet to the end of the raw tablets list.
     /// *Always succeeds* in appending to the list, but in the case of an error a dummy is appended.
     #[allow(clippy::needless_pass_by_value)]
@@ -248,7 +304,7 @@ impl DataFrame {
                 (
                     RawTabletSlot::Concrete(RawTablet {
                         interpreter,
-                        info,
+                        axes: info,
                         tcid,
                     }),
                     Some(crate::tablet::Tablet {
@@ -274,24 +330,6 @@ impl DataFrame {
 
         self.raw_tablets.push(raw_tablet);
         self.raw_tablets.last_mut().unwrap()
-    }
-    /// Get a tablet by the Ink index.
-    /// `None` means deleted or out-of-bounds.
-    fn tcid_by_idx(&self, idx: u32) -> Option<&RawTabletSlot> {
-        // idx is not a direct subscript into `raw_tablets`, instead, an index of `n` means
-        // "the `n`th tablet which is not marked for deletion".
-        self.raw_tablets
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, tab)| {
-                self.raw_tablet_deletions
-                    // Soundness - deletion list is always sorted
-                    .binary_search(&idx)
-                    // *not* in deleted list, not filtered out.
-                    .is_err()
-                    .then_some(tab)
-            })
-            .nth(idx as usize)
     }
     /// Delete the given index, emitting a removal event.`Ok(tablet)` if successfully deleted, `Err(())` if out-of-bounds.
     fn delete_tcid_by_idx(&mut self, idx: i32) -> Result<&mut RawTabletSlot, ()> {
@@ -341,7 +379,7 @@ impl DataFrame {
     }
     fn handle_packets(
         &mut self,
-        _rts: Option<&tablet_pc::IRealTimeStylus>,
+        rts: &tablet_pc::IRealTimeStylus,
         stylus_info: tablet_pc::StylusInfo,
         // Number of packets packed into `props``
         num_packets: u32,
@@ -350,7 +388,12 @@ impl DataFrame {
         phase: StylusPhase,
     ) {
         let tablet_id = ID::Tablet(stylus_info.tcid);
-        let stylus_id = ID::Stylus(stylus_info.cid, stylus_info.bIsInvertedCursor.as_bool());
+
+        // Find the relevant tool
+        let Ok(tool) = Self::get_or_insert_tool(&mut self.tools, rts, stylus_info.cid) else {
+            // Failed to get stylus, nothing else for us to do.
+            return;
+        };
 
         // Find the relevant tablet
         let tablet = self
@@ -372,6 +415,17 @@ impl DataFrame {
             return;
         };
 
+        // Virally spread capabilities from tablet to any tool that visits it
+        // (only if going from out to some other state to avoid redundany calcs)
+        if self
+            .stylus_states
+            .contains_key(tool.internal_id.unwrap_ink())
+        {
+            tool.axes = tool.axes.union(&tablet.axes);
+        }
+
+        // Emit events.
+        let stylus_id = *(tool.internal_id.unwrap_ink());
         let mut needs_frame = false;
 
         {
@@ -422,7 +476,9 @@ impl DataFrame {
             }
         }
 
-        if let Ok(props_per_packet @ 1..) = usize::try_from(num_packets) {
+        if let Ok(num_packets @ 1..) = usize::try_from(num_packets) {
+            let props_per_packet = props.len() / num_packets;
+
             let mut packets = packet::Iter::new(
                 &tablet.interpreter,
                 self.himetric_to_logical_pixel,
@@ -543,7 +599,7 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         Ok(tablet_pc::RealTimeStylusDataInterest(
             // Devices added/removed
             tablet_pc::RTSDI_RealTimeStylusEnabled.0
-                | tablet_pc::RTSDI_StylusNew.0
+                // RTSDI_StylusNew - there's no event handler for this? Would be nice but not here.
                 | tablet_pc::RTSDI_TabletAdded.0
                 | tablet_pc::RTSDI_TabletRemoved.0
                 // In/Out
@@ -575,41 +631,38 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         }
         let mut lock = self.shared_frame.lock().unwrap();
 
-        let mut leave_by_id = |id: ID| {
-            // Remove it from the map - represents the stylus is Out.
-            let old_phase = lock.stylus_states.remove(&id);
+        // Get the full ID of this (sid aint enough!)
+        let Some(tool) = lock.get_tool(sid) else {
+            return Ok(());
+        };
+        let id = *tool.internal_id.unwrap_ink();
 
-            // The stylus was busy. Emit appropriate events to yank it away
-            if let Some(old_phase) = old_phase {
-                match old_phase {
-                    // Was touching. emit up and out.
-                    StylusPhase::Touched => {
-                        lock.events.push(crate::events::raw::Event::Tool {
-                            tool: id,
-                            event: crate::events::raw::ToolEvent::Up,
-                        });
-                        lock.events.push(crate::events::raw::Event::Tool {
-                            tool: id,
-                            event: crate::events::raw::ToolEvent::Out,
-                        });
-                    }
-                    // Was in air. Emit just out.
-                    StylusPhase::InAir => {
-                        lock.events.push(crate::events::raw::Event::Tool {
-                            tool: id,
-                            event: crate::events::raw::ToolEvent::Out,
-                        });
-                    }
+        // Remove it from the map - missing from map represents the stylus is Out.
+        let old_phase = lock.stylus_states.remove(&id);
+
+        // The stylus was busy. Emit appropriate events to yank it away
+        if let Some(old_phase) = old_phase {
+            match old_phase {
+                // Was touching. emit up and out.
+                StylusPhase::Touched => {
+                    lock.events.push(crate::events::raw::Event::Tool {
+                        tool: id,
+                        event: crate::events::raw::ToolEvent::Up,
+                    });
+                    lock.events.push(crate::events::raw::Event::Tool {
+                        tool: id,
+                        event: crate::events::raw::ToolEvent::Out,
+                    });
+                }
+                // Was in air. Emit just out.
+                StylusPhase::InAir => {
+                    lock.events.push(crate::events::raw::Event::Tool {
+                        tool: id,
+                        event: crate::events::raw::ToolEvent::Out,
+                    });
                 }
             }
-        };
-
-        // We don't know if the tip or eraser left, we only know the ID of the device itself.
-        // So, try on both to leave.
-        let stylus_tip = ID::Stylus(sid, false);
-        let stylus_tail = ID::Stylus(sid, true);
-        leave_by_id(stylus_tip);
-        leave_by_id(stylus_tail);
+        }
 
         Ok(())
     }
@@ -690,7 +743,7 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         // Delegate!
         // We don't have specific states for Up/Down transitions, those are handled
         // implicitly but observing previous state and new state.
-        lock.handle_packets(rts, *stylus_info, 1, props, StylusPhase::Touched);
+        lock.handle_packets(&self.rts, *stylus_info, 1, props, StylusPhase::Touched);
 
         Ok(())
     }
@@ -730,7 +783,7 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         // Delegate!
         // We don't have specific states for Up/Down transitions, those are handled
         // implicitly but observing previous state and new state.
-        lock.handle_packets(rts, *stylus_info, 1, props, StylusPhase::InAir);
+        lock.handle_packets(&self.rts, *stylus_info, 1, props, StylusPhase::InAir);
 
         Ok(())
     }
@@ -815,7 +868,13 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         let stylus_info = unsafe { stylus_info.as_ref() }.ok_or(E_POINTER)?;
         let mut lock = self.shared_frame.lock().unwrap();
         // Delegate!
-        lock.handle_packets(rts, *stylus_info, num_packets, props, StylusPhase::InAir);
+        lock.handle_packets(
+            &self.rts,
+            *stylus_info,
+            num_packets,
+            props,
+            StylusPhase::InAir,
+        );
 
         Ok(())
     }
@@ -856,7 +915,13 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         let stylus_info = unsafe { stylus_info.as_ref() }.ok_or(E_POINTER)?;
         let mut lock = self.shared_frame.lock().unwrap();
         // Delegate!
-        lock.handle_packets(rts, *stylus_info, num_packets, props, StylusPhase::Touched);
+        lock.handle_packets(
+            &self.rts,
+            *stylus_info,
+            num_packets,
+            props,
+            StylusPhase::Touched,
+        );
 
         Ok(())
     }
