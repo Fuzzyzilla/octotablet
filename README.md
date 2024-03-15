@@ -4,18 +4,19 @@ Work in progress high-level tablet/pad/stylus library, reporting connected hardw
 event-based access to user input.
 
 ## Platform Support
-| Platform                             |                                                                     Support |
-|--------------------------------------|----------------------------------------------------------------------------:|
-| Linux/Wayland (`tablet_unstable_v2`) |                                                             In progress[^1] |
-| Windows (Ink `RealTimeStylus`)       | [Stalled](https://github.com/Fuzzyzilla/octotablet/pull/1#issue-2177999569) |
-| Linux/X11 (`xinput`)                 |                                                                    I'll try |
-| Windows (`Winuser.h` Pointer API)    |                                                                     Planned |
-| Windows (`wintab`, proprietary)      |                                                                     Maybe?? |
-| MacOS                                |                                                                 Help needed |
-| IOS                                  |                                                                 Help needed |
-| Android                              |                                                                 Help needed |
+| Platform                             |         Support |
+|--------------------------------------|----------------:|
+| Linux/Wayland (`tablet_unstable_v2`) | In progress[^1] |
+| Windows (Ink `RealTimeStylus`)       | In Progress[^2] |
+| Linux/X11 (`xinput`)                 |        I'll try |
+| MacOS                                |     Help needed |
+| IOS                                  |     Help needed |
+| Android                              |     Help needed |
+| Windows (`Winuser.h` Pointer API)    |     Not planned |
+| Windows (`wintab`, proprietary)      |     Not planned |
 
 [^1]: Compositor support/conformance for this protocol is hit or miss and some features may not work (to be expected from an unstable protocol I guess!)
+[^2]: [Pull request.](https://github.com/Fuzzyzilla/octotablet/pull/1) Only Tablets and Tools - Pads and associated hardware are not exposed by the Ink API. The status of pad hardware on windows is dire, often reported as emulated mouse/keyboard events!
 
 ## Device Support
 So far, tested on:
