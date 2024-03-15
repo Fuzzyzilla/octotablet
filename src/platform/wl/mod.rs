@@ -7,6 +7,7 @@ use crate::{
     pad::{Group, Ring, Strip, TouchSource},
 };
 pub type ID = wayland_backend::client::ObjectId;
+pub type ButtonID = u32;
 use wayland_client::{
     protocol::{wl_registry, wl_seat},
     Connection, Dispatch, Proxy, QueueHandle,

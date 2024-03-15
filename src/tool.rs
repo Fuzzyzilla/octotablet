@@ -18,6 +18,24 @@
 use crate::axis;
 use std::fmt::Debug;
 
+/// An Opaque representation of a Tool button. While tool buttons have no inherent ordering, name, or index, this
+/// allows individual buttons on a single tool to be referred to. Though this type is [`Ord`], the ordering provided is
+/// arbitrary but stable.
+///
+/// A single button ID is not necessarily unique across tools.
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct ButtonID(pub(crate) crate::platform::ButtonID);
+
+/// An opaque identifier that is baked into the hardware of the tool.
+/// Likely to remain stable over executions when the same tool hardware is used, and unique across even devices of the same model.
+/// It is usable to save per-tool configurations to disk, for example.
+///
+/// Connects related tools together - for example, a pen and its eraser will share the same hardware id.
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct HardwareID(pub(crate) u64);
+
 #[derive(Clone, Copy, Debug, strum::AsRefStr, PartialEq, Eq)]
 pub enum Type {
     Pen,
@@ -44,17 +62,14 @@ pub enum Type {
 pub struct Tool {
     /// Platform internal ID.
     pub(crate) internal_id: crate::InternalID,
-    /// An identifier that is baked into the hardware of the tool.
-    /// Likely to remain stable over executions, and unique across even devices of the same model.
-    /// It is usable to save per-tool configurations to disk, for example.
-    ///
-    /// Connects related tools together - for example, a pen and its eraser will share the same id.
-    /// `None` is unknown and does not imply relationships with other tools of id `None`.
+    /// Identifier uniquely represinting this tool hardware. See [`HardwareID`] for more info.
     ///
     /// If this is present, it's also a hint that the tool may be allowed to freely roam between
     /// several connected tablets. Otherwise, the pen is considered tied to the first tablet it comes
     /// [in proximity](crate::events::ToolEvent::In) to.
-    pub hardware_id: Option<u64>,
+    ///
+    /// `None` is unknown and does not imply relationships with other tools of hardware id `None`.
+    pub hardware_id: Option<HardwareID>,
     /// A unique tool type reported by wacom devices. With a lookup table of wacom hardware,
     /// it is possible to find the specific model and additional capabilities of the device
     /// beyond the properties reported by this crate.

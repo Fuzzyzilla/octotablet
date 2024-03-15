@@ -149,6 +149,26 @@ impl LengthInfo {
             Self::Centimeters(c) => c.granularity,
         }
     }
+    /// Returns a new Info with the most extreme properties of each.
+    /// (`Limits::min` is the lowest of the two, `limits::max` the highest, etc.)
+    #[must_use = "doesn't modify self, returns a new Info representing the union"]
+    pub(crate) fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Centimeters(a), Self::Centimeters(b)) => Self::Centimeters(a.union(b)),
+            (Self::Normalized(a), Self::Normalized(b)) => Self::Normalized(NormalizedInfo {
+                granularity: a.granularity.max(b.granularity),
+            }),
+            (Self::Centimeters(cm), Self::Normalized(n))
+            | (Self::Normalized(n), Self::Centimeters(cm)) => {
+                // Uh oh.. This occurs when a linear axis and it's sibling disagree on whether the units are normalized or not.
+                // Not reallllyyyy much we can do here. Feels like an api crime. whoops!
+                // FIXME!
+                Self::Normalized(NormalizedInfo {
+                    granularity: n.granularity.max(cm.granularity),
+                })
+            }
+        }
+    }
 }
 impl Default for LengthInfo {
     fn default() -> Self {

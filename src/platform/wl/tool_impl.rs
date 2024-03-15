@@ -65,8 +65,9 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
                 hardware_serial_lo,
             } => {
                 let ctor = this.partial_tools.get_or_insert_ctor(tool.id());
-                ctor.hardware_id =
-                    Some(u64::from(hardware_serial_hi) << 32 | u64::from(hardware_serial_lo));
+                ctor.hardware_id = Some(crate::tool::HardwareID(
+                    u64::from(hardware_serial_hi) << 32 | u64::from(hardware_serial_lo),
+                ));
             }
             Event::Type {
                 tool_type: wayland_client::WEnum::Value(tool_type),

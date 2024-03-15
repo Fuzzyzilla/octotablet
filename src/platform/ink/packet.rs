@@ -1,18 +1,12 @@
-use super::{core, tablet_pc, WinResult, E_FAIL, E_INVALIDARG};
+//! Logic for parsing the hardware-dependent packet slices.
+//!
+//! The packets are specified as `[i32]` but the interpretation of this varies by device.
+//! The unit, ranges, precision, ect. of all of these are defined at runtime. [`Interpreter`] encodes
+//! the schema for a single tablet and can be used to extract [`axis::Pose`]s from a stream.
+
+use super::{core, tablet_pc, WinResult, E_FAIL};
 use crate::{axis, events, util::NicheF32};
 
-trait ArrayMap2: Sized {
-    // Can't be generic over array length in stable :V
-    type From;
-    fn map<T>(self, f: impl FnMut(Self::From) -> T) -> [T; 2];
-}
-impl<From> ArrayMap2 for [From; 2] {
-    type From = From;
-    fn map<T>(self, mut f: impl FnMut(Self::From) -> T) -> [T; 2] {
-        let [a, b] = self;
-        [f(a), f(b)]
-    }
-}
 /// All the axes we care about ([`crate::axis::Axis`])
 /// (There are Azimuth and altitude axes that can be used to derive X/Y Tilt.
 /// Are there any devices that report azimuth/altitude and NOT x/y? shoud i implement that?)
@@ -34,9 +28,22 @@ pub const DESIRED_PACKET_DESCRIPTIONS: &[core::GUID] = &[
     tablet_pc::GUID_PACKETPROPERTY_GUID_HEIGHT,
     tablet_pc::GUID_PACKETPROPERTY_GUID_TIMER_TICK,
     // Packet status always reported last regardless of it's index into this list, but still must be requested.
-    // Guaranteed by the Ink API to be supported.s
+    // Guaranteed by the Ink API to be supported.
     tablet_pc::GUID_PACKETPROPERTY_GUID_PACKET_STATUS,
 ];
+
+trait SlicePop {
+    type Item;
+    fn pop_front(&mut self) -> Option<Self::Item>;
+}
+impl<'a, T> SlicePop for &'a [T] {
+    type Item = &'a T;
+    fn pop_front(&mut self) -> Option<Self::Item> {
+        let item = self.first()?;
+        *self = &self[..];
+        Some(item)
+    }
+}
 
 /// Describes the transform from raw property packet value to reported value. Works in double precision
 /// due to the possibility of absurd ranges that we gotta squash down to reasonable range precisely.
@@ -52,9 +59,7 @@ impl Scaler {
     pub fn read_from(&self, from: &mut &[i32]) -> Result<NicheF32, FilterError> {
         let Self { multiply, bias } = *self;
 
-        let &data = from.first().ok_or(FilterError::NotEnoughData)?;
-        // Advance the slice - infallible since get(..) woulda bailed!
-        *from = &from[1..];
+        let &data = from.pop_front().ok_or(FilterError::NotEnoughData)?;
 
         // Bias the value, expanding size to fit. Actually fits in "i33-ish"
         let biased = i64::from(data) + i64::from(bias);
@@ -76,52 +81,40 @@ impl Scaler {
 #[derive(Copy, Clone, Debug)]
 pub enum Tristate<T> {
     /// Don't consume a property value and don't report any value.
-    Missing,
+    NotIncluded,
     /// Consume the value, but report nothing.
-    Skip,
+    Malformed,
     /// Consume a property value, scale, then report it.
-    Read(T),
+    Ok(T),
 }
 
 impl Tristate<Scaler> {
     /// Apply this filter from these properties. Will advance the slice if consumed.
     pub fn read_from(&self, from: &mut &[i32]) -> Result<NicheF32, FilterError> {
         match self {
-            Self::Missing => Ok(NicheF32::NONE),
-            Self::Skip => {
-                // try consume and discard
-                let trimmed = from.get(1..).ok_or(FilterError::NotEnoughData)?;
-                *from = trimmed;
-
+            Self::NotIncluded => Ok(NicheF32::NONE),
+            Self::Malformed => {
+                from.pop_front().ok_or(FilterError::NotEnoughData)?;
                 Ok(NicheF32::NONE)
             }
-            Self::Read(scale) => scale.read_from(from),
+            Self::Ok(scale) => scale.read_from(from),
         }
     }
 }
 impl<T> Tristate<T> {
     /// Returns a new Tristate with the [`Tristate::Read`] variant transformed through the
     /// given closure
-    pub fn map_read<U>(self, f: impl FnOnce(T) -> U) -> Tristate<U> {
+    pub fn map_ok<U>(self, f: impl FnOnce(T) -> U) -> Tristate<U> {
         match self {
-            Self::Read(t) => Tristate::Read(f(t)),
-            Self::Skip => Tristate::Skip,
-            Self::Missing => Tristate::Missing,
-        }
-    }
-    /// Returns a new Tristate with the [`Tristate::Read`] variant transformed into a new Tristate through the
-    /// given closure. See [`Option::and_then`]
-    pub fn and_then<U>(self, f: impl FnOnce(T) -> Tristate<U>) -> Tristate<U> {
-        match self {
-            Self::Read(t) => f(t),
-            Self::Skip => Tristate::Skip,
-            Self::Missing => Tristate::Missing,
+            Self::Ok(t) => Tristate::Ok(f(t)),
+            Self::Malformed => Tristate::Malformed,
+            Self::NotIncluded => Tristate::NotIncluded,
         }
     }
     /// Get the value of the `Read` variant.
-    pub fn read(self) -> Option<T> {
+    pub fn ok(self) -> Option<T> {
         match self {
-            Self::Read(t) => Some(t),
+            Self::Ok(t) => Some(t),
             _ => None,
         }
     }
@@ -136,10 +129,9 @@ pub enum FilterError {
 }
 
 /// Describes the state of all optional packet properties, allowing dynamically structured packets in the form of
-/// `[i32]` to be interpreted.
+/// `[i32]` to be interpreted as a [`axis::Pose`].
 #[derive(Clone, Debug)]
-pub struct PacketInterpreter {
-    pub position: [Scaler; 2],
+pub struct Interpreter {
     pub normal_pressure: Tristate<Scaler>,
     pub tilt: [Tristate<Scaler>; 2],
     pub z: Tristate<Scaler>,
@@ -152,32 +144,36 @@ pub struct PacketInterpreter {
 }
 
 #[derive(thiserror::Error, Debug, Clone, Copy)]
-pub enum PacketInterpretError {
+pub enum InterpretError {
     #[error("property slice too long")]
     TooMuchData,
     #[error(transparent)]
     Filter(#[from] FilterError),
 }
 
-impl PacketInterpreter {
+impl Interpreter {
     /// Consume the slice of properties according to these filters, producing a `Pose` and an optional timestamp.
     pub fn consume(
         &self,
+        himetric_to_logical_pixels: f32,
         mut props: &[i32],
-    ) -> Result<(axis::Pose, Option<crate::events::FrameTimestamp>), PacketInterpretError> {
+    ) -> Result<(axis::Pose, Option<crate::events::FrameTimestamp>), InterpretError> {
         // ======= ORDER IS IMPORTANT!! ========
         // If you change me, make sure to change `DESIRED_PACKET_DESCRIPTIONS` :3
 
         let pose = axis::Pose {
+            #[allow(clippy::cast_precision_loss)]
             position: [
-                self.position[0]
-                    .read_from(&mut props)?
-                    .get()
-                    .ok_or(FilterError::Value)?,
-                self.position[1]
-                    .read_from(&mut props)?
-                    .get()
-                    .ok_or(FilterError::Value)?,
+                *props
+                    .pop_front()
+                    .ok_or(InterpretError::Filter(FilterError::NotEnoughData))?
+                    as f32
+                    * himetric_to_logical_pixels,
+                *props
+                    .pop_front()
+                    .ok_or(InterpretError::Filter(FilterError::NotEnoughData))?
+                    as f32
+                    * himetric_to_logical_pixels,
             ],
             pressure: self.normal_pressure.read_from(&mut props)?,
             tilt: match (
@@ -205,9 +201,7 @@ impl PacketInterpreter {
             wheel: None,
         };
         let timer = if self.timer {
-            let &timer = props.first().ok_or(FilterError::NotEnoughData)?;
-            // Advance the slice - infallible since get(..) woulda bailed!
-            props = &props[1..];
+            let &timer = props.pop_front().ok_or(FilterError::NotEnoughData)?;
 
             let timer = u64::try_from(timer).map_err(|_| FilterError::Value)?;
             Some(crate::events::FrameTimestamp(
@@ -221,8 +215,19 @@ impl PacketInterpreter {
         } else {
             // There's data left on the tail. This means we parsed it wrong, and things are probably
             // definitely borked about the stuff that's been parsed into `pose`, so err out.
-            Err(PacketInterpretError::TooMuchData)
+            Err(InterpretError::TooMuchData)
         }
+    }
+}
+
+bitflags::bitflags! {
+    /// As described in https://learn.microsoft.com/en-us/windows/win32/tablet/packetpropertyguids-constants
+    #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+    pub struct StatusWord: i32 {
+        const DOWN = 1;
+        const INVERTED = 2;
+        const _ = 4;
+        const BARREL = 8;
     }
 }
 
@@ -230,28 +235,36 @@ impl PacketInterpreter {
 pub struct Packet {
     pub pose: axis::Pose,
     pub timestamp: Option<events::FrameTimestamp>,
-    pub status: i32,
+    pub status: StatusWord,
 }
-pub struct PacketIter<'a> {
-    filters: &'a PacketInterpreter,
+
+pub struct Iter<'a> {
+    filters: &'a Interpreter,
+    himetric_to_logical_pixel: f32,
     props: &'a [i32],
     props_per_packet: usize,
 }
-impl<'a> PacketIter<'a> {
+impl<'a> Iter<'a> {
     /// Create an iterator over the packets of a slice of data.
-    pub fn new(filters: &'a PacketInterpreter, props: &'a [i32], props_per_packet: usize) -> Self {
+    pub fn new(
+        filters: &'a Interpreter,
+        himetric_to_logical_pixel: f32,
+        props: &'a [i32],
+        props_per_packet: usize,
+    ) -> Self {
         // Round down to nearest whole packet
         let trim = (props.len() / props_per_packet) * props_per_packet;
         let props = &props[..trim];
         Self {
             filters,
+            himetric_to_logical_pixel,
             props,
             props_per_packet,
         }
     }
 }
-impl<'a> Iterator for PacketIter<'a> {
-    type Item = Result<Packet, PacketInterpretError>;
+impl<'a> Iterator for Iter<'a> {
+    type Item = Result<Packet, InterpretError>;
     fn next(&mut self) -> Option<Self::Item> {
         // Get the next words...
         let packet = self.props.get(..self.props_per_packet)?;
@@ -262,11 +275,11 @@ impl<'a> Iterator for PacketIter<'a> {
         let &status = packet.last()?;
         let packet = &packet[..packet.len() - 1];
 
-        match self.filters.consume(packet) {
+        match self.filters.consume(self.himetric_to_logical_pixel, packet) {
             Ok((pose, timestamp)) => Some(Ok(Packet {
                 pose,
                 timestamp,
-                status,
+                status: StatusWord::from_bits_truncate(status),
             })),
             Err(e) => Some(Err(e)),
         }
@@ -342,7 +355,7 @@ fn normalized(
             // Do i need to handle bias < i32::MIN or bias > i32::MAX? egh.
             #[allow(clippy::cast_possible_truncation)]
             let bias = bias as i32;
-            Tristate::Read((
+            Tristate::Ok((
                 Scaler {
                     bias,
                     multiply: multiplier,
@@ -355,12 +368,12 @@ fn normalized(
         } else {
             // Well that's a problem! Stems from `multiplier` being zero.
             // That's a useless scenario anyway, so skip.
-            Tristate::Skip
+            Tristate::Malformed
         }
     } else {
         // Width is zero (info.min == info.max), can't divide to find the multiplier!
         // Not much we can do except skip it and report nothing.
-        Tristate::Skip
+        Tristate::Malformed
     }
 }
 
@@ -370,7 +383,7 @@ fn linear_or_normalize(
 ) -> Tristate<(Scaler, axis::LengthInfo)> {
     match linear_scale_factor(metrics.Units) {
         // Recognized unit! Report as-is and give the user some info about it.
-        Some(scale) => Tristate::Read((
+        Some(scale) => Tristate::Ok((
             Scaler {
                 multiply: f64::from(scale),
                 bias: 0,
@@ -381,7 +394,7 @@ fn linear_or_normalize(
             }),
         )),
         // Unknown unit. Normalize it to something expected :3
-        None => normalized(metrics, (0.0..=1.0).into()).map_read(|(scaler, info)| {
+        None => normalized(metrics, (0.0..=1.0).into()).map_ok(|(scaler, info)| {
             (
                 scaler,
                 axis::LengthInfo::Normalized(axis::NormalizedInfo {
@@ -396,7 +409,7 @@ fn linear_or_normalize(
 fn half_angle_or_normalize(metrics: tablet_pc::PROPERTY_METRICS) -> Tristate<(Scaler, axis::Info)> {
     match angular_scale_factor(metrics.Units) {
         // Recognized unit! Report as-is and give the user some info about it.
-        Some(scale) => Tristate::Read((
+        Some(scale) => Tristate::Ok((
             Scaler {
                 multiply: f64::from(scale),
                 bias: 0,
@@ -411,7 +424,7 @@ fn half_angle_or_normalize(metrics: tablet_pc::PROPERTY_METRICS) -> Tristate<(Sc
             metrics,
             (-std::f32::consts::PI..=std::f32::consts::PI).into(),
         )
-        .map_read(|(scaler, info)| (scaler, info)),
+        .map_ok(|(scaler, info)| (scaler, info)),
     }
 }
 
@@ -443,7 +456,7 @@ mod util {
     impl<T> OwnedCoTaskMemSlice<T> {
         /// Transfer ownership the pointer, will be `CoTaskMemFree`'d on drop.
         /// Safety:
-        /// * ptr must be allocated with CoTaskMemAlloc
+        /// * ptr must be allocated with `CoTaskMemAlloc`
         /// * if len is not zero, ptr must be well-aligned for T
         /// * ptr must be valid for reads for `len * sizeof T` bytes.
         pub unsafe fn new(ptr: *const T, len: usize) -> Self {
@@ -469,7 +482,7 @@ mod util {
         type IntoIter = std::slice::Iter<'a, T>;
         type Item = &'a T;
         fn into_iter(self) -> Self::IntoIter {
-            self.as_ref().into_iter()
+            self.as_ref().iter()
         }
     }
     impl<T> std::ops::Deref for OwnedCoTaskMemSlice<T> {
@@ -487,35 +500,46 @@ mod util {
     }
 }
 
-/// Query everything about a tablet needed to parse packets and convert them to [`crate::axis::Pose`]s
-///
-/// # Errors
-/// All errors from `GetPropertyMetrics` that are not `TPC_E_UNKNOWN_PROPERTY` are forwarded.
+/// Query everything about a tablet needed to parse packets and convert them to [`crate::axis::Pose`]s.
 /// # Safety
 /// ¯\\\_(ツ)\_/¯
-#[allow(clippy::needless_pass_by_value)]
-pub unsafe fn query_packet_specification(
-    rts: tablet_pc::IRealTimeStylus,
+#[allow(clippy::too_many_lines)]
+pub unsafe fn make_interpreter(
+    rts: &tablet_pc::IRealTimeStylus,
     tcid: u32,
-) -> WinResult<(PacketInterpreter, axis::FullInfo)> {
+) -> WinResult<(Interpreter, axis::FullInfo)> {
     let properties = unsafe {
         let mut num_properties = 0;
         let mut properties = std::ptr::null_mut();
         rts.GetPacketDescriptionData(
             tcid,
+            // We don't care about the scalefactors - they for allow going from HIMETRIC space back to
+            // physical centimeters.
             None,
             None,
             std::ptr::addr_of_mut!(num_properties),
             std::ptr::addr_of_mut!(properties),
         )?;
-        // Place it in a wrapper to free on drop!
-        util::OwnedCoTaskMemSlice::new(properties, num_properties as usize)
+        // Too many properties. Must be a subset of desired descriptions.
+        if num_properties > u32::try_from(DESIRED_PACKET_DESCRIPTIONS.len()).unwrap() {
+            // Short-circuiting before mem management is set up, just do it ourselves!
+            super::com::CoTaskMemFree(Some(properties.cast()));
+            return Err(E_FAIL.into());
+        }
+        // Place it in a wrapper to free mem on drop!
+        util::OwnedCoTaskMemSlice::new(
+            properties,
+            // As ok, checked above.
+            num_properties as usize,
+        )
     };
 
     // We need to find which of `DESIRED_PACKET_DESCRIPTIONS` is actually reflected in `properties`.
     // Guaranteed to be the same order and to be a subset, but some may be missing.
-    let mut desired_idx = 0;
 
+    // Sanity check: Ensure they're all members of DESIRED_PACKET_DESC and in the right order.
+    // (Also ensures they're all unique!). guaranteed by Ink api.
+    let mut desired_idx = 0;
     for property in &properties {
         // Scan forward until found
         while property.guid != DESIRED_PACKET_DESCRIPTIONS[desired_idx] {
@@ -526,23 +550,123 @@ pub unsafe fn query_packet_specification(
                 return Err(E_FAIL.into());
             }
         }
-        todo!()
     }
 
-    Ok((
-        PacketInterpreter {
-            position: [Scaler {
-                bias: 0,
-                multiply: 0.0,
-            }; 2],
-            normal_pressure: Tristate::Missing,
-            tilt: [Tristate::Missing; 2],
-            z: Tristate::Missing,
-            twist: Tristate::Missing,
-            button_pressure: Tristate::Missing,
-            contact_size: [Tristate::Missing; 2],
-            timer: false,
-        },
-        axis::FullInfo::default(),
-    ))
+    // more sanity check:
+    // Check required and guaranteed to be supported properties, X Y and STATUS
+    if properties.len() < 3
+        || properties[0].guid != DESIRED_PACKET_DESCRIPTIONS[0]
+        || properties[0].guid != DESIRED_PACKET_DESCRIPTIONS[1]
+        || properties.last().unwrap().guid != *DESIRED_PACKET_DESCRIPTIONS.last().unwrap()
+    {
+        return Err(E_FAIL.into());
+    }
+
+    let mut interpreter = Interpreter {
+        normal_pressure: Tristate::NotIncluded,
+        tilt: [Tristate::NotIncluded; 2],
+        z: Tristate::NotIncluded,
+        twist: Tristate::NotIncluded,
+        button_pressure: Tristate::NotIncluded,
+        contact_size: [Tristate::NotIncluded; 2],
+        timer: false,
+    };
+    let mut info = axis::FullInfo::default();
+
+    // Cut out first two and last one, those are X,Y, .., STATUS which we have no need to query.
+    // TODO: X,Y granularity calculation. Bleh, left as None for now.
+    for prop in &properties[2..properties.len() - 1] {
+        match prop.guid {
+            tablet_pc::GUID_PACKETPROPERTY_GUID_NORMAL_PRESSURE => {
+                let norm = normalized(prop.PropertyMetrics, (0.0..=1.0).into());
+
+                interpreter.normal_pressure = norm.map_ok(|(a, _)| a);
+                info.pressure = norm.ok().map(|(_, b)| axis::NormalizedInfo {
+                    granularity: b.granularity,
+                });
+            }
+            tablet_pc::GUID_PACKETPROPERTY_GUID_BUTTON_PRESSURE => {
+                let norm = normalized(prop.PropertyMetrics, (0.0..=1.0).into());
+
+                interpreter.button_pressure = norm.map_ok(|(a, _)| a);
+                info.button_pressure = norm.ok().map(|(_, b)| axis::NormalizedInfo {
+                    granularity: b.granularity,
+                });
+            }
+
+            tablet_pc::GUID_PACKETPROPERTY_GUID_X_TILT_ORIENTATION
+            | tablet_pc::GUID_PACKETPROPERTY_GUID_Y_TILT_ORIENTATION => {
+                let norm = half_angle_or_normalize(prop.PropertyMetrics);
+
+                match prop.guid {
+                    tablet_pc::GUID_PACKETPROPERTY_GUID_X_TILT_ORIENTATION => {
+                        interpreter.tilt[0] = norm.map_ok(|(a, _)| a);
+                    }
+                    tablet_pc::GUID_PACKETPROPERTY_GUID_Y_TILT_ORIENTATION => {
+                        interpreter.tilt[1] = norm.map_ok(|(a, _)| a);
+                    }
+                    _ => unreachable!(),
+                }
+
+                if let Some(new_info) = norm.ok().map(|(_, b)| b) {
+                    // Extend the tilt with our new one.
+                    info.tilt = match info.tilt {
+                        // Already had, take the "best" properties of both.
+                        Some(t) => Some(t.union(new_info)),
+                        // Didn't have, replace.
+                        None => Some(new_info),
+                    };
+                }
+            }
+            tablet_pc::GUID_PACKETPROPERTY_GUID_TWIST_ORIENTATION => {
+                // TAU.next_down().
+                let tau_exclusive = f32::from_bits(0x40C9_0FDA);
+
+                let norm = normalized(prop.PropertyMetrics, (0.0..=tau_exclusive).into());
+
+                interpreter.twist = norm.map_ok(|(a, _)| a);
+                info.roll = norm.ok().map(|(_, b)| axis::CircularInfo {
+                    granularity: b.granularity,
+                });
+            }
+            tablet_pc::GUID_PACKETPROPERTY_GUID_Z => {
+                let norm = linear_or_normalize(prop.PropertyMetrics);
+
+                interpreter.z = norm.map_ok(|(a, _)| a);
+                info.distance = norm.ok().map(|(_, b)| b);
+            }
+            tablet_pc::GUID_PACKETPROPERTY_GUID_WIDTH
+            | tablet_pc::GUID_PACKETPROPERTY_GUID_HEIGHT => {
+                let norm = linear_or_normalize(prop.PropertyMetrics);
+
+                match prop.guid {
+                    tablet_pc::GUID_PACKETPROPERTY_GUID_WIDTH => {
+                        interpreter.contact_size[0] = norm.map_ok(|(a, _)| a);
+                    }
+                    tablet_pc::GUID_PACKETPROPERTY_GUID_HEIGHT => {
+                        interpreter.contact_size[1] = norm.map_ok(|(a, _)| a);
+                    }
+                    _ => unreachable!(),
+                }
+
+                if let Some(new_info) = norm.ok().map(|(_, b)| b) {
+                    // Extend the tilt with our new one.
+                    info.contact_size = match info.contact_size {
+                        // Already had, take the "best" properties of both.
+                        Some(t) => Some(t.union(new_info)),
+                        // Didn't have, replace.
+                        None => Some(new_info),
+                    };
+                }
+            }
+            tablet_pc::GUID_PACKETPROPERTY_GUID_TIMER_TICK => {
+                interpreter.timer = true;
+            }
+            // Sanity check above ensured that this is a subset of DESIRED_PACKET_DESCRIPTIONS,
+            // where these ^^ patterns are from.
+            _ => unreachable!(),
+        }
+    }
+
+    Ok((interpreter, info))
 }

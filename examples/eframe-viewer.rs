@@ -239,7 +239,7 @@ impl eframe::App for Viewer {
                             .map_or("Unknown tool", |ty| ty.as_ref());
                         let name = if let Some(id) = tool.hardware_id {
                             format!(
-                                "{type_name:<7} ({:08X?} - Hardware ID: {id:08X})",
+                                "{type_name:<7} ({:08X?} - Hardware ID: {id:08X?})",
                                 tool.id()
                             )
                         } else {
@@ -499,9 +499,9 @@ impl egui::Widget for ShowPen<'_> {
                 let mut cursor = resp.rect.left_top();
                 let pen_name = match (state.tool.hardware_id, state.tool.tool_type) {
                     (None, None) => "Unknown Tool".to_owned(),
-                    (Some(id), None) => format!("{:08X}", id),
+                    (Some(id), None) => format!("{:08X?}", id),
                     (None, Some(ty)) => ty.as_ref().to_string(),
-                    (Some(id), Some(ty)) => format!("{} {:08X}", ty.as_ref(), id),
+                    (Some(id), Some(ty)) => format!("{} {:08X?}", ty.as_ref(), id),
                 };
                 let rect = painter.text(
                     cursor,
