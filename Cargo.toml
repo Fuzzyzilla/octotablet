@@ -3,6 +3,7 @@ name = "octotablet"
 version = "0.1.0"
 authors = ["Aspen <fuzzyzilla01@gmail.com>"]
 edition = "2021"
+description = "Cross-platform Tablet and Stylus Api 🐙✨"
 categories = [
     # lol, very few relavant ones. Notably nothing for platform abstraction :V
     "os",
@@ -15,6 +16,8 @@ keywords = [
     "pen",
     "ink",
 ]
+repository = "https://github.com/Fuzzyzilla/octotablet"
+license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
