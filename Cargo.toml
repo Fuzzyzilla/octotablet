@@ -66,10 +66,10 @@ default = ["wayland-tablet-unstable-v2", "windows-ink"]
 
 # Wayland `tablet_unstable_v2` support
 # Note: "unstable" here refers to the protocol itself, not to the stability of it's integration into this crate!
-wayland-tablet-unstable-v2 = ["wayland-backend", "wayland-client", "wayland-protocols"]
+wayland-tablet-unstable-v2 = ["dep:wayland-backend", "dep:wayland-client", "dep:wayland-protocols"]
 
 # Windows Ink `RealTimeStylus` support
-windows-ink = ["windows"]
+windows-ink = ["dep:windows"]
 
 [dev-dependencies]
 eframe = "0.26.2" 
