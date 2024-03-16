@@ -33,7 +33,6 @@ pub struct Manager {
 }
 
 mod pad_impl;
-mod summary;
 mod tool_impl;
 
 impl Manager {
@@ -69,29 +68,21 @@ impl super::PlatformImpl for Manager {
         self.queue.dispatch_pending(&mut self.state)?;
         Ok(())
     }
-    #[must_use]
     fn timestamp_granularity(&self) -> Option<std::time::Duration> {
         // Wayland always reports, and with millisecond granularity.
         Some(std::time::Duration::from_millis(1))
     }
-    #[must_use]
     fn pads(&self) -> &[crate::pad::Pad] {
         &self.state.pads
     }
-    #[must_use]
     fn tools(&self) -> &[crate::tool::Tool] {
         &self.state.tools
     }
-    #[must_use]
     fn tablets(&self) -> &[crate::tablet::Tablet] {
         &self.state.tablets
     }
     fn raw_events(&self) -> super::RawEventsIter<'_> {
         super::RawEventsIter::Wayland(self.state.events.iter())
-    }
-    #[must_use]
-    fn make_summary(&self) -> crate::events::summary::Summary {
-        self.state.raw_summary.make_concrete(self)
     }
 }
 
@@ -315,8 +306,7 @@ struct TabletState {
     // Associations for which pad each group is connected
     // `group -> pad`
     group_associations: std::collections::HashMap<ID, ID>,
-    // Partial and complete event/summary tracking.
-    raw_summary: summary::Summary,
+    // Partial and complete event tracking.
     frames_in_progress: Vec<FrameInProgress>,
     events: Vec<crate::events::raw::Event<ID>>,
 }
@@ -351,7 +341,6 @@ impl TabletState {
                 }
             }
         }
-        self.raw_summary.consume_oneshot();
     }
     // Create or get the partially built frame.
     fn frame_in_progress(&mut self, tool: ID) -> &mut FrameInProgress {

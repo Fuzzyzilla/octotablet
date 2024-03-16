@@ -1,8 +1,8 @@
 //! Dispatch impls for pad-related events
 
 use super::{
-    raw_events, summary::PadButton, summary::PressInfo, wl_tablet, Connection, Dispatch,
-    FrameTimestamp, Group, HasWlId, Proxy, QueueHandle, Ring, Strip, TabletState, TouchSource,
+    raw_events, wl_tablet, Connection, Dispatch, FrameTimestamp, Group, HasWlId, Proxy,
+    QueueHandle, Ring, Strip, TabletState, TouchSource,
 };
 
 impl Dispatch<wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for TabletState {
@@ -40,7 +40,6 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for TabletState 
                 }
             }
             Event::Removed => {
-                this.raw_summary.pads.retain(|p| p.id != pad.id());
                 this.destroy_pad(pad.id());
                 this.events.push(raw_events::Event::Pad {
                     pad: pad.id(),
@@ -59,23 +58,6 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for TabletState 
                         wl_tablet::zwp_tablet_pad_v2::ButtonState::Pressed
                     )
                 );
-                // Update summary
-                {
-                    let pad_summary = this.raw_summary.pad_or_insert_mut(pad.id());
-                    // Ensure there are enough button elements.
-                    if pad_summary.buttons.len() <= button as usize {
-                        // Button is a zero-based index, so add one
-                        pad_summary
-                            .buttons
-                            .resize(button as usize + 1, PadButton::default());
-                    }
-                    // Increase count if going from unpressed->pressed
-                    let button = &mut pad_summary.buttons[button as usize];
-                    if !button.pressed && pressed {
-                        button.count = button.count.saturating_add(1);
-                    }
-                    button.pressed = pressed;
-                }
                 // Send event
                 this.events.push(raw_events::Event::Pad {
                     pad: pad.id(),
@@ -86,7 +68,6 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for TabletState 
                 });
             }
             Event::Enter { tablet, .. } => {
-                this.raw_summary.pad_or_insert_mut(pad.id()).tablet_id = Some(tablet.id());
                 this.events.push(raw_events::Event::Pad {
                     pad: pad.id(),
                     event: raw_events::PadEvent::Enter {
@@ -95,7 +76,6 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for TabletState 
                 });
             }
             Event::Leave { .. } => {
-                this.raw_summary.pad_or_insert_mut(pad.id()).tablet_id = None;
                 this.events.push(raw_events::Event::Pad {
                     pad: pad.id(),
                     event: raw_events::PadEvent::Exit,
@@ -202,9 +182,6 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, ()> for T
                 ..
             } => {
                 let Some(pad_id) = pad_id else { return };
-                this.raw_summary
-                    .group_or_insert_mut(pad_id.clone(), group.id())
-                    .mode = Some(mode);
                 this.events.push(raw_events::Event::Pad {
                     pad: pad_id,
                     event: raw_events::PadEvent::Group {
@@ -250,9 +227,6 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2, ()> for Tab
                 }
                 let degrees = degrees as f32;
                 let radians = degrees.to_radians();
-                this.raw_summary
-                    .ring_or_insert_mut(pad.clone(), group.clone(), ring.id())
-                    .set(radians);
                 this.events.push(raw_events::Event::Pad {
                     pad,
                     event: raw_events::PadEvent::Group {
@@ -272,16 +246,6 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2, ()> for Tab
                     ) => TouchSource::Finger,
                     _ => TouchSource::Unknown,
                 };
-                // Set press source and refresh if already pressed, or insert anew.
-                let sum =
-                    this.raw_summary
-                        .ring_or_insert_mut(pad.clone(), group.clone(), ring.id());
-                if let Some(press) = sum.pressed.as_mut() {
-                    press.source = source;
-                    press.refresh_expiry();
-                } else {
-                    sum.pressed = Some(PressInfo::new(source));
-                }
 
                 this.events.push(raw_events::Event::Pad {
                     pad,
@@ -295,9 +259,6 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2, ()> for Tab
                 });
             }
             wl_tablet::zwp_tablet_pad_ring_v2::Event::Stop => {
-                this.raw_summary
-                    .ring_or_insert_mut(pad.clone(), group.clone(), ring.id())
-                    .pressed = None;
                 this.events.push(raw_events::Event::Pad {
                     pad,
                     event: raw_events::PadEvent::Group {
@@ -310,9 +271,6 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2, ()> for Tab
                 });
             }
             wl_tablet::zwp_tablet_pad_ring_v2::Event::Frame { time } => {
-                this.raw_summary
-                    .ring_or_insert_mut(pad.clone(), group.clone(), ring.id())
-                    .frame();
                 this.events.push(raw_events::Event::Pad {
                     pad,
                     event: raw_events::PadEvent::Group {
@@ -355,9 +313,7 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2, ()> for T
                 // Saturating-as (guaranteed by the protocol spec to be 0..=65535)
                 let position = u16::try_from(position).unwrap_or(65535);
                 let position = f32::from(position) / 65535.0;
-                this.raw_summary
-                    .strip_or_insert_mut(pad.clone(), group.clone(), strip.id())
-                    .set(position);
+
                 this.events.push(raw_events::Event::Pad {
                     pad,
                     event: raw_events::PadEvent::Group {
@@ -377,16 +333,7 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2, ()> for T
                     ) => TouchSource::Finger,
                     _ => TouchSource::Unknown,
                 };
-                // Set press source and refresh if already pressed, or insert anew.
-                let sum =
-                    this.raw_summary
-                        .strip_or_insert_mut(pad.clone(), group.clone(), strip.id());
-                if let Some(press) = sum.pressed.as_mut() {
-                    press.source = source;
-                    press.refresh_expiry();
-                } else {
-                    sum.pressed = Some(PressInfo::new(source));
-                }
+
                 this.events.push(raw_events::Event::Pad {
                     pad,
                     event: raw_events::PadEvent::Group {
@@ -399,9 +346,6 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2, ()> for T
                 });
             }
             wl_tablet::zwp_tablet_pad_strip_v2::Event::Stop => {
-                this.raw_summary
-                    .strip_or_insert_mut(pad.clone(), group.clone(), strip.id())
-                    .pressed = None;
                 this.events.push(raw_events::Event::Pad {
                     pad,
                     event: raw_events::PadEvent::Group {
@@ -414,9 +358,6 @@ impl Dispatch<wl_tablet::zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2, ()> for T
                 });
             }
             wl_tablet::zwp_tablet_pad_strip_v2::Event::Frame { time } => {
-                this.raw_summary
-                    .strip_or_insert_mut(pad.clone(), group.clone(), strip.id())
-                    .frame();
                 this.events.push(raw_events::Event::Pad {
                     pad,
                     event: raw_events::PadEvent::Group {

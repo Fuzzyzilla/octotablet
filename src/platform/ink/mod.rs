@@ -1329,9 +1329,6 @@ impl super::PlatformImpl for Manager {
     fn tablets(&self) -> &[crate::tablet::Tablet] {
         self.local_frame.as_ref().map_or(&[], DataFrame::tablets)
     }
-    fn make_summary(&self) -> crate::events::summary::Summary {
-        crate::events::summary::Summary::empty()
-    }
     fn raw_events(&self) -> super::RawEventsIter<'_> {
         super::RawEventsIter::Ink(
             self.local_frame
