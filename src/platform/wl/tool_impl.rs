@@ -1,7 +1,6 @@
 //! Dispatch impls for Tool-related events.
 use super::{
-    raw_events, summary::Tool, wl_tablet, Connection, Dispatch, FrameState, NicheF32, Pose, Proxy,
-    QueueHandle, TabletState,
+    raw_events, wl_tablet, Connection, Dispatch, FrameState, Proxy, QueueHandle, TabletState,
 };
 
 impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletState {
@@ -108,94 +107,50 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
             Event::ProximityIn { tablet, .. } => {
                 this.frame_in_progress(tool.id()).state_transition =
                     Some(FrameState::In(tablet.id()));
-                // Start a tool interaction if none exists already.
-                if this.raw_summary.tool.is_none() {
-                    this.raw_summary.tool = Some(Tool {
-                        tablet_id: tablet.id(),
-                        id: tool.id(),
-                        down: false,
-                        buttons: smallvec::smallvec![],
-                        pose: Pose::default(),
-                    });
-                }
             }
             Event::ProximityOut { .. } => {
                 this.frame_in_progress(tool.id()).state_transition = Some(FrameState::Out);
-                // If the tool matches the summary, clear the summary.
-                if this.raw_summary.tool_mut(&tool.id()).is_some() {
-                    this.raw_summary.tool = None;
-                }
             }
             Event::Down { .. } => {
                 this.frame_in_progress(tool.id()).state_transition = Some(FrameState::Down);
-                if let Some(summary) = &mut this.raw_summary.tool_mut(&tool.id()) {
-                    summary.down = true;
-                }
             }
             Event::Up { .. } => {
                 this.frame_in_progress(tool.id()).state_transition = Some(FrameState::Up);
-                if let Some(summary) = &mut this.raw_summary.tool_mut(&tool.id()) {
-                    summary.down = false;
-                }
             }
             #[allow(clippy::cast_possible_truncation)]
             Event::Motion { x, y } => {
                 let x = x as f32;
                 let y = y as f32;
                 this.frame_in_progress(tool.id()).position = Some([x, y]);
-                #[allow(clippy::cast_possible_truncation)]
-                if let Some(summary) = &mut this.raw_summary.tool_mut(&tool.id()) {
-                    summary.pose.position = [x, y];
-                }
             }
             #[allow(clippy::cast_possible_truncation)]
             Event::Tilt { tilt_x, tilt_y } => {
                 let tilt_x = (tilt_x as f32).to_radians();
                 let tilt_y = (tilt_y as f32).to_radians();
                 this.frame_in_progress(tool.id()).tilt = Some([tilt_x, tilt_y]);
-                #[allow(clippy::cast_possible_truncation)]
-                if let Some(summary) = &mut this.raw_summary.tool_mut(&tool.id()) {
-                    summary.pose.tilt = Some([tilt_x, tilt_y]);
-                }
             }
             Event::Pressure { pressure } => {
                 // Saturating-as (guaranteed by the protocol spec to be 0..=65535)
                 let pressure = u16::try_from(pressure).unwrap_or(65535);
                 let pressure = f32::from(pressure) / 65535.0;
                 this.frame_in_progress(tool.id()).pressure = Some(pressure);
-                #[allow(clippy::cast_precision_loss)]
-                if let Some(summary) = &mut this.raw_summary.tool_mut(&tool.id()) {
-                    summary.pose.pressure = NicheF32::new_some(pressure).unwrap();
-                }
             }
             Event::Distance { distance } => {
                 // Saturating-as (guaranteed by the protocol spec to be 0..=65535)
                 let distance = u16::try_from(distance).unwrap_or(65535);
                 let distance = f32::from(distance) / 65535.0;
                 this.frame_in_progress(tool.id()).distance = Some(distance);
-                #[allow(clippy::cast_precision_loss)]
-                if let Some(summary) = &mut this.raw_summary.tool_mut(&tool.id()) {
-                    summary.pose.distance = NicheF32::new_some(distance).unwrap();
-                }
             }
             #[allow(clippy::cast_possible_truncation)]
             Event::Rotation { degrees } => {
                 let radians = (degrees as f32).to_radians();
                 this.frame_in_progress(tool.id()).roll = Some(radians);
-                #[allow(clippy::cast_possible_truncation)]
-                if let Some(summary) = &mut this.raw_summary.tool_mut(&tool.id()) {
-                    summary.pose.roll = NicheF32::new_some(radians).unwrap();
-                }
             }
             Event::Slider { position } => {
                 // Saturating-as (guaranteed by the protocol spec to be 0..=65535)
                 let position = u16::try_from(position).unwrap_or(65535);
                 let position = f32::from(position) / 65535.0;
                 this.frame_in_progress(tool.id()).slider = Some(position);
-                #[allow(clippy::cast_precision_loss)]
-                if let Some(summary) = &mut this.raw_summary.tool_mut(&tool.id()) {
-                    summary.pose.slider = NicheF32::new_some(position).unwrap();
-                }
             }
             Event::Button { button, state, .. } => {
                 let pressed = matches!(
@@ -207,17 +162,6 @@ impl Dispatch<wl_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for TabletStat
                 this.frame_in_progress(tool.id())
                     .buttons
                     .push((button, pressed));
-                if let Some(summary) = &mut this.raw_summary.tool_mut(&tool.id()) {
-                    if pressed {
-                        // Add id if not already present
-                        if !summary.buttons.contains(&button) {
-                            summary.buttons.push(button);
-                        }
-                    } else {
-                        // clear id from the set
-                        summary.buttons.retain(|b| *b != button);
-                    }
-                }
             }
             Event::Frame { time } => {
                 this.frame(&tool.id(), time);

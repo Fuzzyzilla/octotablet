@@ -1,14 +1,6 @@
 //! Sequential information about interactions.
-//!
-//! The events in this module are good for collecting every nuance of the sequence of events
-//! and motions that occured since the last frame. For a higher level but lossy
-//! view of this information, see the [`summary`] module.
-//!
-//! In general, if you're making a drawing app, use events to inspect the exact path taken during the frame.
-//! If you're using the tools as a mouse-with-extras and only care about the final position, use summaries.
 
 pub(crate) mod raw;
-pub mod summary;
 
 use crate::{axis::Pose, pad, platform::PlatformImpl, tablet::Tablet, tool::Tool, Manager};
 
@@ -156,7 +148,7 @@ pub enum PadGroupEvent<'a> {
 #[derive(Clone, Copy, Debug)]
 pub enum TouchStripEvent {
     /// Single degree-of-freedom pose. Interpretation depends on the context under which this event was fired - if from a ring,
-    /// this is in radians clockwise from "logical north". If from a strip, it is 0..1 where 0 is "logical top or left".
+    /// this is `[0..TAU)` in radians clockwise from "logical north". If from a strip, it is `[0..1]` where 0 is "logical top or left".
     Pose(f32),
     /// Optionally sent with a frame to describe the cause of the events.
     Source(pad::TouchSource),
@@ -188,8 +180,7 @@ pub enum Event<'a> {
 
 /// This struct is the primary source of realtime data.
 ///
-/// Opaque, copyable `IntoIterator` over events. Alternatively, if you don't care about
-/// intermediate events and just want to know the end state, use [`Events::summarize`].
+/// Opaque, copyable `IntoIterator` over events.
 ///
 /// Since the returned `Iterator` is unable to rewind, make copies if you need
 /// to iterate multiple times. Copies are free!
@@ -203,14 +194,6 @@ impl<'manager> Events<'manager> {
     #[must_use]
     pub fn manager(&'_ self) -> &'manager Manager {
         self.manager
-    }
-    /// Collect a summary of the final status of connected hardware.
-    ///
-    /// This is generally much cheaper than iterating, and is useful if you don't
-    /// care about intermediate events and just want to know final buttons/positions/etc.
-    #[must_use = "returns a new object describing the overall end state"]
-    pub fn summarize(self) -> summary::Summary<'manager> {
-        self.manager.internal.make_summary()
     }
 }
 impl<'manager> IntoIterator for Events<'manager> {

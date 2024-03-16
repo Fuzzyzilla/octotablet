@@ -180,9 +180,6 @@ fn main() {
         });
 
         // Accept all new messages from the stylus server.
-        // We use the events API here as opposed to the summary API presented in the `eframe-viewer` example.
-        // This is so that we can have the highest fidelity record of the digitizer movements, regardless of lag or framerate.
-        // Events are reported upwards of 1000 per second, so much detail!
         let events = manager.pump().unwrap();
         for event in events {
             // We only care about tool events...

@@ -22,6 +22,8 @@ impl From<raw_window_handle::HandleError> for BuildError {
 }
 
 /// Pre-construction configuration for a [`Manager`].
+// Not every integration will use every field, leaving some "unread" on some targets.
+#[allow(unused)]
 pub struct Builder {
     pub(crate) emulate_tool_from_mouse: bool,
 }

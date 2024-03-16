@@ -291,13 +291,12 @@ impl<'a> Iterator for Iter<'a> {
 /// error occurs.
 pub fn calc_limits(
     metrics: tablet_pc::PROPERTY_METRICS,
-    scale_factor: f32,
+    scale_factor: f64,
 ) -> Option<axis::Limits> {
     if scale_factor.is_nan() {
         return None;
     }
     // Use f64 for exact precision on these integers
-    let scale_factor = f64::from(scale_factor);
     let min = f64::from(metrics.nLogicalMin) * scale_factor;
     let max = f64::from(metrics.nLogicalMax) * scale_factor;
 
@@ -311,18 +310,13 @@ pub fn calc_limits(
     }
     Some(axis::Limits { min, max })
 }
-/// Calculates the granularity based on the unit's scale factor. None if a arithmetic
-/// error occurs.
-pub fn calc_granularity(
-    metrics: tablet_pc::PROPERTY_METRICS,
-    scale_factor: f32,
-) -> Option<axis::Granularity> {
-    // Divide here, since the resolution is inversely related to the size of the unit.
-    // `(1 dots/inch) -> (1/2.45 dots/cm)`
-    let resolution = metrics.fResolution / scale_factor;
-    // Saturate. Negative/NaN becomes 0 (invalid), over gets clamped down. Ok!!
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let granularity = resolution.ceil() as u32;
+/// Calculates the granularity based on the unit's scale factor. None if zero.
+pub fn calc_granularity(metrics: tablet_pc::PROPERTY_METRICS) -> Option<axis::Granularity> {
+    let granularity = metrics
+        .nLogicalMax
+        .abs_diff(metrics.nLogicalMin)
+        // Min and Max are inclusive, diff gives us exclusive.
+        .saturating_add(1);
     std::num::NonZeroU32::new(granularity).map(axis::Granularity)
 }
 
@@ -334,7 +328,11 @@ fn normalized(
     onto: axis::Limits,
 ) -> Tristate<(Scaler, axis::Info)> {
     // Range of integer values is a hint at precision! i64 to not overflow (real range is ~i33)
+    // May be negative.
     let from_width = i64::from(metrics.nLogicalMax) - i64::from(metrics.nLogicalMin);
+    // Min and Max are inclusive, magnitude +1
+    let from_width = from_width + from_width.signum();
+
     // saturating as
     let granularity = u32::try_from(from_width.unsigned_abs()).unwrap_or(u32::MAX);
 
@@ -384,16 +382,22 @@ fn linear_or_normalize(
 ) -> Tristate<(Scaler, axis::LengthInfo)> {
     match linear_scale_factor(metrics.Units) {
         // Recognized unit! Report as-is and give the user some info about it.
-        Some(scale) => Tristate::Ok((
-            Scaler {
-                multiply: f64::from(scale),
-                bias: 0,
-            },
-            axis::LengthInfo::Centimeters(axis::Info {
-                granularity: calc_granularity(metrics, scale),
-                limits: calc_limits(metrics, scale),
-            }),
-        )),
+        Some(unit_scale) => {
+            // We must *also* divide by Resolution, as that tells us how many "dots per unit",
+            // and then the unit scale gets us from that hardware unit to our desired unit.
+            let scale = unit_scale / f64::from(metrics.fResolution);
+
+            Tristate::Ok((
+                Scaler {
+                    multiply: scale,
+                    bias: 0,
+                },
+                axis::LengthInfo::Centimeters(axis::Info {
+                    granularity: calc_granularity(metrics),
+                    limits: calc_limits(metrics, scale),
+                }),
+            ))
+        }
         // Unknown unit. Normalize it to something expected :3
         None => normalized(metrics, (0.0..=1.0).into()).map_ok(|(scaler, info)| {
             (
@@ -410,26 +414,32 @@ fn linear_or_normalize(
 fn half_angle_or_normalize(metrics: tablet_pc::PROPERTY_METRICS) -> Tristate<(Scaler, axis::Info)> {
     match angular_scale_factor(metrics.Units) {
         // Recognized unit! Report as-is and give the user some info about it.
-        Some(scale) => Tristate::Ok((
-            Scaler {
-                multiply: f64::from(scale),
-                bias: 0,
-            },
-            axis::Info {
-                granularity: calc_granularity(metrics, scale),
-                limits: calc_limits(metrics, scale),
-            },
-        )),
+        Some(unit_scale) => {
+            // We must *also* divide by Resolution, as that tells us how many "dots per unit",
+            // and then the scale gets us from that unit to our desired unit.
+            let scale = unit_scale / f64::from(metrics.fResolution);
+            Tristate::Ok((
+                Scaler {
+                    // We must *also* divide by Resolution, as that tells us how many "dots per unit",
+                    // and then the unit scale gets us from that hardware unit to our desired unit.
+                    multiply: scale,
+                    bias: 0,
+                },
+                axis::Info {
+                    granularity: calc_granularity(metrics),
+                    limits: calc_limits(metrics, scale),
+                },
+            ))
+        }
         // Unknown unit. Normalize it to something expected :3
         None => normalized(
             metrics,
             (-std::f32::consts::PI..=std::f32::consts::PI).into(),
-        )
-        .map_ok(|(scaler, info)| (scaler, info)),
+        ),
     }
 }
 
-fn linear_scale_factor(unit: tablet_pc::PROPERTY_UNITS) -> Option<f32> {
+fn linear_scale_factor(unit: tablet_pc::PROPERTY_UNITS) -> Option<f64> {
     // Two types for the same enum..
     let unit = tablet_pc::TabletPropertyMetricUnit(unit.0);
     match unit {
@@ -438,13 +448,14 @@ fn linear_scale_factor(unit: tablet_pc::PROPERTY_UNITS) -> Option<f32> {
         _ => None,
     }
 }
-fn angular_scale_factor(unit: tablet_pc::PROPERTY_UNITS) -> Option<f32> {
+fn angular_scale_factor(unit: tablet_pc::PROPERTY_UNITS) -> Option<f64> {
     // Two types for the same enum..
     let unit = tablet_pc::TabletPropertyMetricUnit(unit.0);
     match unit {
         tablet_pc::TPMU_Radians => Some(1.0),
-        tablet_pc::TPMU_Degrees => Some(1.0f32.to_radians()),
-        tablet_pc::TPMU_Seconds => Some((1.0f32 / 3600.0f32).to_radians()),
+        tablet_pc::TPMU_Degrees => Some(1.0f64.to_radians()),
+        // "Seconds" as in Arcseconds.
+        tablet_pc::TPMU_Seconds => Some((1.0f64 / 3600.0f64).to_radians()),
         _ => None,
     }
 }
@@ -602,10 +613,10 @@ pub unsafe fn make_interpreter(
 
                 match prop.guid {
                     tablet_pc::GUID_PACKETPROPERTY_GUID_X_TILT_ORIENTATION => {
-                        interpreter.tilt[0] = norm.map_ok(|(a, _)| a);
+                        interpreter.tilt[0] = dbg!(norm.map_ok(|(a, _)| a));
                     }
                     tablet_pc::GUID_PACKETPROPERTY_GUID_Y_TILT_ORIENTATION => {
-                        interpreter.tilt[1] = norm.map_ok(|(a, _)| a);
+                        interpreter.tilt[1] = dbg!(norm.map_ok(|(a, _)| a));
                     }
                     _ => unreachable!(),
                 }

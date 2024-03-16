@@ -181,8 +181,6 @@ pub(crate) trait PlatformImpl {
     fn tablets(&self) -> &[crate::tablet::Tablet];
     #[must_use]
     fn raw_events(&self) -> RawEventsIter<'_>;
-    #[must_use]
-    fn make_summary(&self) -> crate::events::summary::Summary;
 }
 
 /// Static dispatch between compiled backends.
