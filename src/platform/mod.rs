@@ -39,11 +39,13 @@ impl InternalID {
     // in the common case where it's dead code.
     #[cold]
     #[inline(never)]
+    #[allow(dead_code)]
     fn unwrap_failure() -> ! {
         panic!("Unwrap called on incorrect ID type")
     }
     #[cfg(wl_tablet)]
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn unwrap_wl(&self) -> &wl::ID {
         #[allow(unreachable_patterns)]
         #[allow(clippy::match_wildcard_for_single_variants)]
@@ -54,6 +56,7 @@ impl InternalID {
     }
     #[cfg(ink_rts)]
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn unwrap_ink(&self) -> &ink::ID {
         #[allow(unreachable_patterns)]
         #[allow(clippy::match_wildcard_for_single_variants)]
@@ -110,11 +113,13 @@ impl ButtonID {
     // in the common case where it's dead code.
     #[cold]
     #[inline(never)]
+    #[allow(dead_code)]
     fn unwrap_failure() -> ! {
         panic!("Unwrap called on incorrect ID type")
     }
     #[cfg(wl_tablet)]
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn unwrap_wl(&self) -> &wl::ButtonID {
         #[allow(unreachable_patterns)]
         #[allow(clippy::match_wildcard_for_single_variants)]
@@ -125,6 +130,7 @@ impl ButtonID {
     }
     #[cfg(ink_rts)]
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn unwrap_ink(&self) -> &ink::ButtonID {
         #[allow(unreachable_patterns)]
         #[allow(clippy::match_wildcard_for_single_variants)]

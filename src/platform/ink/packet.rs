@@ -102,7 +102,7 @@ impl Tristate<Scaler> {
     }
 }
 impl<T> Tristate<T> {
-    /// Returns a new Tristate with the [`Tristate::Read`] variant transformed through the
+    /// Returns a new Tristate with the [`Tristate::Ok`] variant transformed through the
     /// given closure
     pub fn map_ok<U>(self, f: impl FnOnce(T) -> U) -> Tristate<U> {
         match self {
@@ -111,7 +111,7 @@ impl<T> Tristate<T> {
             Self::NotIncluded => Tristate::NotIncluded,
         }
     }
-    /// Get the value of the `Read` variant.
+    /// Get the value of the `Ok` variant.
     pub fn ok(self) -> Option<T> {
         match self {
             Self::Ok(t) => Some(t),
@@ -321,7 +321,7 @@ pub fn calc_granularity(metrics: tablet_pc::PROPERTY_METRICS) -> Option<axis::Gr
 }
 
 /// Attempt to squash the range down, regardless of unit.
-/// Returns [`Tristate::Skip`] if an arithmetic error occurs and the normalization cannot
+/// Returns [`Tristate::Malformed`] if an arithmetic error occurs and the normalization cannot
 /// be performed.
 fn normalized(
     metrics: tablet_pc::PROPERTY_METRICS,

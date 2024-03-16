@@ -115,7 +115,7 @@ struct DataFrame {
     /// Tablets *in initialization order*.
     /// This is important, since notifications may refer to a tablet by it's index.
     raw_tablets: Vec<RawTabletSlot>,
-    /// User-visible tablets created from [`RawTablet::Concrete`] tablets.
+    /// User-visible tablets created from [`RawTabletSlot::Concrete`] tablets.
     tablets: Vec<crate::tablet::Tablet>,
     events: Vec<crate::events::raw::Event<ID>>,
 }
@@ -591,7 +591,7 @@ impl Plugin {
 pub struct Manager {
     /// Invariant: valid for the lifetime of Self.
     hwnd: HWND,
-    /// The rts that owns the single async [`Plugin`]` instance.
+    /// The rts that owns the single async [`Plugin`] instance.
     rts: tablet_pc::IRealTimeStylus,
     /// Shared with [`Plugin::poisoned`].
     poisoned: sync::Arc<sync::atomic::AtomicBool>,
