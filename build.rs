@@ -14,6 +14,6 @@ fn main() {
         // lonngg cfg = The feature is on, and (docs or (supported platform and not unsupported platform))
         wl_tablet: { all(feature = "wayland-tablet-unstable-v2", any(docsrs, all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_os = "ios", target_os = "macos"))))) },
         // Ink RealTimeStylus is requested and available
-        ink_rts: { all(feature = "windows-ink", any(docsrs, target_os = "windows")) },
+        ink_rts: { all(feature = "windows-ink", any(docsrs, target_os = "windows", unix)) },
     }
 }

@@ -23,9 +23,14 @@ use std::fmt::Debug;
 /// arbitrary but stable.
 ///
 /// A single button ID is not necessarily unique across tools.
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct ButtonID(pub(crate) crate::platform::ButtonID);
+impl std::fmt::Debug for ButtonID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 /// An opaque identifier that is baked into the hardware of the tool.
 /// Likely to remain stable over executions when the same tool hardware is used, and unique across even devices of the same model.
@@ -81,4 +86,4 @@ pub struct Tool {
     pub axes: axis::FullInfo,
 }
 
-crate::macro_bits::impl_get_id!(ID for Tool);
+crate::util::macro_bits::impl_get_id!(ID for Tool);

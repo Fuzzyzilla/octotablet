@@ -72,7 +72,10 @@ pub enum ToolEvent<'a> {
     /// For an Airbrush, lens, or mouse, this could be a button.
     Down,
     /// A button on the tool was pressed or released. *This is not an index!*
-    Button { button_id: u32, pressed: bool },
+    Button {
+        button_id: crate::tool::ButtonID,
+        pressed: bool,
+    },
     /// A snapshot of all axes at this point in time. See [`Pose`] for quirks.
     // This single variant is so much larger than all the others and inflates the whole
     // event enum by over 2x D:
@@ -251,9 +254,10 @@ impl<'manager> EventIterator<'manager> {
                                 .unwrap(),
                         },
                         RawTool::Down => ToolEvent::Down,
-                        RawTool::Button { button_id, pressed } => {
-                            ToolEvent::Button { button_id, pressed }
-                        }
+                        RawTool::Button { button_id, pressed } => ToolEvent::Button {
+                            button_id: crate::tool::ButtonID(button_id),
+                            pressed,
+                        },
                         RawTool::Pose(v) => ToolEvent::Pose(v),
                         RawTool::Frame(v) => ToolEvent::Frame(v),
                         RawTool::Up => ToolEvent::Up,

@@ -613,10 +613,10 @@ pub unsafe fn make_interpreter(
 
                 match prop.guid {
                     tablet_pc::GUID_PACKETPROPERTY_GUID_X_TILT_ORIENTATION => {
-                        interpreter.tilt[0] = dbg!(norm.map_ok(|(a, _)| a));
+                        interpreter.tilt[0] = norm.map_ok(|(a, _)| a);
                     }
                     tablet_pc::GUID_PACKETPROPERTY_GUID_Y_TILT_ORIENTATION => {
-                        interpreter.tilt[1] = dbg!(norm.map_ok(|(a, _)| a));
+                        interpreter.tilt[1] = norm.map_ok(|(a, _)| a);
                     }
                     _ => unreachable!(),
                 }

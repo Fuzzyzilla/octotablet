@@ -28,7 +28,7 @@ pub struct Pad {
     // (todo: make that a type-level guarantee)
     pub groups: Vec<Group>,
 }
-crate::macro_bits::impl_get_id!(ID for Pad);
+crate::util::macro_bits::impl_get_id!(ID for Pad);
 // Submodules for nicer ID names.
 pub mod group {
     /// The type of interactable being queried in a [`FeedbackFn`]
@@ -75,7 +75,7 @@ pub mod group {
             this.finish()
         }
     }
-    crate::macro_bits::impl_get_id!(ID for Group);
+    crate::util::macro_bits::impl_get_id!(ID for Group);
 }
 
 /// The cause of a ring or strip interaction.
@@ -93,7 +93,7 @@ pub mod ring {
         /// Granularity of the reported angle, if known.
         pub granularity: Option<crate::axis::Granularity>,
     }
-    crate::macro_bits::impl_get_id!(ID for Ring);
+    crate::util::macro_bits::impl_get_id!(ID for Ring);
 }
 pub mod strip {
     /// A touch-sensitive strip or slider, reporting absolute position in `0..=1` where 0 is "logical top/left."
@@ -103,5 +103,5 @@ pub mod strip {
         /// Granularity of the reported linear position, if known.
         pub granularity: Option<crate::axis::Granularity>,
     }
-    crate::macro_bits::impl_get_id!(ID for Strip);
+    crate::util::macro_bits::impl_get_id!(ID for Strip);
 }

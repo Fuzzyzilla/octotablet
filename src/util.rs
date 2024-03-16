@@ -87,3 +87,35 @@ impl PartialEq<NicheF32> for f32 {
         other == self
     }
 }
+
+pub(crate) mod macro_bits {
+    /// Implements an public opaque ID,
+    /// assuming the struct has a `internal_id` which implements `Into<platform::InternalID>`
+    macro_rules! impl_get_id {
+        ($id_name:ident for $impl_for:ident) => {
+            /// An opaque ID. Can be used to keep track of hardware, but only during its lifetime.
+            /// Once the hardware is `Removed`, the ID loses meaning.
+            #[derive(Clone, Hash, PartialEq, Eq)]
+            #[allow(clippy::module_name_repetitions)]
+            #[repr(transparent)]
+            pub struct $id_name(crate::platform::InternalID);
+
+            impl ::std::fmt::Debug for $id_name {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    self.0.fmt(f)
+                }
+            }
+
+            impl $impl_for {
+                /// Opaque, transient ID of this tool, assigned arbitrarily by the software. Will not
+                /// be stable across invocations or even unplugs/replugs!
+                #[must_use]
+                pub fn id(&self) -> $id_name {
+                    $id_name(self.internal_id.clone().into())
+                }
+            }
+        };
+    }
+    // Weird hacks to allow use from submodules..
+    pub(crate) use impl_get_id;
+}

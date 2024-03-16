@@ -217,7 +217,7 @@ pub fn format_event(event: Event) -> (String, eframe::egui::Color32) {
                 ToolEvent::Pose(pose) => (format!("{name} {pose:#?}"), colors::POSE),
                 ToolEvent::Button { button_id, pressed } => (
                     format!(
-                        "{name} button {button_id} {}",
+                        "{name} button {button_id:08X?} {}",
                         if pressed { "pressed" } else { "released" }
                     ),
                     if pressed {

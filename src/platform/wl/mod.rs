@@ -421,7 +421,10 @@ impl TabletState {
             for &(button_id, pressed) in &frame.buttons {
                 self.events.push(raw_events::Event::Tool {
                     tool: tool.clone(),
-                    event: raw_events::ToolEvent::Button { button_id, pressed },
+                    event: raw_events::ToolEvent::Button {
+                        button_id: button_id.into(),
+                        pressed,
+                    },
                 });
             }
             // emit ups and outs last... Return true from Out to mark the frame for clearing.

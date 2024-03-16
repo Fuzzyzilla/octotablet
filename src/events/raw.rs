@@ -5,9 +5,14 @@
 pub enum ToolEvent<Id> {
     Added,
     Removed,
-    In { tablet: Id },
+    In {
+        tablet: Id,
+    },
     Down,
-    Button { button_id: u32, pressed: bool },
+    Button {
+        button_id: crate::platform::ButtonID,
+        pressed: bool,
+    },
     // This variant is many times the size of all the others resulting in huge inefficiency.
     // If memory usage/throughput becomes appreciably bad, this is a good place to start.
     Pose(super::Pose),

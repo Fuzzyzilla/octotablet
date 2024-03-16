@@ -7,7 +7,7 @@
 //! builtin buttons and other tablet hardware are reported by zero or more [pads](crate::pad),
 //! and sensing capabilities are provided by individual [tools](crate::tool).
 
-crate::macro_bits::impl_get_id!(ID for Tablet);
+crate::util::macro_bits::impl_get_id!(ID for Tablet);
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct UsbId {
