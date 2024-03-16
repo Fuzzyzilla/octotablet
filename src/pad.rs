@@ -34,7 +34,7 @@ pub mod group {
     /// The type of interactable being queried in a [`FeedbackFn`]
     #[derive(Copy, Clone)]
     pub enum FeedbackElement<'a> {
-        /// The [button](super::Pad::total_buttons) with the given pad index. This will only
+        /// The [button](super::Pad::total_buttons) index with the given pad. This will only
         /// be called with buttons [owned](Group::buttons) by the relevant group.
         Button(u32),
         Ring(&'a super::Ring),
@@ -42,9 +42,10 @@ pub mod group {
     }
 
     /// After the group switches to the given mode index, provide feedback to the OS as to the roles
-    /// of buttons, sliders, and rings within the group. Called potentially many times per switch.
+    /// of buttons, sliders, and rings within the group. Called potentially many times per mode switch.
     pub type FeedbackFn = dyn FnMut(&Group, u32, FeedbackElement<'_>) -> String;
 
+    /// A Pad reports one or more Groups. See the [pad module docs](crate::pad) for more info.
     pub struct Group {
         pub(crate) internal_id: crate::InternalID,
         /// How many mode layers does this group cycle through?
@@ -53,7 +54,9 @@ pub mod group {
         /// Sorted list of the pad button indices that are owned by this group.
         /// This is some subset of the [buttons reported by the Pad](super::Pad::total_buttons).
         pub buttons: Vec<u32>,
+        /// The set of rings belonging to this group.
         pub rings: Vec<super::Ring>,
+        /// The set of strips belonging to this strip.
         pub strips: Vec<super::Strip>,
         /// Called synchronously for each group element (buttons, rings, and strips) after a modeswitch on supporting platforms.
         /// Provides new description text for the roles of each element, which may be shown by on-screen displays or other means.

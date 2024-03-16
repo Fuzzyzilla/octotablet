@@ -67,6 +67,8 @@ enum Backing {
     Raw,
 }
 #[derive(Clone, Copy, Debug)]
+
+/// List of supported backends. This is not affected by enabled features.
 // Some are never constructed due to disabled features/target platform.
 #[allow(dead_code)]
 pub enum Backend {
@@ -89,7 +91,7 @@ pub enum PumpError {
     WaylandDispatch(#[from] wayland_client::DispatchError),
 }
 
-/// Manages a connection to the OS's tablet server. This is the main
+/// Maintains a connection to the OS's tablet server. This is the main
 /// entry point for enumerating hardware and listening for events.
 pub struct Manager {
     pub(crate) internal: platform::PlatformManager,
@@ -100,7 +102,9 @@ pub struct Manager {
     pub(crate) _backing: Backing,
 }
 impl Manager {
-    /// Dispatch pending events without blocking, updating hardware reports and returning an [`IntoIterator`] containing the events.
+    /// Dispatch pending events, updating hardware reports and returning an [`IntoIterator`] containing the events.
+    ///
+    /// This will not wait for new events, and will return immediately with empty events if there is nothing to do.
     #[allow(clippy::missing_errors_doc)]
     pub fn pump(&mut self) -> Result<Events<'_>, PumpError> {
         self.internal.pump()?;

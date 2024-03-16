@@ -28,7 +28,8 @@ impl std::ops::Sub for FrameTimestamp {
     }
 }
 
-/// Events associated with a specific `Tool`.
+/// Events associated with a specific [`Tool`].
+///
 /// Events other than Added and Removed are logically grouped into "Frames" representing grouping
 /// of events in time, providing the timestamp that the group's events occured at if available.
 /// Events within a frame are arbitrarily ordered and to be interpreted
@@ -87,7 +88,7 @@ pub enum ToolEvent<'a> {
     /// The tool has left sensing range or left the window region of the tablet.
     Out,
 }
-/// Events associated with a specific `Tablet`.
+/// Events associated with a specific [`Tablet`].
 #[derive(Clone, Copy, Debug)]
 pub enum TabletEvent {
     /// The tablet is new. May be enumerated at the start of the program,
@@ -96,7 +97,7 @@ pub enum TabletEvent {
     /// Unplugged or otherwise becomes unavailable. The tablet will be removed from the hardware report.
     Removed,
 }
-/// Events associated with a specific `Pad`.
+/// Events associated with a specific [`Pad`](pad::Pad).
 #[derive(Clone, Copy, Debug)]
 pub enum PadEvent<'a> {
     /// The pad is new. May be enumerated at the start of the program,
@@ -124,7 +125,7 @@ pub enum PadEvent<'a> {
     /// The pad has lost it's tablet association.
     Exit,
 }
-/// Events associated with a specific group within a larger Pad.
+/// Events associated with a specific [`Group`](pad::Group) within a larger [`Pad`](pad::Pad).
 #[derive(Clone, Copy, Debug)]
 pub enum PadGroupEvent<'a> {
     /// A ring was interacted.

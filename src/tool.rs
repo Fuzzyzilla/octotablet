@@ -3,7 +3,7 @@
 //! Also called a *stylus* or *pointer*, these represent the device that the user holds to interact with a pad.
 //! "Tools" do not correspond with directly with the above concepts, for example a
 //! single stylus with a tip and eraser represents *two* tools, one for each end. These can be re-associated with
-//! each other through [`Tool::id`].
+//! each other through [`Tool::hardware_id`].
 //!
 //! See [`Type`] for more ideas of what a "tool" may represent.
 //!
@@ -41,6 +41,7 @@ impl std::fmt::Debug for ButtonID {
 #[repr(transparent)]
 pub struct HardwareID(pub(crate) u64);
 
+/// Describes the class of hardware a tool represents
 #[derive(Clone, Copy, Debug, strum::AsRefStr, PartialEq, Eq)]
 pub enum Type {
     Pen,

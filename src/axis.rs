@@ -1,3 +1,5 @@
+//! Axes descriptions of tool capabilities and limits.
+
 use crate::util::NicheF32;
 
 bitflags::bitflags! {
@@ -49,6 +51,7 @@ impl AvailableAxes {
     strum::IntoStaticStr,
     strum::EnumIter,
 )]
+/// An individual Tool axis.
 pub enum Axis {
     /// The tool can sense how much force is applied, purpendicular to the pad surface.
     Pressure,
@@ -60,7 +63,7 @@ pub enum Axis {
     Roll,
     /// The tool has a scroll wheel. It may report continuous motion as well as discrete steps.
     Wheel,
-    /// The tool has an absolute linear slider control, ranging from -1 to 1 with zero being the "natural" position.
+    /// The tool has an absolute linear slider control, `[-1, 1]` with zero being the "natural" position.
     Slider,
     /// The tool has a pressure-sensitive button, reporting how hard the user is pressing on it.
     ButtonPressure,
@@ -101,8 +104,9 @@ impl<U: Union + Clone> Union for Option<U> {
     }
 }
 
-/// Granularity of an axis. This does not affect the range of values.
-/// Describes the number of unique values between `0` and `1` of the associated unit.
+/// Describes the number of unique values in the entire range of the associated axis.
+///
+/// This does not affect the range of values nor the interpretation of values reported by a [`Pose`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct Granularity(pub std::num::NonZeroU32);
@@ -125,12 +129,18 @@ impl Union for PositionGranularity {
     }
 }
 
-/// Limits of an axis's reported value.
+/// Limits of an axis's reported value. This does not affect the interpretation of a value reported by [`Pose`]
+///
+/// In many cases, you may ignore this value - this crate makes strong guarantees about the
+/// units values are reported in, and you may rely on those. However, this may desscribe e.g. that a tool only detects
+/// tilt in the +/-45° range.
 /// # Quirks
 /// This is a hint, and the value is not clamped - the hardware is allowed to report a value exceeding this in either direction.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
+    /// Inclusive minimum
     pub min: f32,
+    /// Inclusive maximum
     pub max: f32,
 }
 impl From<Limits> for std::ops::RangeInclusive<f32> {
@@ -153,7 +163,7 @@ impl Union for Limits {
     }
 }
 
-/// Represents a normalized axis, always in the range `0..=1`
+/// Represents a normalized axis, always in the range `[0, 1]`
 /// Since the min and max are fixed, only the granularity is given, if known.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NormalizedInfo {
@@ -167,14 +177,14 @@ impl Union for NormalizedInfo {
     }
 }
 
+/// Info for an axis which may or may not correspond to a physical unit of length.
 #[derive(Clone, Copy, Debug)]
 pub enum LengthInfo {
-    /// The axis reports a `0..=1` range, where the value doesn't necessarily correlate linearly with a
+    /// The axis reports a `[0, 1]` range, where the value doesn't necessarily correlate linearly with a
     /// physical unit of distance.
-    /// In this case, [`Granularity`] is to be interpreted as the total number of states between 0 and 1.
     Normalized(NormalizedInfo),
     /// The axis reports a physical distance in centimeters, within the range provided by
-    /// [`Info::limits`]. In this case, [`Granularity`] is to be interpreted as "dots per cm".
+    /// [`Info::limits`].
     Centimeters(Info),
 }
 impl LengthInfo {
@@ -218,6 +228,7 @@ impl Default for LengthInfo {
     }
 }
 
+/// Generic information about an axis with hardware-defined limits.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Info {
     pub limits: Option<Limits>,
@@ -245,7 +256,7 @@ impl Union for PositionInfo {
     }
 }
 
-/// Information about a circular axis, always reporting in the range of `0..TAU`.
+/// Information about a circular axis, always reporting in the range of `[0, TAU)`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CircularInfo {
     pub granularity: Option<Granularity>,
@@ -258,7 +269,7 @@ impl Union for CircularInfo {
     }
 }
 
-/// Information about a slider axis, always reporting in the range of `-1..=1` with zero being the resting point.
+/// Information about a slider axis, always reporting in the range of `[-1, 1]` with zero being the resting point.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SliderInfo {
     pub granularity: Option<Granularity>,
@@ -272,19 +283,15 @@ impl Union for SliderInfo {
 }
 
 /// A report of the limits and capabilities of all axes, or None if the axis is
-/// not supported by the device.
+/// not supported by the device. See [`Pose`] for descriptions.
 #[derive(Debug, Copy, Clone, Default)]
 pub struct FullInfo {
     /// The X and Y axes - always supported, and with units of logical pixels.
     pub position: [PositionInfo; 2],
-    /// A unitless normalized value in [-1, 1]
     pub slider: Option<SliderInfo>,
-    /// The rotation around the tool's long axis, always reported in radians `0..TAU` if available.
     pub roll: Option<CircularInfo>,
-    // Force axes. Ink *can* report these in grams, but for simplicities sake we normalize. Todo?
     pub pressure: Option<NormalizedInfo>,
     pub button_pressure: Option<NormalizedInfo>,
-    /// X/Y tilt, in radians from vertical. See [`Pose::tilt`].
     pub tilt: Option<Info>,
     pub wheel: Option<CircularInfo>,
     pub distance: Option<LengthInfo>,
@@ -312,6 +319,7 @@ impl Union for FullInfo {
 
 #[derive(thiserror::Error, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 #[error("axis not supported")]
+/// An axis was queried that is not reported as available.
 pub struct UnsupportedAxisError;
 
 impl FullInfo {
@@ -441,7 +449,8 @@ pub struct Pose {
     ///
     /// This may have sub-pixel precision, and may exceed your window size in the negative or positive directions.
     pub position: [f32; 2],
-    /// Perpendicular distance from the surface of the tablet. See [`FullInfo::distance`] for interpretation.
+    /// Perpendicular distance from the surface of the tablet. This may be an arbitrary, unitless `[0, 1]` value, or
+    /// reported in physical centimeters, see the [`FullInfo::distance`] of the reporting [`Tool`](crate::tool::Tool) for interpretation.
     ///
     /// # Quirks
     /// This will not necessarily be zero when in contact with the device, and may
@@ -472,6 +481,6 @@ pub struct Pose {
     /// Absolute slider position, in `[-1, 1]`, where zero is the "natural" position.
     pub slider: NicheF32,
     /// The size of the contact ellipse. First element describes the X-axis width of the ellipse,
-    /// and second describes the Y-axis height. See [`FullInfo::contact_size`] for interpretation.
+    /// and second describes the Y-axis height. See [`FullInfo::contact_size`] of the reporting [`Tool`](crate::tool::Tool) for units.
     pub contact_size: Option<[f32; 2]>,
 }
