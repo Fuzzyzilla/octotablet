@@ -663,7 +663,6 @@ impl Manager {
             // This was a whole thing to get working. I think i'm doing it right, but its all so
             // undocumented how can I ever be sure D:
             let marshaler: com::Marshal::IMarshal = {
-                use core::ComInterface;
                 use core::Interface;
 
                 let marshaler = com::CoCreateFreeThreadedMarshaler(&plugin)?;
