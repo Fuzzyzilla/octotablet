@@ -7,6 +7,7 @@ use crate::{
     pad::{Group, Ring, Strip, TouchSource},
 };
 pub type ID = wayland_backend::client::ObjectId;
+pub type ButtonID = u32;
 use wayland_client::{
     protocol::{wl_registry, wl_seat},
     Connection, Dispatch, Proxy, QueueHandle,
@@ -14,10 +15,12 @@ use wayland_client::{
 use wayland_protocols::wp::tablet::zv2::client as wl_tablet;
 
 use crate::{
-    events::{FrameTimestamp, NicheF32, Pose},
+    axis::Pose,
+    events::FrameTimestamp,
     pad::Pad,
     tablet::{Tablet, UsbId},
-    tool::{AvailableAxes, AxisInfo, Tool},
+    tool::Tool,
+    util::NicheF32,
 };
 
 use super::InternalID;
@@ -30,15 +33,16 @@ pub struct Manager {
 }
 
 mod pad_impl;
-mod summary;
 mod tool_impl;
 
 impl Manager {
     /// Creates a tablet manager with from the given pointer to `wl_display`.
     /// # Safety
-    /// The given display pointer must be valid as long as the returned `Manager` is alive. The [`Backing`] parameter
-    /// is kept alive with the returned Manager, which can be used to uphold this requirement.
-    pub(crate) unsafe fn build_wayland_display(wl_display: *mut ()) -> Manager {
+    /// The given display pointer must be valid as long as the returned `Manager` is alive.
+    pub(crate) unsafe fn build_wayland_display(
+        _: crate::builder::Builder,
+        wl_display: *mut (),
+    ) -> Manager {
         // Safety - deferred to this fn's contract
         let backend =
             unsafe { wayland_backend::client::Backend::from_foreign_display(wl_display.cast()) };
@@ -64,29 +68,21 @@ impl super::PlatformImpl for Manager {
         self.queue.dispatch_pending(&mut self.state)?;
         Ok(())
     }
-    #[must_use]
     fn timestamp_granularity(&self) -> Option<std::time::Duration> {
         // Wayland always reports, and with millisecond granularity.
         Some(std::time::Duration::from_millis(1))
     }
-    #[must_use]
     fn pads(&self) -> &[crate::pad::Pad] {
         &self.state.pads
     }
-    #[must_use]
     fn tools(&self) -> &[crate::tool::Tool] {
         &self.state.tools
     }
-    #[must_use]
     fn tablets(&self) -> &[crate::tablet::Tablet] {
         &self.state.tablets
     }
     fn raw_events(&self) -> super::RawEventsIter<'_> {
         super::RawEventsIter::Wayland(self.state.events.iter())
-    }
-    #[must_use]
-    fn make_summary(&self) -> crate::events::summary::Summary {
-        self.state.raw_summary.make_concrete(self)
     }
 }
 
@@ -106,14 +102,11 @@ impl HasWlId for Tool {
     fn new_default(id: ID) -> Self {
         Tool {
             internal_id: id.into(),
+            name: None,
             hardware_id: None,
             wacom_id: None,
-            available_axes: AvailableAxes::empty(),
             tool_type: None,
-            // Unfortunately, Wayland doesn't enumerate axis precision info. :<
-            axis_info: Default::default(),
-            position_info: AxisInfo::default(),
-            distance_unit: crate::tool::DistanceUnit::Unitless,
+            axes: crate::axis::FullInfo::default(),
         }
     }
     fn id(&self) -> &ID {
@@ -130,7 +123,7 @@ impl HasWlId for Tablet {
     fn new_default(id: ID) -> Self {
         Tablet {
             internal_id: id.into(),
-            name: String::new(),
+            name: None,
             usb_id: None,
         }
     }
@@ -313,8 +306,7 @@ struct TabletState {
     // Associations for which pad each group is connected
     // `group -> pad`
     group_associations: std::collections::HashMap<ID, ID>,
-    // Partial and complete event/summary tracking.
-    raw_summary: summary::Summary,
+    // Partial and complete event tracking.
     frames_in_progress: Vec<FrameInProgress>,
     events: Vec<crate::events::raw::Event<ID>>,
 }
@@ -349,7 +341,6 @@ impl TabletState {
                 }
             }
         }
-        self.raw_summary.consume_oneshot();
     }
     // Create or get the partially built frame.
     fn frame_in_progress(&mut self, tool: ID) -> &mut FrameInProgress {
@@ -417,9 +408,9 @@ impl TabletState {
                     slider: frame.slider.try_into().unwrap_or(NicheF32::NONE),
                     tilt: frame.tilt.filter(|[x, y]| !x.is_nan() && !y.is_nan()),
                     wheel: frame.wheel.filter(|(delta, _)| !delta.is_nan()),
+                    button_pressure: NicheF32::NONE,
+                    contact_size: None,
                 };
-                // Make double extra sure!
-                pose.debug_assert_not_nan();
 
                 self.events.push(raw_events::Event::Tool {
                     tool: tool.clone(),
@@ -430,7 +421,10 @@ impl TabletState {
             for &(button_id, pressed) in &frame.buttons {
                 self.events.push(raw_events::Event::Tool {
                     tool: tool.clone(),
-                    event: raw_events::ToolEvent::Button { button_id, pressed },
+                    event: raw_events::ToolEvent::Button {
+                        button_id: button_id.into(),
+                        pressed,
+                    },
                 });
             }
             // emit ups and outs last... Return true from Out to mark the frame for clearing.
@@ -599,7 +593,7 @@ impl Dispatch<wl_tablet::zwp_tablet_v2::ZwpTabletV2, ()> for TabletState {
                     .map(|(vid, pid)| UsbId { vid, pid });
             }
             Event::Name { name } => {
-                this.partial_tablets.get_or_insert_ctor(tablet.id()).name = name;
+                this.partial_tablets.get_or_insert_ctor(tablet.id()).name = Some(name);
             }
             Event::Path { .. } => (),
             Event::Removed => {

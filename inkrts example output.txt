@@ -1,0 +1,571 @@
+-- EUREKA! The scale factors are useless don't look at them!!
+-- The X,Y coordinates are *ALREADY* in a physical screen space in the form of HIMETRIC units.
+-- The scale factors are from working *backwards* from this HIMETRIC to physical Centimeters, hence why they differ per tablet.
+
+TRUE SCALE FACTORS: HIMETRIC/system dpi (2540/96 in this case!!!)
+
+DPI: 96
+Factors: 0.037795275x0.037795275
+Querying Ok(\\.\DISPLAY1)
+- {598A6A8F-52C0-4BA0-93AF-AF357411A561} - RawPropertyRange { min: 0, max: 1024, resolution: 37.785976, unit: Centimeters }
+- {B53F9F75-04E0-4498-A7EE-C30DBB5A9011} - RawPropertyRange { min: 0, max: 768, resolution: 37.83251, unit: Centimeters }
+- {436510C5-FED3-45D1-8B76-71D3EA7A829D} - RawPropertyRange { min: 0, max: 2147483647, resolution: 1.0, unit: Unknown }
+PacketInterpreter {
+    position: [
+        Scaler {
+            bias: 0,
+            multiply: 0.0,
+        },
+        Scaler {
+            bias: 0,
+            multiply: 0.0,
+        },
+    ],
+    normal_pressure: Missing,
+    tilt: [
+        Missing,
+        Missing,
+    ],
+    z: Missing,
+    twist: Missing,
+    button_pressure: Missing,
+    contact_size: [
+        Missing,
+        Missing,
+    ],
+    timer: true,
+}
+FullInfo {
+    position: [
+        Info {
+            limits: Some(
+                Limits {
+                    min: 0.0,
+                    max: 1024.0,
+                },
+            ),
+            granularity: Some(
+                Granularity(
+                    38,
+                ),
+            ),
+        },
+        Info {
+            limits: Some(
+                Limits {
+                    min: 0.0,
+                    max: 768.0,
+                },
+            ),
+            granularity: Some(
+                Granularity(
+                    38,
+                ),
+            ),
+        },
+    ],
+    slider: None,
+    roll: None,
+    pressure: None,
+    button_pressure: None,
+    tilt: None,
+    wheel: None,
+    distance: None,
+    contact_size: None,
+}
+Factors: 1.2094119x1.6125492
+Querying Ok(Intuos S)
+- {598A6A8F-52C0-4BA0-93AF-AF357411A561} - RawPropertyRange { min: 0, max: 32767, resolution: 2155.7236, unit: Centimeters }
+- {B53F9F75-04E0-4498-A7EE-C30DBB5A9011} - RawPropertyRange { min: 0, max: 32767, resolution: 3449.158, unit: Centimeters }
+- {7307502D-F9F4-4E18-B3F2-2CE1B1A3610C} - RawPropertyRange { min: 0, max: 4095, resolution: 4.3105265e-6, unit: Unknown }
+- {0D324960-13B2-41E4-ACE6-7AE9D43D2D3B} - RawPropertyRange { min: 0, max: 36000, resolution: 100.0, unit: Degrees }
+- {8B7FEFC4-96AA-4BFE-AC26-8A5F0BE07BF5} - RawPropertyRange { min: 0, max: 1024, resolution: 1.0778947e-6, unit: Unknown }
+- {A8D07B3A-8BF0-40B0-95A9-B80A6BB787BF} - RawPropertyRange { min: -9000, max: 9000, resolution: 100.0, unit: Degrees }
+- {0E932389-1D77-43AF-AC00-5B950D6D4B2D} - RawPropertyRange { min: -9000, max: 9000, resolution: 100.0, unit: Degrees }
+- {436510C5-FED3-45D1-8B76-71D3EA7A829D} - RawPropertyRange { min: 0, max: 2147483647, resolution: 1.0, unit: Unknown }
+PacketInterpreter {
+    position: [
+        Scaler {
+            bias: 0,
+            multiply: 0.0,
+        },
+        Scaler {
+            bias: 0,
+            multiply: 0.0,
+        },
+    ],
+    normal_pressure: Read(
+        Scaler {
+            bias: 0,
+            multiply: 0.0002442002442002442,
+        },
+    ),
+    tilt: [
+        Read(
+            Scaler {
+                bias: 0,
+                multiply: 0.01745329238474369,
+            },
+        ),
+        Read(
+            Scaler {
+                bias: 0,
+                multiply: 0.01745329238474369,
+            },
+        ),
+    ],
+    z: Missing,
+    twist: Read(
+        Scaler {
+            bias: 0,
+            multiply: 0.01745329238474369,
+        },
+    ),
+    button_pressure: Read(
+        Scaler {
+            bias: 0,
+            multiply: 0.0009765625,
+        },
+    ),
+    contact_size: [
+        Read(
+            Scaler {
+                bias: 0,
+                multiply: 0.01745329238474369,
+            },
+        ),
+        Read(
+            Scaler {
+                bias: 0,
+                multiply: 0.01745329238474369,
+            },
+        ),
+    ],
+    timer: true,
+}
+FullInfo {
+    position: [
+        Info {
+            limits: Some(
+                Limits {
+                    min: 0.0,
+                    max: 32767.0,
+                },
+            ),
+            granularity: Some(
+                Granularity(
+                    2156,
+                ),
+            ),
+        },
+        Info {
+            limits: Some(
+                Limits {
+                    min: 0.0,
+                    max: 32767.0,
+                },
+            ),
+            granularity: Some(
+                Granularity(
+                    3450,
+                ),
+            ),
+        },
+    ],
+    slider: None,
+    roll: Some(
+        Info {
+            limits: Some(
+                Limits {
+                    min: 0.0,
+                    max: 628.31854,
+                },
+            ),
+            granularity: Some(
+                Granularity(
+                    5730,
+                ),
+            ),
+        },
+    ),
+    pressure: Some(
+        ForceInfo {
+            unit: Unitless,
+            info: Info {
+                limits: Some(
+                    Limits {
+                        min: 0.0,
+                        max: 1.0,
+                    },
+                ),
+                granularity: Some(
+                    Granularity(
+                        4095,
+                    ),
+                ),
+            },
+        },
+    ),
+    button_pressure: Some(
+        ForceInfo {
+            unit: Unitless,
+            info: Info {
+                limits: Some(
+                    Limits {
+                        min: 0.0,
+                        max: 1.0,
+                    },
+                ),
+                granularity: Some(
+                    Granularity(
+                        1024,
+                    ),
+                ),
+            },
+        },
+    ),
+    tilt: Some(
+        AngleInfo {
+            unit: Radians,
+            info: Info {
+                limits: Some(
+                    Limits {
+                        min: -157.07964,
+                        max: 157.07964,
+                    },
+                ),
+                granularity: Some(
+                    Granularity(
+                        5730,
+                    ),
+                ),
+            },
+        },
+    ),
+    wheel: None,
+    distance: None,
+    contact_size: None,
+}
+Factors: 1.2094119x1.6125492
+Querying Ok(Intuos S)
+- {598A6A8F-52C0-4BA0-93AF-AF357411A561} - RawPropertyRange { min: 0, max: 32767, resolution: 2155.7236, unit: Centimeters }
+- {B53F9F75-04E0-4498-A7EE-C30DBB5A9011} - RawPropertyRange { min: 0, max: 32767, resolution: 3449.158, unit: Centimeters }
+- {7307502D-F9F4-4E18-B3F2-2CE1B1A3610C} - RawPropertyRange { min: 0, max: 4095, resolution: 11.375, unit: Degrees }
+- {0D324960-13B2-41E4-ACE6-7AE9D43D2D3B} - RawPropertyRange { min: 0, max: 36000, resolution: 100.0, unit: Degrees }
+- {8B7FEFC4-96AA-4BFE-AC26-8A5F0BE07BF5} - RawPropertyRange { min: 0, max: 1024, resolution: 2.8444445, unit: Degrees }
+- {A8D07B3A-8BF0-40B0-95A9-B80A6BB787BF} - RawPropertyRange { min: -9000, max: 9000, resolution: 100.0, unit: Degrees }
+- {0E932389-1D77-43AF-AC00-5B950D6D4B2D} - RawPropertyRange { min: -9000, max: 9000, resolution: 100.0, unit: Degrees }
+- {436510C5-FED3-45D1-8B76-71D3EA7A829D} - RawPropertyRange { min: 0, max: 2147483647, resolution: 1.0, unit: Unknown }
+PacketInterpreter {
+    position: [
+        Scaler {
+            bias: 0,
+            multiply: 0.0,
+        },
+        Scaler {
+            bias: 0,
+            multiply: 0.0,
+        },
+    ],
+    normal_pressure: Read(
+        Scaler {
+            bias: 0,
+            multiply: 0.0002442002442002442,
+        },
+    ),
+    tilt: [
+        Read(
+            Scaler {
+                bias: 0,
+                multiply: 0.01745329238474369,
+            },
+        ),
+        Read(
+            Scaler {
+                bias: 0,
+                multiply: 0.01745329238474369,
+            },
+        ),
+    ],
+    z: Missing,
+    twist: Read(
+        Scaler {
+            bias: 0,
+            multiply: 0.01745329238474369,
+        },
+    ),
+    button_pressure: Read(
+        Scaler {
+            bias: 0,
+            multiply: 0.0009765625,
+        },
+    ),
+    contact_size: [
+        Read(
+            Scaler {
+                bias: 0,
+                multiply: 0.01745329238474369,
+            },
+        ),
+        Read(
+            Scaler {
+                bias: 0,
+                multiply: 0.01745329238474369,
+            },
+        ),
+    ],
+    timer: true,
+}
+FullInfo {
+    position: [
+        Info {
+            limits: Some(
+                Limits {
+                    min: 0.0,
+                    max: 32767.0,
+                },
+            ),
+            granularity: Some(
+                Granularity(
+                    2156,
+                ),
+            ),
+        },
+        Info {
+            limits: Some(
+                Limits {
+                    min: 0.0,
+                    max: 32767.0,
+                },
+            ),
+            granularity: Some(
+                Granularity(
+                    3450,
+                ),
+            ),
+        },
+    ],
+    slider: None,
+    roll: Some(
+        Info {
+            limits: Some(
+                Limits {
+                    min: 0.0,
+                    max: 628.31854,
+                },
+            ),
+            granularity: Some(
+                Granularity(
+                    5730,
+                ),
+            ),
+        },
+    ),
+    pressure: Some(
+        ForceInfo {
+            unit: Unitless,
+            info: Info {
+                limits: Some(
+                    Limits {
+                        min: 0.0,
+                        max: 1.0,
+                    },
+                ),
+                granularity: Some(
+                    Granularity(
+                        4095,
+                    ),
+                ),
+            },
+        },
+    ),
+    button_pressure: Some(
+        ForceInfo {
+            unit: Unitless,
+            info: Info {
+                limits: Some(
+                    Limits {
+                        min: 0.0,
+                        max: 1.0,
+                    },
+                ),
+                granularity: Some(
+                    Granularity(
+                        1024,
+                    ),
+                ),
+            },
+        },
+    ),
+    tilt: Some(
+        AngleInfo {
+            unit: Radians,
+            info: Info {
+                limits: Some(
+                    Limits {
+                        min: -157.07964,
+                        max: 157.07964,
+                    },
+                ),
+                granularity: Some(
+                    Granularity(
+                        5730,
+                    ),
+                ),
+            },
+        },
+    ),
+    wheel: None,
+    distance: None,
+    contact_size: None,
+}
+Factors: 1.1811023x1.5748031
+Querying Ok(\??\Microsoft HID RID\000D_0002\0)
+- {598A6A8F-52C0-4BA0-93AF-AF357411A561} - RawPropertyRange { min: 0, max: 32000, resolution: 1181.2477, unit: Centimeters }
+- {B53F9F75-04E0-4498-A7EE-C30DBB5A9011} - RawPropertyRange { min: 0, max: 32000, resolution: 1574.8031, unit: Centimeters }
+- {7307502D-F9F4-4E18-B3F2-2CE1B1A3610C} - RawPropertyRange { min: 0, max: 1024, resolution: 0.0, unit: Unknown }
+- {0D324960-13B2-41E4-ACE6-7AE9D43D2D3B} - RawPropertyRange { min: 0, max: 360, resolution: 0.0, unit: Unknown }
+- {A8D07B3A-8BF0-40B0-95A9-B80A6BB787BF} - RawPropertyRange { min: -90, max: 90, resolution: 0.0, unit: Unknown }
+- {0E932389-1D77-43AF-AC00-5B950D6D4B2D} - RawPropertyRange { min: -90, max: 90, resolution: 0.0, unit: Unknown }
+- {436510C5-FED3-45D1-8B76-71D3EA7A829D} - RawPropertyRange { min: 0, max: 2147483647, resolution: 1.0, unit: Unknown }
+PacketInterpreter {
+    position: [
+        Scaler {
+            bias: 0,
+            multiply: 0.0,
+        },
+        Scaler {
+            bias: 0,
+            multiply: 0.0,
+        },
+    ],
+    normal_pressure: Read(
+        Scaler {
+            bias: 0,
+            multiply: 0.0009765625,
+        },
+    ),
+    tilt: [
+        Read(
+            Scaler {
+                bias: 0,
+                multiply: 0.034906586011250816,
+            },
+        ),
+        Read(
+            Scaler {
+                bias: 0,
+                multiply: 0.034906586011250816,
+            },
+        ),
+    ],
+    z: Missing,
+    twist: Read(
+        Scaler {
+            bias: 0,
+            multiply: 0.017453293005625408,
+        },
+    ),
+    button_pressure: Missing,
+    contact_size: [
+        Read(
+            Scaler {
+                bias: 0,
+                multiply: 0.034906586011250816,
+            },
+        ),
+        Read(
+            Scaler {
+                bias: 0,
+                multiply: 0.034906586011250816,
+            },
+        ),
+    ],
+    timer: true,
+}
+FullInfo {
+    position: [
+        Info {
+            limits: Some(
+                Limits {
+                    min: 0.0,
+                    max: 32000.0,
+                },
+            ),
+            granularity: Some(
+                Granularity(
+                    1182,
+                ),
+            ),
+        },
+        Info {
+            limits: Some(
+                Limits {
+                    min: 0.0,
+                    max: 32000.0,
+                },
+            ),
+            granularity: Some(
+                Granularity(
+                    1575,
+                ),
+            ),
+        },
+    ],
+    slider: None,
+    roll: Some(
+        Info {
+            limits: Some(
+                Limits {
+                    min: 0.0,
+                    max: 6.2831855,
+                },
+            ),
+            granularity: Some(
+                Granularity(
+                    360,
+                ),
+            ),
+        },
+    ),
+    pressure: Some(
+        ForceInfo {
+            unit: Unitless,
+            info: Info {
+                limits: Some(
+                    Limits {
+                        min: 0.0,
+                        max: 1.0,
+                    },
+                ),
+                granularity: Some(
+                    Granularity(
+                        1024,
+                    ),
+                ),
+            },
+        },
+    ),
+    button_pressure: None,
+    tilt: Some(
+        AngleInfo {
+            unit: Radians,
+            info: Info {
+                limits: Some(
+                    Limits {
+                        min: -3.1415927,
+                        max: 3.1415927,
+                    },
+                ),
+                granularity: Some(
+                    Granularity(
+                        180,
+                    ),
+                ),
+            },
+        },
+    ),
+    wheel: None,
+    distance: None,
+    contact_size: None,
+}

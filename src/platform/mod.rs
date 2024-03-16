@@ -39,12 +39,14 @@ impl InternalID {
     // in the common case where it's dead code.
     #[cold]
     #[inline(never)]
+    #[allow(dead_code)]
     fn unwrap_failure() -> ! {
         panic!("Unwrap called on incorrect ID type")
     }
     #[cfg(wl_tablet)]
     #[inline]
-    pub(crate) fn unwrap_wl(&self) -> &wayland_backend::client::ObjectId {
+    #[allow(dead_code)]
+    pub(crate) fn unwrap_wl(&self) -> &wl::ID {
         #[allow(unreachable_patterns)]
         #[allow(clippy::match_wildcard_for_single_variants)]
         match self {
@@ -54,7 +56,8 @@ impl InternalID {
     }
     #[cfg(ink_rts)]
     #[inline]
-    pub(crate) fn unwrap_ink(&self) -> &u32 {
+    #[allow(dead_code)]
+    pub(crate) fn unwrap_ink(&self) -> &ink::ID {
         #[allow(unreachable_patterns)]
         #[allow(clippy::match_wildcard_for_single_variants)]
         match self {
@@ -75,12 +78,86 @@ impl From<ink::ID> for InternalID {
         Self::Ink(value)
     }
 }
+/// Holds any one of the internal platform IDs.
+/// Since these are always sealed away as an implementation detail, we can always
+/// assume they're the right type since they can never be moved between `Manager`s.
+// (because of this it could actually be a union. hmmmm...)
+#[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ButtonID {
+    #[cfg(wl_tablet)]
+    Wayland(wl::ButtonID),
+    #[cfg(ink_rts)]
+    Ink(ink::ButtonID),
+}
+impl std::fmt::Debug for ButtonID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::hash::{Hash, Hasher};
+        // We display as a hash since it's an opaque object, but we still want visual distinction between
+        // differing IDs.
+        // We *really* don't care what the results are here, as long as it's consistent during a single run.
+        // Rather than pull in a dep, just use a random hasher from std!
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut h);
+        f.debug_tuple("ButtonID").field(&h.finish()).finish()
+    }
+}
+
+/// Unwrappers. Impls are free to assume their IDs are always the right type, as there are no accessors
+/// and no way to share IDs between managers of different backends. Thus, the only way this can fail is e.g. the wayland
+/// backend creating an Ink ID.
+///
+/// In most (all?) compilation environments, these are infallible and compile down to nothing, hence the inline (profile me :3).
+impl ButtonID {
+    // Move formatting and unwinding machinery out of the inline path.
+    // Tested on compiler explorer, this being inline(never) does *not* prevent it from being elided entirely
+    // in the common case where it's dead code.
+    #[cold]
+    #[inline(never)]
+    #[allow(dead_code)]
+    fn unwrap_failure() -> ! {
+        panic!("Unwrap called on incorrect ID type")
+    }
+    #[cfg(wl_tablet)]
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn unwrap_wl(&self) -> &wl::ButtonID {
+        #[allow(unreachable_patterns)]
+        #[allow(clippy::match_wildcard_for_single_variants)]
+        match self {
+            Self::Wayland(id) => id,
+            _ => Self::unwrap_failure(),
+        }
+    }
+    #[cfg(ink_rts)]
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn unwrap_ink(&self) -> &ink::ButtonID {
+        #[allow(unreachable_patterns)]
+        #[allow(clippy::match_wildcard_for_single_variants)]
+        match self {
+            Self::Ink(id) => id,
+            _ => Self::unwrap_failure(),
+        }
+    }
+}
+#[cfg(wl_tablet)]
+impl From<wl::ButtonID> for ButtonID {
+    fn from(value: wl::ButtonID) -> Self {
+        Self::Wayland(value)
+    }
+}
+#[cfg(ink_rts)]
+impl From<ink::ButtonID> for ButtonID {
+    fn from(value: ink::ButtonID) -> Self {
+        Self::Ink(value)
+    }
+}
 
 pub(crate) enum RawEventsIter<'a> {
     #[cfg(wl_tablet)]
     Wayland(std::slice::Iter<'a, crate::events::raw::Event<wl::ID>>),
     #[cfg(ink_rts)]
-    Ink(std::slice::Iter<'a, raw::Event<ink::ID>>),
+    Ink(std::slice::Iter<'a, crate::events::raw::Event<ink::ID>>),
 }
 impl Iterator for RawEventsIter<'_> {
     type Item = crate::events::raw::Event<InternalID>;
@@ -110,32 +187,6 @@ pub(crate) trait PlatformImpl {
     fn tablets(&self) -> &[crate::tablet::Tablet];
     #[must_use]
     fn raw_events(&self) -> RawEventsIter<'_>;
-    #[must_use]
-    fn make_summary(&self) -> crate::events::summary::Summary;
-}
-// temp :P
-impl PlatformImpl for std::convert::Infallible {
-    fn pump(&mut self) -> Result<(), crate::PumpError> {
-        match *self {}
-    }
-    fn timestamp_granularity(&self) -> Option<std::time::Duration> {
-        match *self {}
-    }
-    fn pads(&self) -> &[crate::pad::Pad] {
-        match *self {}
-    }
-    fn tools(&self) -> &[crate::tool::Tool] {
-        match *self {}
-    }
-    fn tablets(&self) -> &[crate::tablet::Tablet] {
-        match *self {}
-    }
-    fn raw_events(&self) -> RawEventsIter<'_> {
-        match *self {}
-    }
-    fn make_summary(&self) -> crate::events::summary::Summary {
-        match *self {}
-    }
 }
 
 /// Static dispatch between compiled backends.
@@ -146,5 +197,5 @@ pub(crate) enum PlatformManager {
     #[cfg(wl_tablet)]
     Wayland(wl::Manager),
     #[cfg(ink_rts)]
-    Ink(std::convert::Infallible),
+    Ink(ink::Manager),
 }

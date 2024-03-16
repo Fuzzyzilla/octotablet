@@ -13,6 +13,7 @@ fn main() {
     let window = std::sync::Arc::new(
         winit::window::WindowBuilder::default()
             .with_inner_size(PhysicalSize::new(512u32, 512u32))
+            .with_title("octotablet paint demo")
             .build(&event_loop)
             .unwrap(),
     );
@@ -36,7 +37,7 @@ fn main() {
     // Fetch the tablets, using our window's handle for access.
     // Since we `Arc'd` our window, we get the safety of `build_shared`. Where this is not possible,
     // `build_raw` is available as well!
-    let mut manager = Builder::default().build_shared(window.clone()).unwrap();
+    let mut manager = Builder::default().build_shared(&window).unwrap();
 
     // Re-usable logic to draw and consume the path.
     let consume_path = |pixmap: &mut tiny_skia::Pixmap,
@@ -114,7 +115,13 @@ fn main() {
 
             if let Event::WindowEvent { event, .. } = e {
                 match event {
-                    WindowEvent::CloseRequested => target.exit(),
+                    // Esc pressed or system-specific close event .
+                    WindowEvent::KeyboardInput {
+                        event: winit::event::KeyEvent{
+                            physical_key: winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape),
+                            state: winit::event::ElementState::Pressed,
+                        ..},
+                    .. }  | WindowEvent::CloseRequested => target.exit(),
                     WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                         if scale_factor != 1.0 {
                             // Nothing to test this on, so it's hard to write the transform math... Fixme!
@@ -160,9 +167,11 @@ fn main() {
                                 let r = from.red();
                                 let g = from.green();
                                 let b = from.blue();
-                                // softbuffer requires `0000'0000'rrrr'rrrr'gggbg'gggg'bbb'bbbb` format
+                                // softbuffer requires `0000'0000'rrrr'rrrr'gggg'gggg'bbbb'bbbb` format
                                 *into = (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b));
                             });
+
+                        window.pre_present_notify();
                         buffer.present().unwrap();
                     }
                     _ => (),
@@ -171,9 +180,6 @@ fn main() {
         });
 
         // Accept all new messages from the stylus server.
-        // We use the events API here as opposed to the summary API presented in the `eframe-viewer` example.
-        // This is so that we can have the highest fidelity record of the digitizer movements, regardless of lag or framerate.
-        // Events are reported upwards of 1000 per second, so much detail!
         let events = manager.pump().unwrap();
         for event in events {
             // We only care about tool events...
