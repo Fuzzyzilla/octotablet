@@ -528,7 +528,6 @@ enum StylusPhase {
 
 /// Helper to set an atomic flag on drop to catch an unwind or early return.
 /// Use `disarm` to prevent the poison from occuring.
-// (This task is slightly redundant with the anti-panic wrapper but this also catches early returns).
 #[must_use = "will poison immediately if not bound"]
 struct Poison<'a> {
     poisoned: &'a sync::atomic::AtomicBool,

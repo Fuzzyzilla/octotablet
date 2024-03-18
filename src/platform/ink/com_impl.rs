@@ -7,26 +7,22 @@ use windows::Win32::UI::TabletPC as tablet_pc;
 
 use super::{fetch_himetric_to_logical_pixel, ButtonID, Plugin, StylusPhase};
 
-use std::sync::PoisonError;
+use std::{panic::AssertUnwindSafe, sync::PoisonError};
 
-/// Don't allow Rust panics to propogate accross FFI boundaries, that's UB!
-/// Instead, set the poison bit and return an Err.
-macro_rules! com_panic_wrapper {
-    {$poison:expr, $body:block} => {
-        match ::std::panic::catch_unwind(
-            // I uhh.. Don't know what this means. Sorry.
-            ::std::panic::AssertUnwindSafe(
-                || {$body}
-            )
-            // Pass inner `Result` as is if didn't panic. If panic'd, `E_FAIL`.
-        ) {
-            Ok(x) => x,
-            Err(_) => {
-                $poison.store(true, ::std::sync::atomic::Ordering::Relaxed);
-                Err(E_FAIL.into())
-            }
-        }
-    };
+impl Plugin {
+    /// It is UB to allow a rust unwind to cross FFI boundary.
+    /// Catch panics, transforming them into an [`E_FAIL`] and setting the poison bit.
+    fn panic_wrapper(
+        &self,
+        f: impl FnOnce() -> WinResult<()> + std::panic::UnwindSafe,
+    ) -> WinResult<()> {
+        std::panic::catch_unwind(f).unwrap_or_else(|_| {
+            // Panic occured, oison unconditionally
+            // Is this a good behavior? Revisit on err handling refactor >w>;;
+            let _ = self.poison_on_drop();
+            Err(E_FAIL.into())
+        })
+    }
 }
 
 impl tablet_pc::IStylusAsyncPlugin_Impl for Plugin {}
@@ -72,52 +68,52 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         _tcid: u32,
         sid: u32,
     ) -> WinResult<()> {
-        com_panic_wrapper! {
-            self.poisoned,
-            {
-                self.poison_bail()?;
-                // Should only ever be called with the RTS we made.
-                if rts != Some(&self.rts) {
-                    return Err(E_INVALIDARG.into());
-                }
-                let mut lock = self.shared_frame.lock().unwrap_or_else(PoisonError::into_inner);
+        self.panic_wrapper(AssertUnwindSafe(|| {
+            self.poison_bail()?;
+            // Should only ever be called with the RTS we made.
+            if rts != Some(&self.rts) {
+                return Err(E_INVALIDARG.into());
+            }
+            let mut lock = self
+                .shared_frame
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
 
-                // Get the full ID of this (sid aint enough!)
-                let Some(tool) = lock.get_tool(sid) else {
-                    return Ok(());
-                };
-                let id = *tool.internal_id.unwrap_ink();
+            // Get the full ID of this (sid aint enough!)
+            let Some(tool) = lock.get_tool(sid) else {
+                return Ok(());
+            };
+            let id = *tool.internal_id.unwrap_ink();
 
-                // Remove it from the map - missing from map represents the stylus is Out.
-                let old_phase = lock.stylus_states.remove(&id);
+            // Remove it from the map - missing from map represents the stylus is Out.
+            let old_phase = lock.stylus_states.remove(&id);
 
-                // The stylus was busy. Emit appropriate events to yank it away
-                if let Some(old_phase) = old_phase {
-                    match old_phase {
-                        // Was touching. emit up and out.
-                        StylusPhase::Touched => {
-                            lock.events.push(crate::events::raw::Event::Tool {
-                                tool: id,
-                                event: crate::events::raw::ToolEvent::Up,
-                            });
-                            lock.events.push(crate::events::raw::Event::Tool {
-                                tool: id,
-                                event: crate::events::raw::ToolEvent::Out,
-                            });
-                        }
-                        // Was in air. Emit just out.
-                        StylusPhase::InAir => {
-                            lock.events.push(crate::events::raw::Event::Tool {
-                                tool: id,
-                                event: crate::events::raw::ToolEvent::Out,
-                            });
-                        }
+            // The stylus was busy. Emit appropriate events to yank it away
+            if let Some(old_phase) = old_phase {
+                match old_phase {
+                    // Was touching. emit up and out.
+                    StylusPhase::Touched => {
+                        lock.events.push(crate::events::raw::Event::Tool {
+                            tool: id,
+                            event: crate::events::raw::ToolEvent::Up,
+                        });
+                        lock.events.push(crate::events::raw::Event::Tool {
+                            tool: id,
+                            event: crate::events::raw::ToolEvent::Out,
+                        });
+                    }
+                    // Was in air. Emit just out.
+                    StylusPhase::InAir => {
+                        lock.events.push(crate::events::raw::Event::Tool {
+                            tool: id,
+                            event: crate::events::raw::ToolEvent::Out,
+                        });
                     }
                 }
-
-                Ok(())
             }
-        }
+
+            Ok(())
+        }))
     }
 
     fn RealTimeStylusEnabled(
@@ -126,44 +122,44 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         num_tablets: u32,
         tcids: *const u32,
     ) -> WinResult<()> {
-        com_panic_wrapper! {
-            self.poisoned,
-            {
-                // Treat this as a CTOR!
+        self.panic_wrapper(AssertUnwindSafe(|| {
+            // Treat this as a CTOR!
 
-                // Poison section - we need to set our internal tablet array to match RTS or bad stuff happens.
-                let poison = self.poison_on_drop()?;
-                // Should only ever be called with the RTS we made.
-                if rts != Some(&self.rts) {
-                    return Err(E_INVALIDARG.into());
-                }
-                let tcids = unsafe {
-                    match num_tablets {
-                        0 => &[],
-                        // Weird guarantee made by the docs, hm! What happens when you connect nine ink devices to
-                        // a windows machine???
-                        1..=8 => {
-                            if tcids.is_null() {
-                                return Err(E_POINTER.into());
-                            }
-                            // As cast ok - of course 8 is in range of usize :P
-                            std::slice::from_raw_parts(tcids, num_tablets as usize)
-                        }
-                        _ => return Err(E_INVALIDARG.into()),
-                    }
-                };
-                let mut lock = self.shared_frame.lock().unwrap_or_else(PoisonError::into_inner);
-                for &tcid in tcids {
-                    unsafe {
-                        let tablet = self.rts.GetTabletFromTabletContextId(tcid)?;
-                        lock.append_tablet(&self.rts, &tablet, tcid);
-                    }
-                }
-
-                poison.disarm();
-                Ok(())
+            // Poison section - we need to set our internal tablet array to match RTS or bad stuff happens.
+            let poison = self.poison_on_drop()?;
+            // Should only ever be called with the RTS we made.
+            if rts != Some(&self.rts) {
+                return Err(E_INVALIDARG.into());
             }
-        }
+            let tcids = unsafe {
+                match num_tablets {
+                    0 => &[],
+                    // Weird guarantee made by the docs, hm! What happens when you connect nine ink devices to
+                    // a windows machine???
+                    1..=8 => {
+                        if tcids.is_null() {
+                            return Err(E_POINTER.into());
+                        }
+                        // As cast ok - of course 8 is in range of usize :P
+                        std::slice::from_raw_parts(tcids, num_tablets as usize)
+                    }
+                    _ => return Err(E_INVALIDARG.into()),
+                }
+            };
+            let mut lock = self
+                .shared_frame
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for &tcid in tcids {
+                unsafe {
+                    let tablet = self.rts.GetTabletFromTabletContextId(tcid)?;
+                    lock.append_tablet(&self.rts, &tablet, tcid);
+                }
+            }
+
+            poison.disarm();
+            Ok(())
+        }))
     }
 
     fn StylusDown(
@@ -174,42 +170,45 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         packet: *const i32,
         _: *mut *mut i32,
     ) -> WinResult<()> {
-        com_panic_wrapper! {
-            self.poisoned,
-            {
-                self.poison_bail()?;
-                if rts != Some(&self.rts) {
-                    return Err(E_INVALIDARG.into());
-                }
-
-                // Get the slice of data:
-                let props = match props_in_packet {
-                    0 => &[],
-                    1..=32 => {
-                        if packet.is_null() {
-                            return Err(E_POINTER.into());
-                        }
-                        unsafe {
-                            // Unwrap ok, we checked it's <= 32
-                            std::slice::from_raw_parts(packet, usize::try_from(props_in_packet).unwrap())
-                        }
-                    }
-                    // Spec says <= 32!
-                    _ => return Err(E_INVALIDARG.into()),
-                };
-
-                // This is not an optional field, according to spec.
-                let stylus_info = unsafe { stylus_info.as_ref() }.ok_or(E_POINTER)?;
-                let mut lock = self.shared_frame.lock().unwrap_or_else(PoisonError::into_inner);
-
-                // Delegate!
-                // We don't have specific states for Up/Down transitions, those are handled
-                // implicitly but observing previous state and new state.
-                lock.handle_packets(&self.rts, *stylus_info, 1, props, StylusPhase::Touched);
-
-                Ok(())
+        self.panic_wrapper(AssertUnwindSafe(|| {
+            self.poison_bail()?;
+            if rts != Some(&self.rts) {
+                return Err(E_INVALIDARG.into());
             }
-        }
+
+            // Get the slice of data:
+            let props = match props_in_packet {
+                0 => &[],
+                1..=32 => {
+                    if packet.is_null() {
+                        return Err(E_POINTER.into());
+                    }
+                    unsafe {
+                        // Unwrap ok, we checked it's <= 32
+                        std::slice::from_raw_parts(
+                            packet,
+                            usize::try_from(props_in_packet).unwrap(),
+                        )
+                    }
+                }
+                // Spec says <= 32!
+                _ => return Err(E_INVALIDARG.into()),
+            };
+
+            // This is not an optional field, according to spec.
+            let stylus_info = unsafe { stylus_info.as_ref() }.ok_or(E_POINTER)?;
+            let mut lock = self
+                .shared_frame
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+
+            // Delegate!
+            // We don't have specific states for Up/Down transitions, those are handled
+            // implicitly but observing previous state and new state.
+            lock.handle_packets(&self.rts, *stylus_info, 1, props, StylusPhase::Touched);
+
+            Ok(())
+        }))
     }
 
     fn StylusUp(
@@ -220,41 +219,44 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         packet: *const i32,
         _: *mut *mut i32,
     ) -> WinResult<()> {
-        com_panic_wrapper! {
-            self.poisoned,
-            {
-                self.poison_bail()?;
-                if rts != Some(&self.rts) {
-                    return Err(E_INVALIDARG.into());
-                }
-
-                // Get the slice of data:
-                let props = match props_in_packet {
-                    0 => &[],
-                    1..=32 => {
-                        if packet.is_null() {
-                            return Err(E_POINTER.into());
-                        }
-                        unsafe {
-                            // Unwrap ok, we checked it's <= 32
-                            std::slice::from_raw_parts(packet, usize::try_from(props_in_packet).unwrap())
-                        }
-                    }
-                    // Spec says <= 32!
-                    _ => return Err(E_INVALIDARG.into()),
-                };
-
-                // This is not an optional field, according to spec.
-                let stylus_info = unsafe { stylus_info.as_ref() }.ok_or(E_POINTER)?;
-                let mut lock = self.shared_frame.lock().unwrap_or_else(PoisonError::into_inner);
-                // Delegate!
-                // We don't have specific states for Up/Down transitions, those are handled
-                // implicitly but observing previous state and new state.
-                lock.handle_packets(&self.rts, *stylus_info, 1, props, StylusPhase::InAir);
-
-                Ok(())
+        self.panic_wrapper(AssertUnwindSafe(|| {
+            self.poison_bail()?;
+            if rts != Some(&self.rts) {
+                return Err(E_INVALIDARG.into());
             }
-        }
+
+            // Get the slice of data:
+            let props = match props_in_packet {
+                0 => &[],
+                1..=32 => {
+                    if packet.is_null() {
+                        return Err(E_POINTER.into());
+                    }
+                    unsafe {
+                        // Unwrap ok, we checked it's <= 32
+                        std::slice::from_raw_parts(
+                            packet,
+                            usize::try_from(props_in_packet).unwrap(),
+                        )
+                    }
+                }
+                // Spec says <= 32!
+                _ => return Err(E_INVALIDARG.into()),
+            };
+
+            // This is not an optional field, according to spec.
+            let stylus_info = unsafe { stylus_info.as_ref() }.ok_or(E_POINTER)?;
+            let mut lock = self
+                .shared_frame
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // Delegate!
+            // We don't have specific states for Up/Down transitions, those are handled
+            // implicitly but observing previous state and new state.
+            lock.handle_packets(&self.rts, *stylus_info, 1, props, StylusPhase::InAir);
+
+            Ok(())
+        }))
     }
 
     fn StylusButtonDown(
@@ -264,35 +266,35 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         button_guid: *const core::GUID,
         _stylus_position: *mut POINT,
     ) -> WinResult<()> {
-        com_panic_wrapper! {
-            self.poisoned,
-            {
-                self.poison_bail()?;
-                if rts != Some(&self.rts) {
-                    return Err(E_INVALIDARG.into());
-                }
-                if button_guid.is_null() {
-                    return Err(E_POINTER.into());
-                }
-                let button_guid = unsafe { *button_guid };
-
-                let mut lock = self.shared_frame.lock().unwrap_or_else(PoisonError::into_inner);
-                let Some(tool) = lock.get_tool(sid) else {
-                    return Ok(());
-                };
-
-                let tool = *tool.internal_id.unwrap_ink();
-                lock.events.push(crate::events::raw::Event::Tool {
-                    tool,
-                    event: crate::events::raw::ToolEvent::Button {
-                        button_id: ButtonID(button_guid).into(),
-                        pressed: true,
-                    },
-                });
-
-                Ok(())
+        self.panic_wrapper(AssertUnwindSafe(|| {
+            self.poison_bail()?;
+            if rts != Some(&self.rts) {
+                return Err(E_INVALIDARG.into());
             }
-        }
+            if button_guid.is_null() {
+                return Err(E_POINTER.into());
+            }
+            let button_guid = unsafe { *button_guid };
+
+            let mut lock = self
+                .shared_frame
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(tool) = lock.get_tool(sid) else {
+                return Ok(());
+            };
+
+            let tool = *tool.internal_id.unwrap_ink();
+            lock.events.push(crate::events::raw::Event::Tool {
+                tool,
+                event: crate::events::raw::ToolEvent::Button {
+                    button_id: ButtonID(button_guid).into(),
+                    pressed: true,
+                },
+            });
+
+            Ok(())
+        }))
     }
 
     fn StylusButtonUp(
@@ -302,35 +304,35 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         button_guid: *const core::GUID,
         _stylus_position: *mut POINT,
     ) -> WinResult<()> {
-        com_panic_wrapper! {
-            self.poisoned,
-            {
-                self.poison_bail()?;
-                if rts != Some(&self.rts) {
-                    return Err(E_INVALIDARG.into());
-                }
-                if button_guid.is_null() {
-                    return Err(E_POINTER.into());
-                }
-                let button_guid = unsafe { *button_guid };
-
-                let mut lock = self.shared_frame.lock().unwrap_or_else(PoisonError::into_inner);
-                let Some(tool) = lock.get_tool(sid) else {
-                    return Ok(());
-                };
-
-                let tool = *tool.internal_id.unwrap_ink();
-                lock.events.push(crate::events::raw::Event::Tool {
-                    tool,
-                    event: crate::events::raw::ToolEvent::Button {
-                        button_id: ButtonID(button_guid).into(),
-                        pressed: true,
-                    },
-                });
-
-                Ok(())
+        self.panic_wrapper(AssertUnwindSafe(|| {
+            self.poison_bail()?;
+            if rts != Some(&self.rts) {
+                return Err(E_INVALIDARG.into());
             }
-        }
+            if button_guid.is_null() {
+                return Err(E_POINTER.into());
+            }
+            let button_guid = unsafe { *button_guid };
+
+            let mut lock = self
+                .shared_frame
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(tool) = lock.get_tool(sid) else {
+                return Ok(());
+            };
+
+            let tool = *tool.internal_id.unwrap_ink();
+            lock.events.push(crate::events::raw::Event::Tool {
+                tool,
+                event: crate::events::raw::ToolEvent::Button {
+                    button_id: ButtonID(button_guid).into(),
+                    pressed: true,
+                },
+            });
+
+            Ok(())
+        }))
     }
 
     fn InAirPackets(
@@ -358,45 +360,45 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         _: *mut u32,
         _: *mut *mut i32,
     ) -> WinResult<()> {
-        com_panic_wrapper! {
-            self.poisoned,
-            {
-                self.poison_bail()?;
-                if rts != Some(&self.rts) {
-                    return Err(E_INVALIDARG.into());
-                }
-
-                // Get the slice of data:
-                let props = match total_props {
-                    0 => &[],
-                    1..=0x7FFF => {
-                        if props.is_null() {
-                            return Err(E_POINTER.into());
-                        }
-                        unsafe {
-                            // Unwrap ok, we checked it's <= 0x7FFF which is definitely fitting in usize.
-                            std::slice::from_raw_parts(props, usize::try_from(total_props).unwrap())
-                        }
-                    }
-                    // Spec says <= 0x7FFF!
-                    _ => return Err(E_INVALIDARG.into()),
-                };
-
-                // This is not an optional field, according to spec.
-                let stylus_info = unsafe { stylus_info.as_ref() }.ok_or(E_POINTER)?;
-                let mut lock = self.shared_frame.lock().unwrap_or_else(PoisonError::into_inner);
-                // Delegate!
-                lock.handle_packets(
-                    &self.rts,
-                    *stylus_info,
-                    num_packets,
-                    props,
-                    StylusPhase::InAir,
-                );
-
-                Ok(())
+        self.panic_wrapper(AssertUnwindSafe(|| {
+            self.poison_bail()?;
+            if rts != Some(&self.rts) {
+                return Err(E_INVALIDARG.into());
             }
-        }
+
+            // Get the slice of data:
+            let props = match total_props {
+                0 => &[],
+                1..=0x7FFF => {
+                    if props.is_null() {
+                        return Err(E_POINTER.into());
+                    }
+                    unsafe {
+                        // Unwrap ok, we checked it's <= 0x7FFF which is definitely fitting in usize.
+                        std::slice::from_raw_parts(props, usize::try_from(total_props).unwrap())
+                    }
+                }
+                // Spec says <= 0x7FFF!
+                _ => return Err(E_INVALIDARG.into()),
+            };
+
+            // This is not an optional field, according to spec.
+            let stylus_info = unsafe { stylus_info.as_ref() }.ok_or(E_POINTER)?;
+            let mut lock = self
+                .shared_frame
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // Delegate!
+            lock.handle_packets(
+                &self.rts,
+                *stylus_info,
+                num_packets,
+                props,
+                StylusPhase::InAir,
+            );
+
+            Ok(())
+        }))
     }
 
     fn Packets(
@@ -410,46 +412,46 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         _: *mut u32,
         _: *mut *mut i32,
     ) -> WinResult<()> {
-        com_panic_wrapper! {
-            self.poisoned,
-            {
-                self.poison_bail()?;
-                if rts != Some(&self.rts) {
-                    return Err(E_INVALIDARG.into());
-                }
-
-                // Get the slice of data:
-                let props = match total_props {
-                    0 => &[],
-                    1..=0x7FFF => {
-                        if props.is_null() {
-                            return Err(E_POINTER.into());
-                        }
-                        unsafe {
-                            // Unwrap ok, we checked it's <= 0x7FFF which is definitely fitting in usize.
-                            std::slice::from_raw_parts(props, usize::try_from(total_props).unwrap())
-                        }
-                    }
-                    // Spec says <= 0x7FFF!
-                    _ => return Err(E_INVALIDARG.into()),
-                };
-
-                // This is not an optional field, according to spec.
-                let stylus_info = unsafe { stylus_info.as_ref() }.ok_or(E_POINTER)?;
-                let mut lock = self.shared_frame.lock().unwrap_or_else(PoisonError::into_inner);
-
-                // Delegate!
-                lock.handle_packets(
-                    &self.rts,
-                    *stylus_info,
-                    num_packets,
-                    props,
-                    StylusPhase::Touched,
-                );
-
-                Ok(())
+        self.panic_wrapper(AssertUnwindSafe(|| {
+            self.poison_bail()?;
+            if rts != Some(&self.rts) {
+                return Err(E_INVALIDARG.into());
             }
-        }
+
+            // Get the slice of data:
+            let props = match total_props {
+                0 => &[],
+                1..=0x7FFF => {
+                    if props.is_null() {
+                        return Err(E_POINTER.into());
+                    }
+                    unsafe {
+                        // Unwrap ok, we checked it's <= 0x7FFF which is definitely fitting in usize.
+                        std::slice::from_raw_parts(props, usize::try_from(total_props).unwrap())
+                    }
+                }
+                // Spec says <= 0x7FFF!
+                _ => return Err(E_INVALIDARG.into()),
+            };
+
+            // This is not an optional field, according to spec.
+            let stylus_info = unsafe { stylus_info.as_ref() }.ok_or(E_POINTER)?;
+            let mut lock = self
+                .shared_frame
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+
+            // Delegate!
+            lock.handle_packets(
+                &self.rts,
+                *stylus_info,
+                num_packets,
+                props,
+                StylusPhase::Touched,
+            );
+
+            Ok(())
+        }))
     }
 
     fn TabletAdded(
@@ -457,29 +459,29 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         rts: Option<&tablet_pc::IRealTimeStylus>,
         tablet: Option<&tablet_pc::IInkTablet>,
     ) -> WinResult<()> {
-        com_panic_wrapper! {
-            self.poisoned,
-            {
-                // Poison section - we need to set our internal tablet array to match RTS or bad stuff happens.
-                let poison = self.poison_on_drop()?;
-                // Should only ever be called with the RTS we made.
-                if rts != Some(&self.rts) {
-                    return Err(E_INVALIDARG.into());
-                }
-
-                // Can only continue if both are available
-                let rts = rts.ok_or(E_POINTER)?;
-                let tablet = tablet.ok_or(E_POINTER)?;
-
-                let tcid = unsafe { rts.GetTabletContextIdFromTablet(tablet) }?;
-
-                let mut lock = self.shared_frame.lock().unwrap_or_else(PoisonError::into_inner);
-                unsafe { lock.append_tablet(&self.rts, tablet, tcid) };
-
-                poison.disarm();
-                Ok(())
+        self.panic_wrapper(AssertUnwindSafe(|| {
+            // Poison section - we need to set our internal tablet array to match RTS or bad stuff happens.
+            let poison = self.poison_on_drop()?;
+            // Should only ever be called with the RTS we made.
+            if rts != Some(&self.rts) {
+                return Err(E_INVALIDARG.into());
             }
-        }
+
+            // Can only continue if both are available
+            let rts = rts.ok_or(E_POINTER)?;
+            let tablet = tablet.ok_or(E_POINTER)?;
+
+            let tcid = unsafe { rts.GetTabletContextIdFromTablet(tablet) }?;
+
+            let mut lock = self
+                .shared_frame
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            unsafe { lock.append_tablet(&self.rts, tablet, tcid) };
+
+            poison.disarm();
+            Ok(())
+        }))
     }
 
     fn TabletRemoved(
@@ -487,38 +489,38 @@ impl tablet_pc::IStylusPlugin_Impl for Plugin {
         _rts: Option<&tablet_pc::IRealTimeStylus>,
         tablet_idx: i32,
     ) -> WinResult<()> {
-        com_panic_wrapper! {
-            self.poisoned,
-            {
-                // Poison section - we need to set our internal tablet array to match RTS or bad stuff happens.
-                let poison = self.poison_on_drop()?;
+        self.panic_wrapper(AssertUnwindSafe(|| {
+            // Poison section - we need to set our internal tablet array to match RTS or bad stuff happens.
+            let poison = self.poison_on_drop()?;
 
-                let mut lock = self.shared_frame.lock().unwrap_or_else(PoisonError::into_inner);
-                let _ = lock
-                    // IMPORTANT! use this method to handle all the bookkeeping. `tablet_idx`
-                    // is not a direct subscript into self.raw_tablets!
-                    .delete_tcid_by_idx(tablet_idx)
-                    // Out-of-bounds
-                    .map_err(|()| E_INVALIDARG)?;
+            let mut lock = self
+                .shared_frame
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let _ = lock
+                // IMPORTANT! use this method to handle all the bookkeeping. `tablet_idx`
+                // is not a direct subscript into self.raw_tablets!
+                .delete_tcid_by_idx(tablet_idx)
+                // Out-of-bounds
+                .map_err(|()| E_INVALIDARG)?;
 
-                poison.disarm();
-                Ok(())
-            }
-        }
+            poison.disarm();
+            Ok(())
+        }))
     }
 
     fn UpdateMapping(&self, _: Option<&tablet_pc::IRealTimeStylus>) -> WinResult<()> {
-        com_panic_wrapper! {
-            self.poisoned,
-            {
-                // Called on DPI change, need to re-fetch the conversion factor from HIMETRIC to logical pixels.
-                self.poison_bail()?;
-                let mut lock = self.shared_frame.lock().unwrap_or_else(PoisonError::into_inner);
-                lock.himetric_to_logical_pixel = unsafe { fetch_himetric_to_logical_pixel(lock.hwnd) };
+        self.panic_wrapper(AssertUnwindSafe(|| {
+            // Called on DPI change, need to re-fetch the conversion factor from HIMETRIC to logical pixels.
+            self.poison_bail()?;
+            let mut lock = self
+                .shared_frame
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            lock.himetric_to_logical_pixel = unsafe { fetch_himetric_to_logical_pixel(lock.hwnd) };
 
-                Ok(())
-            }
-        }
+            Ok(())
+        }))
     }
 
     // ================= Dead code :V ==================
