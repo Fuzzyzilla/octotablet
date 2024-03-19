@@ -4,240 +4,336 @@
 use octotablet::builder::Builder;
 use winit::dpi::PhysicalSize;
 
-use winit::platform::pump_events::EventLoopExtPumpEvents;
+/// Paint every `PAINT_SPACING_PX` during a stroke.
+const PAINT_SPACING_PX: f32 = 5.0;
 
-fn main() {
-    let mut event_loop = winit::event_loop::EventLoopBuilder::<()>::default()
-        .build()
-        .unwrap();
-    let window = std::sync::Arc::new(
-        winit::window::WindowBuilder::default()
-            .with_inner_size(PhysicalSize::new(512u32, 512u32))
-            .with_title("octotablet paint demo")
-            .build(&event_loop)
-            .unwrap(),
-    );
+/// Painter for an individual tool interaction
+#[derive(Default)]
+struct ToolPainter {
+    /// Whether the tool should erase ink instead of placing it.
+    is_eraser: bool,
+    /// Position at the end of last frame, for connecting previous data to new data.
+    /// None if start of frame.
+    previous_pose: Option<octotablet::axis::Pose>,
+    /// The path being traced
+    builder: tiny_skia::PathBuilder,
+    /// Length of the painted stroke, modulo [`PAINT_SPACING_PX`]
+    arc_len_modulo: f32,
+}
+impl ToolPainter {
+    fn pressure_to_radius(pressure: f32) -> f32 {
+        const BRUSH_SIZE: f32 = 15.0;
+        // Could perform some curves in here!
+        pressure * BRUSH_SIZE
+    }
+    // Linearly interpolate two points `(position, pressure)` across `t` in `[0, 1]`
+    fn lerp_pose(from: ([f32; 2], f32), to: ([f32; 2], f32), t: f32) -> ([f32; 2], f32) {
+        let inv_t = 1.0 - t;
+        (
+            [
+                from.0[0] * inv_t + to.0[0] * t,
+                from.0[1] * inv_t + to.0[1] * t,
+            ],
+            from.1 * inv_t + to.1 * t,
+        )
+    }
 
-    // To allow us to draw on the screen without pulling in a whole GPU package,
-    // we use `softbuffer` for presentation and `tiny-skia` for drawing
-    let mut pixmap = tiny_skia::Pixmap::new(512, 512).unwrap();
-    let mut builder = tiny_skia::PathBuilder::new();
-    let softbuffer = softbuffer::Context::new(&window).unwrap();
-    let mut surface = softbuffer::Surface::new(&softbuffer, &window).unwrap();
-
-    // Which pen is currently `In`?
-    let mut down_tool = None::<octotablet::tool::ID>;
-    // Is the current tool an eraser?
-    let mut is_eraser = false;
-    // Current pressure. tiny_skia doesn't allow per-point size nor color, so we just choose per-frame.
-    let mut current_pressure = 0.0;
-    // If it was down, where was it at the end of the last frame?
-    let mut previous_point = None::<[f32; 2]>;
-
-    // Fetch the tablets, using our window's handle for access.
-    // Since we `Arc'd` our window, we get the safety of `build_shared`. Where this is not possible,
-    // `build_raw` is available as well!
-    let mut manager = Builder::default().build_shared(&window).unwrap();
-
-    // Re-usable logic to draw and consume the path.
-    let consume_path = |pixmap: &mut tiny_skia::Pixmap,
-                        path: &mut tiny_skia::PathBuilder,
-                        pressure: f32,
-                        is_eraser: bool| {
-        const BRUSH_SIZE: f32 = 40.0;
-        // If empty or fails to build, skip.
-        if path.is_empty() || pressure <= 0.0 {
-            return;
-        }
-        let Some(built) = std::mem::take(path).finish() else {
+    /// Add a pose to the painter.
+    fn push_pose(&mut self, pose: octotablet::axis::Pose) {
+        // Update and take old pose
+        let Some(previous_pose) = self.previous_pose.replace(pose) else {
+            // We need before and after to perform the draw - nothing to do here.
             return;
         };
 
+        // We want to place a circle at even intervals during the length of the drawn path.
+        // However, since we only get data in bursts and not all at once, extra bookkeeping is needed
+        // to allow this to happen!
+        let delta = [
+            previous_pose.position[0] - pose.position[0],
+            previous_pose.position[1] - pose.position[1],
+        ];
+
+        // Reduce poses to the info we care about for this simple example
+        // (position, pressure)
+        // If pressure isn't supported by the device, then assume 100% pressure.
+        let previous_pose = (
+            previous_pose.position,
+            previous_pose.pressure.get().unwrap_or(1.0),
+        );
+        let pose = (pose.position, pose.pressure.get().unwrap_or(1.0));
+
+        let length = ((delta[0] * delta[0]) + (delta[1] * delta[1])).sqrt();
+
+        if length > (PAINT_SPACING_PX - self.arc_len_modulo) {
+            // Enough length to draw!
+            // First dot location, in [0, 1] where 0 is previous and 1 is next
+            let mut t = (PAINT_SPACING_PX - self.arc_len_modulo) / length;
+            // How much percentage each dot advances by
+            let delta_t = PAINT_SPACING_PX / length;
+
+            // Draw circles every PAINT_SPACING_PX until we surpass 100%
+            while t <= 1.0 {
+                let (pos, pressure) = Self::lerp_pose(previous_pose, pose, t);
+                let size = Self::pressure_to_radius(pressure);
+                self.builder.push_circle(pos[0], pos[1], size);
+                t += delta_t;
+            }
+
+            // Accumulate the arclength
+            self.arc_len_modulo += length;
+            self.arc_len_modulo %= PAINT_SPACING_PX;
+        } else {
+            // Too short to draw..
+            // Accumulate the arclength
+            self.arc_len_modulo += length;
+        }
+    }
+    /// Consume the pending drawings, rendering into the given pixmap.
+    /// Returns true to request a redraw.
+    fn consume_draw(&mut self, pixmap: &mut tiny_skia::Pixmap) -> bool {
+        // Consume path
+        let Some(path) = std::mem::take(&mut self.builder).finish() else {
+            // Empty path, no draw!
+            return false;
+        };
+        // Draw!
+
         // If the tool is known to be an eraser, erase!
-        let mut color = if is_eraser {
+        let color = if self.is_eraser {
             // mwuhahahaha, clear with black instead of actually reducing opacity.
             tiny_skia::Color::BLACK
         } else {
             tiny_skia::Color::WHITE
         };
 
-        // Apply some arbitrary curve to make it nicer visually
-        color.apply_opacity(pressure.powf(0.5));
-
-        pixmap.stroke_path(
-            &built,
+        pixmap.fill_path(
+            &path,
             &tiny_skia::Paint {
                 shader: tiny_skia::Shader::SolidColor(color),
-                blend_mode: tiny_skia::BlendMode::SourceOver,
+                blend_mode: tiny_skia::BlendMode::Source,
                 anti_alias: false,
                 force_hq_pipeline: false,
             },
-            &tiny_skia::Stroke {
-                width: pressure * BRUSH_SIZE,
-                miter_limit: 4.0,
-                line_cap: tiny_skia::LineCap::Round,
-                line_join: tiny_skia::LineJoin::Round,
-                dash: None,
-            },
+            // Circles may overlap, EvenOdd would give weird XOR results!
+            tiny_skia::FillRule::Winding,
             tiny_skia::Transform::identity(),
             None,
         );
+        // We changed the buffer, request redraw for this frame.
+        true
+    }
+}
 
-        // Pixbuf changed, ask winit logic to display it.
-        window.request_redraw();
-    };
+/// Painter container, dispatches octotablet events to the sub-painters to render the image
+struct Painter {
+    scale_factor: f32,
+    tools: std::collections::HashMap<octotablet::tool::ID, ToolPainter>,
+}
 
-    // Start pumping events...
-    while !event_loop.exiting() {
-        // Throttle the loop. Everything here will run *as fast as possible*
-        // eating up a lot of CPU for no good purpose!
-        // Fixme: it shouldn't do this by default. Something is wrong with my winit usage, i swear I've tried every
-        // permutation of wait-times and control-flows and.... :(
+impl Painter {
+    /// Paint from the events stream. Returns true to request a redraw.
+    fn paint<'a>(
+        &mut self,
+        events: impl IntoIterator<Item = octotablet::events::Event<'a>>,
+        pixmap: &mut tiny_skia::Pixmap,
+    ) -> bool {
+        // Track every draw event, if any of them request redraw then forward that.
+        let mut needs_redraw = false;
 
-        let wait_time = if previous_point.is_some() {
-            // When drawing, poll often: This is not necessary to get the full quality out of `octotab` - quality is the same
-            // regardless of polling rate when using the `event` api. However, this makes it feel smoother to draw.
-            std::time::Duration::from_millis(10)
-        } else {
-            // When not, poll less often. Can't be too long or `winit` gets unhappy!
-            std::time::Duration::from_millis(50)
-        };
-
-        std::thread::sleep(wait_time);
-
-        // Let winit manage its messages....
-        event_loop.pump_events(Some(std::time::Duration::ZERO), |e, target| {
-            use winit::event::*;
-            // Use poll, since wait times are set *outside* the loop.
-            // Wait stalls the thread, and ignores the `wait_time` parameter
-            // for some reason!
-            target.set_control_flow(winit::event_loop::ControlFlow::Poll);
-
-            if let Event::WindowEvent { event, .. } = e {
-                match event {
-                    // Esc pressed or system-specific close event .
-                    WindowEvent::KeyboardInput {
-                        event: winit::event::KeyEvent{
-                            physical_key: winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape),
-                            state: winit::event::ElementState::Pressed,
-                        ..},
-                    .. }  | WindowEvent::CloseRequested => target.exit(),
-                    WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                        if scale_factor != 1.0 {
-                            // Nothing to test this on, so it's hard to write the transform math... Fixme!
-                            unimplemented!("I don't know what math to put here :<")
-                        }
-                    }
-                    WindowEvent::Resized(size) => {
-                        // Make a new map
-                        let mut new_map = tiny_skia::Pixmap::new(size.width, size.height).unwrap();
-                        // copy the old onto it.
-                        new_map.draw_pixmap(
-                            0,
-                            0,
-                            pixmap.as_ref(),
-                            &tiny_skia::PixmapPaint {
-                                opacity: 1.0,
-                                blend_mode: tiny_skia::BlendMode::Source,
-                                quality: tiny_skia::FilterQuality::Nearest,
-                            },
-                            tiny_skia::Transform::identity(),
-                            None,
-                        );
-                        // Replace map, inform the surface of the change, and redraw.
-                        pixmap = new_map;
-                        surface
-                            .resize(
-                                size.width.try_into().unwrap(),
-                                size.height.try_into().unwrap(),
-                            )
-                            .unwrap();
-                        window.request_redraw();
-                    }
-                    WindowEvent::RedrawRequested => {
-                        // Copy skia bitmap into the framebufer and present.
-                        let mut buffer = surface.buffer_mut().unwrap();
-                        buffer
-                            .iter_mut()
-                            .zip(pixmap.pixels().iter())
-                            .for_each(|(into, from)| {
-                                // This is a premul color. Treat it as composited atop black,
-                                // which has the nice side effect of requiring literally no work
-                                // other than setting alpha to 1 :D
-                                let r = from.red();
-                                let g = from.green();
-                                let b = from.blue();
-                                // softbuffer requires `0000'0000'rrrr'rrrr'gggg'gggg'bbbb'bbbb` format
-                                *into = (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b));
-                            });
-
-                        window.pre_present_notify();
-                        buffer.present().unwrap();
-                    }
-                    _ => (),
-                }
-            }
-        });
-
-        // Accept all new messages from the stylus server.
-        let events = manager.pump().unwrap();
         for event in events {
-            // We only care about tool events...
-            if let octotablet::events::Event::Tool { tool, event } = event {
-                // We're already listening on a different tool...
-                if down_tool.as_ref().is_some_and(|t| t != &tool.id()) {
-                    continue;
-                }
+            use octotablet::events::{Event, ToolEvent};
+            if let Event::Tool { tool, event } = event {
                 match event {
-                    // Start listening! We don't start listening at "In", as we only care for motions that are pressed against the page.
-                    octotablet::events::ToolEvent::Down => {
-                        down_tool = Some(tool.id());
-                        is_eraser = Some(octotablet::tool::Type::Eraser) == tool.tool_type;
+                    // Start drawing!
+                    ToolEvent::Down => {
+                        // Create a painter.
+                        self.tools.entry(tool.id()).or_insert_with(|| ToolPainter {
+                            // Mark eraser-type tools to erase
+                            is_eraser: matches!(
+                                tool.tool_type,
+                                Some(octotablet::tool::Type::Eraser)
+                            ),
+                            ..Default::default()
+                        });
                     }
-                    octotablet::events::ToolEvent::Pose(pose) => {
-                        // Ignore poses if the tool isn't down yet.
-                        if down_tool.is_none() {
-                            continue;
-                        }
-                        // strokes crossing many frames makes for more complex logic!
-                        match (previous_point, builder.is_empty()) {
-                            (None, _) => {
-                                // Start of stroke, add move verb to position and don't line.
-                                builder.move_to(pose.position[0], pose.position[1]);
-                            }
-                            (Some([prev_x, prev_y]), true) => {
-                                // Stroke continued from last frame. Add a move verb to last point and then line
-                                builder.move_to(prev_x, prev_y);
-                                builder.line_to(pose.position[0], pose.position[1]);
-                            }
-                            (Some(_), false) => {
-                                // Continuing from this frame. Just line.
-                                builder.line_to(pose.position[0], pose.position[1]);
-                            }
-                        }
-                        // Update last pos, in case this happens to be the last event.
-                        previous_point = Some(pose.position);
+                    // Positioning data, continue drawing!
+                    ToolEvent::Pose(mut pose) => {
+                        // If there's a painter, paint on it!
+                        // If not, we haven't hit the `Down` event yet.
+                        if let Some(painter) = self.tools.get_mut(&tool.id()) {
+                            // Octotablet works in "logical pixels", but our tiny_skia renderer needs
+                            // "physical pixels". Multiplying by the window's scale factor performs
+                            // that conversion.
+                            pose.position = [
+                                pose.position[0] * self.scale_factor,
+                                pose.position[1] * self.scale_factor,
+                            ];
 
-                        // Choose a brush size from the pressure. Due to renderer limitations, this isn't
-                        // part of the path and is coarsly chosen per-frame. FIXME! :D
-                        current_pressure = pose.pressure.get().unwrap_or(1.0);
+                            painter.push_pose(pose);
+                        }
                     }
-                    // Current interaction just stopped (hardware removed, out of proximity, or no longer pressed)
-                    octotablet::events::ToolEvent::Removed
-                    | octotablet::events::ToolEvent::Out
-                    | octotablet::events::ToolEvent::Up => {
-                        // Stop!
-                        down_tool = None;
-                        previous_point = None;
-                        // Draw what we had in-progress..
-                        consume_path(&mut pixmap, &mut builder, current_pressure, is_eraser);
+                    // At any of these events, finish the drawing.
+                    ToolEvent::Removed | ToolEvent::Out | ToolEvent::Up => {
+                        // Remove the painter for this tool, and allow it to draw before drop.
+                        if let Some(mut painter) = self.tools.remove(&tool.id()) {
+                            needs_redraw |= painter.consume_draw(pixmap);
+                        }
                     }
-                    // We don't care about the other tool events - buttons, frame times, ect.
                     _ => (),
                 }
             }
         }
-        // Draw what we had in-progress...
-        consume_path(&mut pixmap, &mut builder, current_pressure, is_eraser);
+
+        // Draw any pending painters but keep them around.
+        // This allows for the ink to be seen immediately.
+        for painter in self.tools.values_mut() {
+            needs_redraw |= painter.consume_draw(pixmap);
+        }
+
+        needs_redraw
     }
+}
+
+fn main() {
+    let event_loop = winit::event_loop::EventLoopBuilder::<()>::default()
+        .build()
+        .expect("start event loop");
+    let window = std::sync::Arc::new(
+        winit::window::WindowBuilder::default()
+            .with_inner_size(PhysicalSize::new(512u32, 512u32))
+            .with_title("octotablet paint demo")
+            .build(&event_loop)
+            .expect("create window"),
+    );
+
+    // To allow us to draw on the screen without pulling in a whole GPU package,
+    // we use `softbuffer` for presentation and `tiny-skia` for drawing
+    let mut pixmap = tiny_skia::Pixmap::new(512, 512).unwrap();
+    let softbuffer = softbuffer::Context::new(window.as_ref()).expect("init softbuffer");
+    let mut surface =
+        softbuffer::Surface::new(&softbuffer, &window).expect("make presentation surface");
+
+    // Fetch the tablets, using our window's handle for access.
+    // Since we `Arc'd` our window, we get the safety of `build_shared`. Where this is not possible,
+    // `build_raw` is available as well!
+    let mut manager = Builder::default()
+        .build_shared(&window)
+        .expect("connect to stylus server");
+
+    // Make a painter to turn the stylus events into pretty pictures!
+    let mut painter = Painter {
+        tools: std::collections::HashMap::new(),
+        // Winit doesn't notify for the initial scale factor, query directly!
+        scale_factor: window.scale_factor() as f32,
+    };
+
+    // Whether the winit loop should poll more often (during a stylus interaction)
+    let mut should_poll = false;
+
+    // Let winit manage its messages....
+    event_loop
+        .run(|e, target| {
+            use winit::event::*;
+
+            // We must poll occasionally for tablet events. Winit will not wake up automatically on stylus events since
+            // octotablet uses a separate event loop!
+            target.set_control_flow(winit::event_loop::ControlFlow::wait_duration(
+                // Poll more often during an interaction.
+                std::time::Duration::from_millis(if should_poll { 10 } else { 100 }),
+            ));
+
+            match e {
+                Event::WindowEvent { event, .. } => {
+                    match event {
+                        // Esc pressed or system-specific close event.
+                        WindowEvent::KeyboardInput {
+                            event:
+                                winit::event::KeyEvent {
+                                    physical_key:
+                                        winit::keyboard::PhysicalKey::Code(
+                                            winit::keyboard::KeyCode::Escape,
+                                        ),
+                                    state: winit::event::ElementState::Pressed,
+                                    ..
+                                },
+                            ..
+                        }
+                        | WindowEvent::CloseRequested => target.exit(),
+                        WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                            painter.scale_factor = scale_factor as f32
+                            // Window resize event occurs next and that handles image resize.
+                        }
+                        WindowEvent::Resized(size) => {
+                            // Make a new map
+                            let mut new_map =
+                                tiny_skia::Pixmap::new(size.width, size.height).unwrap();
+                            // copy the old onto it.
+                            new_map.draw_pixmap(
+                                0,
+                                0,
+                                pixmap.as_ref(),
+                                &tiny_skia::PixmapPaint {
+                                    opacity: 1.0,
+                                    blend_mode: tiny_skia::BlendMode::Source,
+                                    // No resizing is taking place.
+                                    quality: tiny_skia::FilterQuality::Nearest,
+                                },
+                                tiny_skia::Transform::identity(),
+                                None,
+                            );
+                            // Replace map, inform the surface of the change, and redraw.
+                            pixmap = new_map;
+                            surface
+                                .resize(
+                                    size.width.try_into().unwrap(),
+                                    size.height.try_into().unwrap(),
+                                )
+                                .unwrap();
+                            window.request_redraw();
+                        }
+                        WindowEvent::RedrawRequested => {
+                            // Copy skia bitmap into the framebufer and present.
+                            let mut buffer = surface.buffer_mut().expect("fetch draw buffer");
+                            buffer.iter_mut().zip(pixmap.pixels().iter()).for_each(
+                                |(into, from)| {
+                                    // This is a premul color. Treat it as composited atop black,
+                                    // which has the nice side effect of requiring literally no work
+                                    // other than setting alpha to 1 :D
+                                    let r = from.red();
+                                    let g = from.green();
+                                    let b = from.blue();
+                                    // softbuffer requires `0000'0000'rrrr'rrrr'gggg'gggg'bbbb'bbbb` format
+                                    *into =
+                                        (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b));
+                                },
+                            );
+
+                            window.pre_present_notify();
+                            buffer.present().expect("present");
+                        }
+                        _ => (),
+                    }
+                }
+                Event::AboutToWait => {
+                    // Finished events from Winit, parse events from octotablet.
+                    // Accept all new messages from the stylus server, draw with them!
+                    let events = manager.pump().expect("octotablet event pump");
+
+                    // Has events - mark to pull more often if so!
+                    should_poll = events.into_iter().next().is_some();
+
+                    // Perform painting...
+                    let needs_present = painter.paint(events, &mut pixmap);
+
+                    // Something was drawn in the buffer, request present.
+                    if needs_present {
+                        window.request_redraw();
+                    }
+                }
+                // Other winit events..
+                _ => (),
+            }
+        })
+        .expect("winit event loop");
 }
