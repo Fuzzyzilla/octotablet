@@ -1,4 +1,6 @@
 # Device-agnostic Cross-platform Tablet Library 🐙✨
+[![Crates.io Version](https://img.shields.io/crates/v/octotablet?style=for-the-badge)](https://crates.io/crates/octotablet)
+[![docs.rs](https://img.shields.io/docsrs/octotablet?style=for-the-badge)](https://docs.rs/octotablet/latest/octotablet/)
 
 Cross-platform high-level tablet/pad/stylus library, reporting connected hardware features and providing easy-to-use
 event-based access to user input.
