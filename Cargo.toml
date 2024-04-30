@@ -74,9 +74,11 @@ windows-ink = ["dep:windows"]
 [dev-dependencies]
 eframe = "0.26.2" 
 winit = "0.29.15"
-tiny-skia = {version = "0.11.4", default-features = false, features = ["std", "simd"]}
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
 usb-ids = "1.2024.2"
 softbuffer = "0.4.1"
+sdl2 = { version = "0.36.0", features = ["raw-window-handle"] }
+rwh_05 = { package = "raw-window-handle", version = "0.5.0" }
 
 [build-dependencies]
 cfg_aliases = "0.2.0"
