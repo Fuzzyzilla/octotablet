@@ -5,6 +5,10 @@
 Cross-platform high-level tablet/pad/stylus library, reporting connected hardware features and providing easy-to-use
 event-based access to user input.
 
+## [Examples](examples/README.md)
+See [the examples](examples/README.md) for features and usage with several windowing abstractions.
+In particular, `eframe-viewer` provides a nice interface to debug your devices and view many of the capabilities of this crate.
+
 ## Platform Support
 | Platform                             |      Support |
 |--------------------------------------|-------------:|
