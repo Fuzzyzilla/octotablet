@@ -16,3 +16,12 @@ frame lag - the events api will never coalesce events, leaving them as detailed 
 Demos integration with `eframe` for exploring the data this crate provides, including listing connected tablet/pad/stylus
 hardware with their capabilities. Also includes a test area where you can play with and visualize the distance/tilt/pressure
 capabilities of your tablet and observe the raw event stream.
+
+## `sdl2`
+Demos integration with the `sdl2` crate, and does little more than that. Currently, `sdl2` requires the use of `raw-window-handle = 0.5.0`
+whereas `octotablet` requires the use of `raw-window-handle = 0.6.0`, this demo shows how to bridge between the two. In the future,
+this should be fixed.
+Octotablet currently requires wayland, which can be accessed via the environment variable `SDL_VIDEODRIVER`.
+```bash
+SDL_VIDEODRIVER=wayland cargo run --example sdl2
+```
