@@ -2035,6 +2035,7 @@ dependencies = [
  "wayland-protocols",
  "windows 0.54.0",
  "winit",
+ "x11-dl",
 ]
 
 [[package]]
