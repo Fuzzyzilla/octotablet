@@ -3,6 +3,8 @@
 pub(crate) mod ink;
 #[cfg(wl_tablet)]
 pub(crate) mod wl;
+#[cfg(xinput2)]
+pub(crate) mod xinput2;
 
 /// Holds any one of the internal platform IDs.
 /// Since these are always sealed away as an implementation detail, we can always
@@ -12,6 +14,8 @@ pub(crate) mod wl;
 pub(crate) enum InternalID {
     #[cfg(wl_tablet)]
     Wayland(wl::ID),
+    #[cfg(xinput2)]
+    XInput2(xinput2::ID),
     #[cfg(ink_rts)]
     Ink(ink::ID),
 }
@@ -54,6 +58,17 @@ impl InternalID {
             _ => Self::unwrap_failure(),
         }
     }
+    #[cfg(xinput2)]
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn unwrap_xinput2(&self) -> &xinput2::ID {
+        #[allow(unreachable_patterns)]
+        #[allow(clippy::match_wildcard_for_single_variants)]
+        match self {
+            Self::XInput2(id) => id,
+            _ => Self::unwrap_failure(),
+        }
+    }
     #[cfg(ink_rts)]
     #[inline]
     #[allow(dead_code)]
@@ -72,6 +87,12 @@ impl From<wl::ID> for InternalID {
         Self::Wayland(value)
     }
 }
+#[cfg(xinput2)]
+impl From<xinput2::ID> for InternalID {
+    fn from(value: xinput2::ID) -> Self {
+        Self::XInput2(value)
+    }
+}
 #[cfg(ink_rts)]
 impl From<ink::ID> for InternalID {
     fn from(value: ink::ID) -> Self {
@@ -86,6 +107,8 @@ impl From<ink::ID> for InternalID {
 pub(crate) enum ButtonID {
     #[cfg(wl_tablet)]
     Wayland(wl::ButtonID),
+    #[cfg(xinput2)]
+    XInput2(xinput2::ButtonID),
     #[cfg(ink_rts)]
     Ink(ink::ButtonID),
 }
@@ -128,6 +151,17 @@ impl ButtonID {
             _ => Self::unwrap_failure(),
         }
     }
+    #[cfg(xinput2)]
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn unwrap_xinput2(&self) -> &xinput2::ButtonID {
+        #[allow(unreachable_patterns)]
+        #[allow(clippy::match_wildcard_for_single_variants)]
+        match self {
+            Self::XInput2(id) => id,
+            _ => Self::unwrap_failure(),
+        }
+    }
     #[cfg(ink_rts)]
     #[inline]
     #[allow(dead_code)]
@@ -146,6 +180,12 @@ impl From<wl::ButtonID> for ButtonID {
         Self::Wayland(value)
     }
 }
+#[cfg(xinput2)]
+impl From<xinput2::ButtonID> for ButtonID {
+    fn from(value: xinput2::ButtonID) -> Self {
+        Self::XInput2(value)
+    }
+}
 #[cfg(ink_rts)]
 impl From<ink::ButtonID> for ButtonID {
     fn from(value: ink::ButtonID) -> Self {
@@ -156,6 +196,8 @@ impl From<ink::ButtonID> for ButtonID {
 pub(crate) enum RawEventsIter<'a> {
     #[cfg(wl_tablet)]
     Wayland(std::slice::Iter<'a, crate::events::raw::Event<wl::ID>>),
+    #[cfg(wl_tablet)]
+    XInput2(std::slice::Iter<'a, crate::events::raw::Event<wl::ID>>),
     #[cfg(ink_rts)]
     Ink(std::slice::Iter<'a, crate::events::raw::Event<ink::ID>>),
 }
@@ -166,6 +208,8 @@ impl Iterator for RawEventsIter<'_> {
         match self {
             #[cfg(wl_tablet)]
             Self::Wayland(wl) => wl.next().cloned().map(crate::events::raw::Event::id_into),
+            #[cfg(xinput2)]
+            Self::XInput2(xi) => xi.next().cloned().map(crate::events::raw::Event::id_into),
             #[cfg(ink_rts)]
             Self::Ink(ink) => ink.next().cloned().map(crate::events::raw::Event::id_into),
         }
@@ -190,12 +234,14 @@ pub(crate) trait PlatformImpl {
 }
 
 /// Static dispatch between compiled backends.
-/// Enum cause why not, (almost?) always has one variant and is thus compiles away to the inner type transparently.
+/// Enum cause why not, in some cases this has one variant and is thus compiles away to the inner type transparently.
 /// Even empty enum is OK, since everything involving it becomes essentially `match ! {}` which is sound :D
 #[enum_dispatch::enum_dispatch(PlatformImpl)]
 pub(crate) enum PlatformManager {
     #[cfg(wl_tablet)]
     Wayland(wl::Manager),
+    #[cfg(xinput2)]
+    XInput2(xinput2::Manager),
     #[cfg(ink_rts)]
     Ink(ink::Manager),
 }

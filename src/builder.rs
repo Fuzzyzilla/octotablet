@@ -118,6 +118,30 @@ impl Builder {
                     },
                 ))
             }
+            #[cfg(xinput2)]
+            raw_window_handle::RawDisplayHandle::Xlib(_)
+            | raw_window_handle::RawDisplayHandle::Xcb(_) => {
+                // We don't actually care about the dispaly handle for xlib! We need the *window* id instead.
+                // (We manage our own connection and snoop the window events from there.)
+                // As such, we accept both Xlib and Xcb, since we only care about the numeric window ID which is *server* defined,
+                // not client library defined.
+                let window = match rwh.window_handle()?.as_raw() {
+                    raw_window_handle::RawWindowHandle::Xlib(
+                        raw_window_handle::XlibWindowHandle { window, .. },
+                    ) => window,
+                    raw_window_handle::RawWindowHandle::Xcb(
+                        raw_window_handle::XcbWindowHandle { window, .. },
+                    ) => u64::from(window.get()),
+                    // The display handle said it was one of these!!
+                    _ => unreachable!(),
+                };
+
+                Ok(crate::platform::PlatformManager::XInput2(
+                    // Safety: forwarded to this fn's contract.
+                    // Fixme: unwrap.
+                    unsafe { crate::platform::xinput2::Manager::build_window(self, window) },
+                ))
+            }
             #[cfg(ink_rts)]
             raw_window_handle::RawDisplayHandle::Windows(_) => {
                 // We need the window handle for this :V
