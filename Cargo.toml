@@ -48,8 +48,10 @@ smallvec = "1.13.1"
 wayland-backend = { version = "0.3.3", features = ["client_system"], optional = true }
 wayland-client = { version = "0.31.2", optional = true }
 wayland-protocols = { version = "0.31.2", features = ["client", "unstable"], optional = true }
-# Xorg deps.
-x11-dl = { version = "2.21.0", optional = true }
+
+# Xorg `xinput2` deps. We use x11rb RustConnection as xcb doesn't support xinput2 out-of-box
+# and xlib cannot be soundly used due to its use of global variables.
+x11rb = { version = "0.13.1", features = ["xinput", "extra-traits"], optional = true }
 
 # Windows Ink `RealTimeStylus`
 [target.'cfg(any(docsrs, target_os = "windows"))'.dependencies.windows]
@@ -70,7 +72,7 @@ default = ["wayland-tablet-unstable-v2", "xorg-xinput2", "windows-ink"]
 # Note: "unstable" here refers to the protocol itself, not to the stability of it's integration into this crate!
 wayland-tablet-unstable-v2 = ["dep:wayland-backend", "dep:wayland-client", "dep:wayland-protocols"]
 
-xorg-xinput2 = ["dep:x11-dl"]
+xorg-xinput2 = ["dep:x11rb"]
 
 # Windows Ink `RealTimeStylus` support
 windows-ink = ["dep:windows"]

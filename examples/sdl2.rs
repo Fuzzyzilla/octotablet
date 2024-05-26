@@ -34,6 +34,16 @@ mod rwh_bridge {
                     screen,
                 )
                 .into(),
+                // Xcb...
+                rwh_05::RawDisplayHandle::Xcb(rwh_05::XcbDisplayHandle {
+                    connection,
+                    screen,
+                    ..
+                }) => raw_window_handle::XcbDisplayHandle::new(
+                    std::ptr::NonNull::new(connection),
+                    screen,
+                )
+                .into(),
                 // Windows 32... Has no display handle!
                 rwh_05::RawDisplayHandle::Windows(_) => {
                     raw_window_handle::WindowsDisplayHandle::new().into()
@@ -67,6 +77,17 @@ mod rwh_bridge {
                 }) => {
                     let mut rwh = raw_window_handle::XlibWindowHandle::new(window);
                     rwh.visual_id = visual_id;
+                    rwh
+                }
+                .into(),
+                // Xcb...
+                rwh_05::RawWindowHandle::Xcb(rwh_05::XcbWindowHandle {
+                    window, visual_id, ..
+                }) => {
+                    let mut rwh = raw_window_handle::XcbWindowHandle::new(
+                        std::num::NonZeroU32::new(window).expect("null xcb window"),
+                    );
+                    rwh.visual_id = std::num::NonZeroU32::new(visual_id);
                     rwh
                 }
                 .into(),
