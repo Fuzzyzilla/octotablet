@@ -316,9 +316,11 @@ pub struct Manager {
     device_infos: std::collections::BTreeMap<ID, ToolInfo>,
     open_devices: Vec<ID>,
     tools: Vec<crate::tool::Tool>,
-    dummy_tablet: crate::tablet::Tablet,
+    tablets: Vec<crate::tablet::Tablet>,
     events: Vec<crate::events::raw::Event<ID>>,
     window: x11rb::protocol::xproto::Window,
+    atom_usb_id: Option<std::num::NonZero<x11rb::protocol::xproto::Atom>>,
+    atom_device_node: Option<std::num::NonZero<x11rb::protocol::xproto::Atom>>,
 }
 
 impl Manager {
@@ -395,7 +397,7 @@ impl Manager {
                 None
             };
             if let Ok(name) = std::str::from_utf8(&name.name) {
-                println!("{name}");
+                println!("{} - {name}", device.device_id);
             } else {
                 println!("<Bad name>");
             }
@@ -470,19 +472,28 @@ impl Manager {
         .check()
         .unwrap();
 
+        let atom_usb_id = conn
+            .intern_atom(false, b"Device Product ID")
+            .ok()
+            .and_then(|resp| resp.reply().ok())
+            .and_then(|reply| reply.atom.try_into().ok());
+        let atom_device_node = conn
+            .intern_atom(false, b"Device Node")
+            .ok()
+            .and_then(|resp| resp.reply().ok())
+            .and_then(|reply| reply.atom.try_into().ok());
+
         let mut this = Self {
             conn,
             _xinput_minor_version: version.server_minor,
             device_infos: std::collections::BTreeMap::new(),
             open_devices: vec![],
             tools: vec![],
-            dummy_tablet: crate::tablet::Tablet {
-                internal_id: super::InternalID::XInput2(0),
-                name: None,
-                usb_id: None,
-            },
             events: vec![],
+            tablets: vec![],
             window,
+            atom_device_node,
+            atom_usb_id,
         };
 
         // Poll for devices.
@@ -493,8 +504,10 @@ impl Manager {
     /// change events accordingly.
     #[allow(clippy::too_many_lines)]
     fn repopulate(&mut self) {
-        // Fixme, hehe
+        // Fixme, hehe. We need to a) keep these alive for the next pump, and b) appropriately
+        // report adds/removes.
         self.tools.clear();
+        self.tablets.clear();
 
         for device in self.open_devices.drain(..) {
             self.conn
@@ -587,156 +600,330 @@ impl Manager {
 
             // At this point, we're pretty sure this is a tool, pad, or tablet!
 
-            if let DeviceType::Tool(tool_type) = device_type {
-                // It's a tool! Parse all relevant infos.
+            match device_type {
+                DeviceType::Tool(ty) => {
+                    // It's a tool! Parse all relevant infos.
 
-                // Try to parse the hardware ID from the name field.
-                let name_fields = raw_name.as_deref().map(tool_id_from_name);
+                    // Try to parse the hardware ID from the name field.
+                    let name_fields = raw_name.as_deref().map(tool_id_from_name);
 
-                let mut octotablet_info = crate::tool::Tool {
-                    internal_id: super::InternalID::XInput2(device.device_id),
-                    name: name_fields.map(ToolName::name).map(ToOwned::to_owned),
-                    hardware_id: name_fields.and_then(ToolName::id),
-                    wacom_id: None,
-                    tool_type: Some(tool_type),
-                    axes: crate::axis::FullInfo::default(),
-                };
+                    let mut octotablet_info = crate::tool::Tool {
+                        internal_id: super::InternalID::XInput2(device.device_id),
+                        name: name_fields.map(ToolName::name).map(ToOwned::to_owned),
+                        hardware_id: name_fields.and_then(ToolName::id),
+                        wacom_id: None,
+                        tool_type: Some(ty),
+                        axes: crate::axis::FullInfo::default(),
+                    };
 
-                let mut x11_info = ToolInfo {
-                    pressure: None,
-                    tilt: [None, None],
-                    wheel: None,
-                };
+                    let mut x11_info = ToolInfo {
+                        pressure: None,
+                        tilt: [None, None],
+                        wheel: None,
+                    };
 
-                // Look for axes!
-                for class in &query.classes {
-                    if let Some(v) = class.data.as_valuator() {
-                        if v.mode != xinput::ValuatorMode::ABSOLUTE {
-                            continue;
-                        };
-                        // Weird case, that does happen in practice. :V
-                        if v.min == v.max {
-                            continue;
-                        }
-                        let Some(label) = self
-                            .conn
-                            .get_atom_name(v.label)
-                            .ok()
-                            .and_then(|response| response.reply().ok())
-                            .and_then(|atom| String::from_utf8(atom.name).ok())
-                            .and_then(|label| label.parse::<ValuatorAxis>().ok())
-                        else {
-                            continue;
-                        };
-
-                        let min = fixed32_to_f32(v.min);
-                        let max = fixed32_to_f32(v.max);
-
-                        match label {
-                            ValuatorAxis::AbsPressure => {
-                                // Scale and bias to [0,1].
-                                x11_info.pressure = Some(AxisInfo {
-                                    index: v.number,
-                                    transform: Transform::BiasScale {
-                                        bias: -min,
-                                        scale: 1.0 / (max - min),
-                                    },
-                                });
-                                octotablet_info.axes.pressure =
-                                    Some(crate::axis::NormalizedInfo { granularity: None });
+                    // Look for axes!
+                    for class in &query.classes {
+                        if let Some(v) = class.data.as_valuator() {
+                            if v.mode != xinput::ValuatorMode::ABSOLUTE {
+                                continue;
+                            };
+                            // Weird case, that does happen in practice. :V
+                            if v.min == v.max {
+                                continue;
                             }
-                            ValuatorAxis::AbsTiltX => {
-                                // Seemingly always in degrees.
-                                let deg_to_rad = 1.0f32.to_radians();
-                                x11_info.tilt[0] = Some(AxisInfo {
-                                    index: v.number,
-                                    transform: Transform::BiasScale {
-                                        bias: 0.0,
-                                        scale: deg_to_rad,
-                                    },
-                                });
+                            let Some(label) = self
+                                .conn
+                                .get_atom_name(v.label)
+                                .ok()
+                                .and_then(|response| response.reply().ok())
+                                .and_then(|atom| String::from_utf8(atom.name).ok())
+                                .and_then(|label| label.parse::<ValuatorAxis>().ok())
+                            else {
+                                continue;
+                            };
 
-                                let min = min.to_radians();
-                                let max = max.to_radians();
+                            let min = fixed32_to_f32(v.min);
+                            let max = fixed32_to_f32(v.max);
 
-                                let new_info = crate::axis::Info {
-                                    limits: Some(crate::axis::Limits {
-                                        min: min.to_radians(),
-                                        max: max.to_radians(),
-                                    }),
-                                    granularity: None,
-                                };
+                            match label {
+                                ValuatorAxis::AbsPressure => {
+                                    // Scale and bias to [0,1].
+                                    x11_info.pressure = Some(AxisInfo {
+                                        index: v.number,
+                                        transform: Transform::BiasScale {
+                                            bias: -min,
+                                            scale: 1.0 / (max - min),
+                                        },
+                                    });
+                                    octotablet_info.axes.pressure =
+                                        Some(crate::axis::NormalizedInfo { granularity: None });
+                                }
+                                ValuatorAxis::AbsTiltX => {
+                                    // Seemingly always in degrees.
+                                    let deg_to_rad = 1.0f32.to_radians();
+                                    x11_info.tilt[0] = Some(AxisInfo {
+                                        index: v.number,
+                                        transform: Transform::BiasScale {
+                                            bias: 0.0,
+                                            scale: deg_to_rad,
+                                        },
+                                    });
 
-                                // Set the limits, or if already set take the union of the limits.
-                                match &mut octotablet_info.axes.tilt {
-                                    slot @ None => *slot = Some(new_info),
-                                    Some(v) => match &mut v.limits {
-                                        slot @ None => *slot = new_info.limits,
-                                        Some(v) => {
-                                            v.max = v.max.max(max);
-                                            v.min = v.min.min(min);
-                                        }
-                                    },
+                                    let min = min.to_radians();
+                                    let max = max.to_radians();
+
+                                    let new_info = crate::axis::Info {
+                                        limits: Some(crate::axis::Limits {
+                                            min: min.to_radians(),
+                                            max: max.to_radians(),
+                                        }),
+                                        granularity: None,
+                                    };
+
+                                    // Set the limits, or if already set take the union of the limits.
+                                    match &mut octotablet_info.axes.tilt {
+                                        slot @ None => *slot = Some(new_info),
+                                        Some(v) => match &mut v.limits {
+                                            slot @ None => *slot = new_info.limits,
+                                            Some(v) => {
+                                                v.max = v.max.max(max);
+                                                v.min = v.min.min(min);
+                                            }
+                                        },
+                                    }
+                                }
+                                ValuatorAxis::AbsTiltY => {
+                                    // Seemingly always in degrees.
+                                    let deg_to_rad = 1.0f32.to_radians();
+                                    x11_info.tilt[1] = Some(AxisInfo {
+                                        index: v.number,
+                                        transform: Transform::BiasScale {
+                                            bias: 0.0,
+                                            scale: deg_to_rad,
+                                        },
+                                    });
+
+                                    let min = min.to_radians();
+                                    let max = max.to_radians();
+
+                                    let new_info = crate::axis::Info {
+                                        limits: Some(crate::axis::Limits {
+                                            min: min.to_radians(),
+                                            max: max.to_radians(),
+                                        }),
+                                        granularity: None,
+                                    };
+
+                                    // Set the limits, or if already set take the union of the limits.
+                                    match &mut octotablet_info.axes.tilt {
+                                        slot @ None => *slot = Some(new_info),
+                                        Some(v) => match &mut v.limits {
+                                            slot @ None => *slot = new_info.limits,
+                                            Some(v) => {
+                                                v.max = v.max.max(max);
+                                                v.min = v.min.min(min);
+                                            }
+                                        },
+                                    }
+                                }
+                                ValuatorAxis::AbsWheel => {
+                                    // uhh, i don't know. I have no hardware to test with.
                                 }
                             }
-                            ValuatorAxis::AbsTiltY => {
-                                // Seemingly always in degrees.
-                                let deg_to_rad = 1.0f32.to_radians();
-                                x11_info.tilt[1] = Some(AxisInfo {
-                                    index: v.number,
-                                    transform: Transform::BiasScale {
-                                        bias: 0.0,
-                                        scale: deg_to_rad,
-                                    },
-                                });
 
-                                let min = min.to_radians();
-                                let max = max.to_radians();
-
-                                let new_info = crate::axis::Info {
-                                    limits: Some(crate::axis::Limits {
-                                        min: min.to_radians(),
-                                        max: max.to_radians(),
-                                    }),
-                                    granularity: None,
-                                };
-
-                                // Set the limits, or if already set take the union of the limits.
-                                match &mut octotablet_info.axes.tilt {
-                                    slot @ None => *slot = Some(new_info),
-                                    Some(v) => match &mut v.limits {
-                                        slot @ None => *slot = new_info.limits,
-                                        Some(v) => {
-                                            v.max = v.max.max(max);
-                                            v.min = v.min.min(min);
-                                        }
-                                    },
-                                }
-                            }
-                            ValuatorAxis::AbsWheel => {
-                                // uhh, i don't know. I have no hardware to test with.
-                            }
+                            // Resolution is.. meaningless, I think. xwayland is the only server I have
+                            // seen that even bothers to fill it out, and even there it's weird.
                         }
-
-                        // Resolution is.. meaningless, I think. xwayland is the only server I have
-                        // seen that even bothers to fill it out, and even there it's weird.
                     }
+
+                    tool_listen_events.push(device.device_id);
+                    self.tools.push(octotablet_info);
+                    self.device_infos.insert(device.device_id, x11_info);
                 }
+                DeviceType::Pad => {
+                    continue;
+                }
+                DeviceType::Tablet => {
+                    // Tablets are of... dubious usefulness in xinput?
+                    // They do not follow the paradigms needed by octotablet.
+                    // Alas, we can still fetch some useful information!
+                    let usb_id = self
+                        .conn
+                        // USBID consists of two 16 bit integers, [vid, pid].
+                        .xinput_get_device_property(
+                            self.atom_usb_id.map_or(0, std::num::NonZero::get),
+                            0,
+                            0,
+                            2,
+                            device.device_id,
+                            false,
+                        )
+                        .ok()
+                        .and_then(|resp| resp.reply().ok())
+                        .and_then(|property| {
+                            #[allow(clippy::get_first)]
+                            // Try to accept any type.
+                            Some(match property.items {
+                                xinput::GetDevicePropertyItems::Data16(d) => crate::tablet::UsbId {
+                                    vid: *d.get(0)?,
+                                    pid: *d.get(1)?,
+                                },
+                                xinput::GetDevicePropertyItems::Data8(d) => crate::tablet::UsbId {
+                                    vid: (*d.get(0)?).into(),
+                                    pid: (*d.get(1)?).into(),
+                                },
+                                xinput::GetDevicePropertyItems::Data32(d) => crate::tablet::UsbId {
+                                    vid: (*d.get(0)?).try_into().ok()?,
+                                    pid: (*d.get(1)?).try_into().ok()?,
+                                },
+                                xinput::GetDevicePropertyItems::InvalidValue(_) => return None,
+                            })
+                        });
 
-                // Request the server give us access to this device's events.
-                // Not sure what this reply data is for.
-                let _ = self
-                    .conn
-                    .xinput_open_device(device.device_id)
-                    .unwrap()
-                    .reply()
-                    .unwrap();
-                self.open_devices.push(device.device_id);
+                    // We can also fetch device path here.
 
-                tool_listen_events.push(device.device_id);
-                self.tools.push(octotablet_info);
-                self.device_infos.insert(device.device_id, x11_info);
+                    let tablet = crate::tablet::Tablet {
+                        internal_id: super::InternalID::XInput2(device.device_id),
+                        name: raw_name,
+                        usb_id,
+                    };
+
+                    self.tablets.push(tablet);
+                }
             }
+
+            // If we got to this point, we accepted the device.
+            // Request the server give us access to this device's events.
+            // Not sure what this reply data is for.
+            let repl = self
+                .conn
+                .xinput_open_device(device.device_id)
+                .unwrap()
+                .reply()
+                .unwrap();
+            // Keep track so we can close it later!
+            self.open_devices.push(device.device_id);
+
+            // Enable event aspects. Why is this a different process than select events?
+            // Scientists are working day and night to find the answer.
+            let mut enable = Vec::<(u8, u8)>::new();
+            for class in repl.class_info {
+                const DEVICE_KEY_PRESS: u8 = 0;
+                const DEVICE_KEY_RELEASE: u8 = 1;
+                const DEVICE_BUTTON_PRESS: u8 = 0;
+                const DEVICE_BUTTON_RELEASE: u8 = 1;
+                const DEVICE_MOTION_NOTIFY: u8 = 0;
+                const DEVICE_FOCUS_IN: u8 = 0;
+                const DEVICE_FOCUS_OUT: u8 = 1;
+                const PROXIMITY_IN: u8 = 0;
+                const PROXIMITY_OUT: u8 = 1;
+                const DEVICE_STATE_NOTIFY: u8 = 0;
+                const DEVICE_MAPPING_NOTIFY: u8 = 1;
+                const CHANGE_DEVICE_NOTIFY: u8 = 2;
+                // Reverse engineered from Xinput.h, and xinput/test.c
+                // #define FindTypeAndClass(device,proximity_in_type,desired_event_mask,ProximityClass,offset) \
+                // FindTypeAndClass(device, proximity_in_type, desired_event_mask, ProximityClass, _proximityIn)
+                // == EXPANDED: ==
+                // {
+                //   int _i;
+                //   XInputClassInfo *_ip;
+                //   proximity_in_type = 0;
+                //   desired_event_mask = 0;
+                //   _i = 0;
+                //   _ip = ((XDevice *) device)->classes;
+                //   for (;_i< ((XDevice *) device)->num_classes; _i++, _ip++) {
+                //       if (_ip->input_class == ProximityClass) {
+                //           proximity_in_type = _ip->event_type_base + 0;
+                //           desired_event_mask = ((XDevice *) device)->device_id << 8 | proximity_in_type;
+                //       }
+                //   }
+                // }
+
+                // (base, offset)
+
+                match class.class_id {
+                    // Constants taken from XInput.h
+                    xinput::InputClass::PROXIMITY => {
+                        enable.extend_from_slice(&[
+                            (class.event_type_base, PROXIMITY_IN),
+                            (class.event_type_base, PROXIMITY_OUT),
+                        ]);
+                    }
+                    xinput::InputClass::BUTTON => {
+                        enable.extend_from_slice(&[
+                            (class.event_type_base, DEVICE_BUTTON_PRESS),
+                            (class.event_type_base, DEVICE_BUTTON_RELEASE),
+                        ]);
+                    }
+                    xinput::InputClass::FOCUS => {
+                        enable.extend_from_slice(&[
+                            (class.event_type_base, DEVICE_FOCUS_IN),
+                            (class.event_type_base, DEVICE_FOCUS_OUT),
+                        ]);
+                    }
+                    xinput::InputClass::OTHER => {
+                        enable.extend_from_slice(&[
+                            (class.event_type_base, DEVICE_STATE_NOTIFY),
+                            (class.event_type_base, DEVICE_MAPPING_NOTIFY),
+                            (class.event_type_base, CHANGE_DEVICE_NOTIFY),
+                            // PROPERTY_NOTIFY
+                        ]);
+                    }
+                    xinput::InputClass::VALUATOR => {
+                        enable.push((class.event_type_base, DEVICE_MOTION_NOTIFY));
+                    }
+                    _ => (),
+                }
+            }
+            let masks = enable
+                .into_iter()
+                .map(|(base, offset)| -> u32 {
+                    u32::from(device.device_id) << 8 | (u32::from(base) + u32::from(offset))
+                })
+                .collect::<Vec<_>>();
+
+            self.conn
+                .xinput_select_extension_event(self.window, &masks)
+                .unwrap()
+                .check()
+                .unwrap();
+            let status = self
+                .conn
+                .xinput_grab_device(
+                    self.window,
+                    NOW_MAGIC,
+                    x11rb::protocol::xproto::GrabMode::SYNC,
+                    x11rb::protocol::xproto::GrabMode::SYNC,
+                    false,
+                    device.device_id,
+                    &masks,
+                )
+                .unwrap()
+                .reply()
+                .unwrap()
+                .status;
+
+            println!("Grab {} - {:?}", device.device_id, status);
+        }
+
+        if !self.tools.is_empty() {
+            // So.... xinput doesn't have the same "Tablet owns pads and tools"
+            // hierarchy as we do. When we associate tools with tablets, we need a tablet
+            // to bind it to, but xinput does not necessarily provide one.
+
+            // Wacom tablets and the DECO-01 use a consistent naming scheme, where tools are called
+            // <Tablet name> {Pen, Eraser} (hardware id), which we can use to extract such information.
+            self.tablets.push(crate::tablet::Tablet {
+                internal_id: super::InternalID::XInput2(0),
+                name: Some("xinput master".to_owned()),
+                usb_id: None,
+            });
+        }
+
+        // Skip if nothing to enable. (Avoids server error)
+        if tool_listen_events.is_empty() {
+            return;
         }
 
         // Register with the server that we want to listen in on these events for all current devices:
@@ -746,16 +933,25 @@ impl Manager {
                 xinput::EventMask {
                     deviceid: id.into(),
                     mask: [
-                        // ..where is proximity?
-
                         // Cursor entering and leaving client area (doesn't work lol)
                         xinput::XIEventMask::ENTER
                         | xinput::XIEventMask::LEAVE
                         // Barrel and tip buttons
                         | xinput::XIEventMask::BUTTON_PRESS
                         | xinput::XIEventMask::BUTTON_RELEASE
+                        // Also enter and leave?
+                        | xinput::XIEventMask::FOCUS_IN
+                        | xinput::XIEventMask::FOCUS_OUT
+                        // No idea, doesn't send.
+                        | xinput::XIEventMask::BARRIER_HIT
+                        | xinput::XIEventMask::BARRIER_LEAVE
+                        // Sent when a master device is bound, and the device controlling it
+                        // changes (thus presenting a master with different classes)
+                        // | xinput::XIEventMask::DEVICE_CHANGED
+                        | xinput::XIEventMask::PROPERTY
                         // Axis movement
                         | xinput::XIEventMask::MOTION,
+                        // Proximity is implicit, i guess. I'm losing my mind.
                     ]
                     .into(),
                 }
@@ -783,11 +979,17 @@ impl super::PlatformImpl for Manager {
             use x11rb::protocol::Event;
             match event {
                 Event::XinputProximityIn(x) => {
-                    // never reported, :(
-                    println!("In");
+                    // x,device_id is total garbage? what did I do to deserve this fate.
+                    self.events.push(raw::Event::Tool {
+                        tool: *self.device_infos.keys().next().unwrap(),
+                        event: raw::ToolEvent::In { tablet: 0 },
+                    });
                 }
                 Event::XinputProximityOut(x) => {
-                    println!("Out");
+                    self.events.push(raw::Event::Tool {
+                        tool: *self.device_infos.keys().next().unwrap(),
+                        event: raw::ToolEvent::Out,
+                    });
                 }
                 // XinputDeviceButtonPress, ButtonPress, XinputRawButtonPress are red herrings.
                 // Dear X consortium... What the fuck?
@@ -814,20 +1016,12 @@ impl super::PlatformImpl for Manager {
                             if e.event_type == xinput::BUTTON_PRESS_EVENT {
                                 self.events.push(raw::Event::Tool {
                                     tool: device_id,
-                                    event: raw::ToolEvent::In { tablet: 0 },
-                                });
-                                self.events.push(raw::Event::Tool {
-                                    tool: device_id,
                                     event: raw::ToolEvent::Down,
                                 });
                             } else {
                                 self.events.push(raw::Event::Tool {
                                     tool: device_id,
                                     event: raw::ToolEvent::Up,
-                                });
-                                self.events.push(raw::Event::Tool {
-                                    tool: device_id,
-                                    event: raw::ToolEvent::Out,
                                 });
                             }
                         }
@@ -924,7 +1118,7 @@ impl super::PlatformImpl for Manager {
         super::RawEventsIter::XInput2(self.events.iter())
     }
     fn tablets(&self) -> &[crate::tablet::Tablet] {
-        std::slice::from_ref(&self.dummy_tablet)
+        &self.tablets
     }
     fn timestamp_granularity(&self) -> Option<std::time::Duration> {
         Some(std::time::Duration::from_millis(1))
