@@ -1,11 +1,772 @@
-pub type ID = ();
-pub type ButtonID = ();
+use crate::events::raw;
+use x11rb::{
+    connection::{Connection, RequestConnection},
+    protocol::{
+        xinput::{self, ConnectionExt},
+        xproto::ConnectionExt as _,
+    },
+};
 
-pub struct Manager;
+// Note: Device Product ID (286) property of tablets states USB vid and pid, and Device Node (285)
+// lists path. Impl that pleas. thanks Uwu
+
+const XI_ALL_DEVICES: u16 = 0;
+/// Magic timestamp signalling to the server "now".
+const NOW_MAGIC: x11rb::protocol::xproto::Timestamp = 0;
+// Strings are used to communicate the class of device, so we need a hueristic to
+// find devices we are interested in and a transformation to a more well-documented enum.
+// I Could not find a comprehensive guide to the strings used here.
+// (I am SURE I saw one at one point, but can't find it again.) So these are just
+// the ones I have access to in my testing.
+/// X "device_type" atom for [`crate::tablet`]s...
+const TYPE_TABLET: &str = "TABLET";
+/// .. [`crate::pad`]s...
+const TYPE_PAD: &str = "PAD";
+/// .. [`crate::pad`]s also ?!?!?...
+const TYPE_TOUCHPAD: &str = "TOUCHPAD";
+/// ..stylus tips..
+const TYPE_STYLUS: &str = "STYLUS";
+/// and erasers!
+const TYPE_ERASER: &str = "ERASER";
+// Type "xwayland-pointer" is used for xwayland mice, styluses, erasers and... *squint* ...keyboards?
+// The role could instead be parsed from it's user-facing device name:
+// "xwayland-tablet-pad:<some value of mystery importance>"
+// "xwayland-tablet eraser:<some value>" (note the hyphen becomes a space)
+// "xwayland-tablet stylus:<some value>"
+// Which is unfortunately a collapsed stream of all devices (similar to X's concept of a Master device)
+// and thus all per-device info (names, hardware IDs, capabilities) is lost in abstraction.
+const TYPE_XWAYLAND_POINTER: &str = "xwayland-pointer";
+
+const TYPE_MOUSE: &str = "MOUSE";
+const TYPE_TOUCHSCREEN: &str = "TOUCHSCREEN";
+
+/// Comes from `xinput_open_device`. Some APIs use u16. Confusing!
+pub type ID = u8;
+/// Comes from datasize of "button count" field of `ButtonInfo` - button names in xinput are indices,
+/// with the zeroth index referring to the tool "down" state.
+pub type ButtonID = std::num::NonZero<u16>;
+
+#[derive(Debug, Clone, Copy)]
+enum ValuatorAxis {
+    // Absolute position, in a normalized device space.
+    // AbsX,
+    // AbsY,
+    AbsPressure,
+    // Degrees, -,- left and away from user.
+    AbsTiltX,
+    AbsTiltY,
+    // This pad ring, degrees, and maybe also stylus scrollwheel? I have none to test,
+    // but under Xwayland this capability is listed for both pad and stylus.
+    AbsWheel,
+}
+impl std::str::FromStr for ValuatorAxis {
+    type Err = ();
+    fn from_str(axis_label: &str) -> Result<Self, Self::Err> {
+        Ok(match axis_label {
+            // "Abs X" => Self::AbsX,
+            // "Abs Y" => Self::AbsY,
+            "Abs Pressure" => Self::AbsPressure,
+            "Abs Tilt X" => Self::AbsTiltX,
+            "Abs Tilt Y" => Self::AbsTiltY,
+            "Abs Wheel" => Self::AbsWheel,
+            // My guess is the next one is roll axis, but I do
+            // not have a any devices that report this axis.
+            _ => return Err(()),
+        })
+    }
+}
+impl From<ValuatorAxis> for crate::axis::Axis {
+    fn from(value: ValuatorAxis) -> Self {
+        match value {
+            ValuatorAxis::AbsPressure => Self::Pressure,
+            ValuatorAxis::AbsTiltX | ValuatorAxis::AbsTiltY => Self::Tilt,
+            ValuatorAxis::AbsWheel => Self::Wheel,
+            //Self::AbsX | Self::AbsY => return None,
+        }
+    }
+}
+enum DeviceType {
+    Tool(crate::tool::Type),
+    Tablet,
+    Pad,
+}
+enum DeviceTypeOrXwayland {
+    Type(DeviceType),
+    /// Device type of xwayland-pointer doesn't tell us much, we must
+    /// also inspect the user-facing device name.
+    Xwayland,
+}
+impl std::str::FromStr for DeviceTypeOrXwayland {
+    type Err = ();
+    fn from_str(device_type: &str) -> Result<Self, Self::Err> {
+        use crate::tool::Type;
+        Ok(match device_type {
+            TYPE_STYLUS => Self::Type(DeviceType::Tool(Type::Pen)),
+            TYPE_ERASER => Self::Type(DeviceType::Tool(Type::Eraser)),
+            TYPE_PAD => Self::Type(DeviceType::Pad),
+            TYPE_TABLET => Self::Type(DeviceType::Tablet),
+            // TYPE_MOUSE => Self::Tool(Type::Mouse),
+            TYPE_XWAYLAND_POINTER => Self::Xwayland,
+            _ => return Err(()),
+        })
+    }
+}
+
+/// Parse the device name of an xwayland device, where the type is stored.
+/// Use if [`DeviceType`] parsing came back as `DeviceType::Xwayland`.
+fn xwayland_type_from_name(device_name: &str) -> Option<DeviceType> {
+    use crate::tool::Type;
+    let class = device_name.strip_prefix("xwayland-tablet")?;
+    // there is a numeric field at the end, unclear what it means.
+    // For me, it's *always* `:43`, /shrug!
+    let colon = class.rfind(':')?;
+    let class = &class[..colon];
+
+    Some(match class {
+        // Weird inconsistent prefix xP
+        "-pad" => DeviceType::Pad,
+        " stylus" => DeviceType::Tool(Type::Pen),
+        " eraser" => DeviceType::Tool(Type::Eraser),
+        _ => return None,
+    })
+}
+
+#[derive(Copy, Clone)]
+enum ToolName<'a> {
+    NameOnly(&'a str),
+    NameAndId(&'a str, crate::tool::HardwareID),
+}
+impl<'a> ToolName<'a> {
+    fn name(self) -> &'a str {
+        match self {
+            Self::NameAndId(name, _) | Self::NameOnly(name) => name,
+        }
+    }
+    fn id(self) -> Option<crate::tool::HardwareID> {
+        match self {
+            Self::NameAndId(_, id) => Some(id),
+            Self::NameOnly(_) => None,
+        }
+    }
+}
+
+/// From the user-facing Device name, try to parse a tool's hardware id.
+fn tool_id_from_name(name: &str) -> ToolName {
+    // X11 seems to place tool hardware IDs within the human-readable Name of the device, and this is
+    // the only place it is exposed. Predictably, as with all things X, this is not documented as far
+    // as I can tell. From experience, it consists of the name, a space, and a hex number (or zero)
+    // in parentheses - This is a hueristic and likely non-exhaustive, Bleh.
+
+    let try_parse = || -> Option<(&str, crate::tool::HardwareID)> {
+        // Detect the range of characters within the last set of parens.
+        let open_paren = name.rfind('(')?;
+        let after_open_paren = open_paren + 1;
+        // Find the close paren after the last open paren (weird change-of-base-address thing)
+        let close_paren = after_open_paren + name.get(after_open_paren..)?.find(')')?;
+
+        // Find the human-readable name content, minus the id field.
+        let name_text = name[..open_paren].trim_ascii_end();
+
+        // Find the id field.
+        // id_text is literal '0', or a hexadecimal number prefixed by literal '0x'
+        let id_text = &name[after_open_paren..close_paren];
+
+        let id_num = if id_text == "0" {
+            // Should this be considered "None"? The XP-PEN DECO-01 reports this value, despite (afaik)
+            // lacking a genuine hardware ID capability.
+            0
+        } else if let Some(id_text) = id_text.strip_prefix("0x") {
+            u64::from_str_radix(id_text, 16).ok()?
+        } else {
+            return None;
+        };
+
+        Some((name_text, crate::tool::HardwareID(id_num)))
+    };
+
+    if let Some((name, id)) = try_parse() {
+        ToolName::NameAndId(name, id)
+    } else {
+        ToolName::NameOnly(name)
+    }
+}
+/// Turn an xinput fixed-point number into a float, rounded.
+// I could probably keep them fixed for more maths, but this is easy for right now.
+fn fixed32_to_f32(fixed: xinput::Fp3232) -> f32 {
+    // Could bit-twiddle these into place instead, likely with more precision.
+    let integral = fixed.integral as f32;
+    let fractional = fixed.frac as f32 / u32::MAX as f32;
+
+    if fixed.integral.is_positive() {
+        integral + fractional
+    } else {
+        integral - fractional
+    }
+}
+/// Turn an xinput fixed-point number into a float, rounded.
+// I could probably keep them fixed for more maths, but this is easy for right now.
+fn fixed16_to_f32(fixed: i32) -> f32 {
+    (fixed as f32) / 65536.0
+}
+
+#[derive(Copy, Clone)]
+enum Transform {
+    BiasScale { bias: f32, scale: f32 },
+}
+impl Transform {
+    fn transform(&self, value: xinput::Fp3232) -> f32 {
+        let value = fixed32_to_f32(value);
+        match self {
+            Self::BiasScale { bias, scale } => (value + bias) * scale,
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+struct AxisInfo {
+    // Where in the valuator array is this?
+    index: u16,
+    // How to adapt the numeric value to octotablet's needs?
+    transform: Transform,
+}
+
+/// Contains the metadata for translating a device's events to octotablet events.
+struct ToolInfo {
+    pressure: Option<AxisInfo>,
+    tilt: [Option<AxisInfo>; 2],
+    wheel: Option<AxisInfo>,
+}
+impl ToolInfo {
+    fn axis_mut(&mut self, axis: ValuatorAxis) -> &mut Option<AxisInfo> {
+        match axis {
+            ValuatorAxis::AbsPressure => &mut self.pressure,
+            ValuatorAxis::AbsTiltX => &mut self.tilt[0],
+            ValuatorAxis::AbsTiltY => &mut self.tilt[1],
+            ValuatorAxis::AbsWheel => &mut self.wheel,
+        }
+    }
+}
+
+struct PadInfo {
+    ring: Option<AxisInfo>,
+}
+
+struct BitDiff {
+    bit_index: usize,
+    set: bool,
+}
+
+struct BitDifferenceIter<'a> {
+    from: &'a [u32],
+    to: &'a [u32],
+    // cursor position:
+    // Which bit within the u32?
+    next_bit_idx: u32,
+    // Which word within the array?
+    cur_word: usize,
+}
+impl<'a> BitDifferenceIter<'a> {
+    fn diff(from: &'a [u32], to: &'a [u32]) -> Self {
+        Self {
+            from,
+            to,
+            next_bit_idx: 0,
+            cur_word: 0,
+        }
+    }
+}
+impl Iterator for BitDifferenceIter<'_> {
+    type Item = BitDiff;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let to = self.to.get(self.cur_word)?;
+            let from = self.from.get(self.cur_word).copied().unwrap_or_default();
+            let diff = to ^ from;
+
+            // find the lowest set bit in the difference word.
+            let next_diff_idx = self.next_bit_idx + (diff >> self.next_bit_idx).trailing_zeros();
+
+            if next_diff_idx >= u32::BITS - 1 {
+                // Advance to the next word for next go around.
+                self.next_bit_idx = 0;
+                self.cur_word += 1;
+            } else {
+                // advance cursor regularly.
+                self.next_bit_idx = next_diff_idx + 1;
+            }
+            if next_diff_idx >= u32::BITS {
+                // No bit was set in this word, skip to next word.
+                continue;
+            }
+
+            // Check what the difference we just found was.
+            let became_set = (to >> next_diff_idx) & 1 == 1;
+
+            return Some(BitDiff {
+                bit_index: self.cur_word * u32::BITS as usize + next_diff_idx as usize,
+                set: became_set,
+            });
+        }
+    }
+}
+
+pub struct Manager {
+    conn: x11rb::rust_connection::RustConnection,
+    _xinput_minor_version: u16,
+    device_infos: std::collections::BTreeMap<ID, ToolInfo>,
+    open_devices: Vec<ID>,
+    tools: Vec<crate::tool::Tool>,
+    dummy_tablet: crate::tablet::Tablet,
+    events: Vec<crate::events::raw::Event<ID>>,
+    window: x11rb::protocol::xproto::Window,
+}
 
 impl Manager {
-    pub unsafe fn build_window(_opts: crate::Builder, _window: u64) -> Self {
-        Self
+    pub fn build_window(_opts: crate::Builder, window: std::num::NonZeroU32) -> Self {
+        let window = window.get();
+
+        let (conn, _screen) = x11rb::connect(None).unwrap();
+        // Check we have XInput2 and get it's version.
+        conn.extension_information(xinput::X11_EXTENSION_NAME)
+            .unwrap()
+            .unwrap();
+        let version = conn
+            // What the heck is "name"? it is totally undocumented and is not part of the XLib interface.
+            // I was unable to reverse engineer it, it seems to work regardless of what data is given to it.
+            .xinput_get_extension_version(b"Fixme!")
+            .unwrap()
+            .reply()
+            .unwrap();
+
+        assert!(version.present && version.server_major >= 2);
+
+        // conn.xinput_select_extension_event(
+        //     window,
+        //     // Some crazy logic involving the output of OpenDevice.
+        //     // /usr/include/X11/extensions/XInput.h has the macros that do the crime, however it seems nonportable to X11rb.
+        //     // https://www.x.org/archive/X11R6.8.2/doc/XGetSelectedExtensionEvents.3.html
+        //     &[u32::from(xinput::CHANGE_DEVICE_NOTIFY_EVENT)],
+        // )
+        // .unwrap()
+        // .check()
+        // .unwrap();
+        let hierarchy_interest = xinput::EventMask {
+            deviceid: XI_ALL_DEVICES,
+            mask: [
+                // device add/remove/enable/disable.
+                xinput::XIEventMask::HIERARCHY,
+            ]
+            .into(),
+        };
+
+        // Ask for notification of device added/removed/reassigned. This is done before
+        // enumeration to avoid TOCTOU bug, but now the bug is in the opposite direction-
+        // We could enumerate a device *and* recieve an added message for it, or get a removal
+        // message for devices we never met. Beware!
+        conn.xinput_xi_select_events(window, std::slice::from_ref(&hierarchy_interest))
+            .unwrap()
+            .check()
+            .unwrap();
+
+        // Testing with itty four button guy,
+        //   TABLET = "Wacom Intuos S Pen"
+        //   PAD = "Wacom Intuos S Pad"
+        //   STYLUS = "Wacom Intuos S Pen Pen (0x7802cf3)" (no that isn't a typo lmao)
+
+        // Fetch existing devices. It is important to do this after we requested to recieve `DEVICE_CHANGED` events,
+        // lest we run into TOCTOU bugs!
+        /*
+        let mut interest = vec![];
+        */
+
+        let devices = conn.xinput_list_input_devices().unwrap().reply().unwrap();
+        let mut flat_infos = &devices.infos[..];
+        for (name, device) in devices.names.iter().zip(devices.devices.iter()) {
+            let ty = if device.device_type != 0 {
+                let mut ty = conn
+                    .get_atom_name(device.device_type)
+                    .unwrap()
+                    .reply()
+                    .unwrap()
+                    .name;
+                ty.push(0);
+                std::ffi::CString::from_vec_with_nul(ty).ok()
+            } else {
+                None
+            };
+            if let Ok(name) = std::str::from_utf8(&name.name) {
+                println!("{name}");
+            } else {
+                println!("<Bad name>");
+            }
+            /*if ty.as_deref() == Some(TYPE_STYLUS) || ty.as_deref() == Some(TYPE_ERASER) {
+                println!("^^ Binding ^^");
+                //let _open = conn
+                //    .xinput_open_device(device.device_id)
+                //    .unwrap()
+                //    .reply()
+                //    .unwrap();
+                //interest.push(device.device_id);
+            }*/
+            println!(" {ty:?} - {device:?}");
+            // Take the infos for this device from the list.
+            let infos = {
+                let (head, tail) = flat_infos.split_at(usize::from(device.num_class_info));
+                flat_infos = tail;
+                head
+            };
+
+            for info in infos {
+                println!(" * {info:?}");
+            }
+        }
+        /*
+        let mut interest = interest
+            .into_iter()
+            .map(|id| {
+                xinput::EventMask {
+                    deviceid: id.into(),
+                    mask: [
+                        // Cursor entering and leaving client area
+                        xinput::XIEventMask::ENTER
+                    | xinput::XIEventMask::LEAVE
+                    // Barrel and tip buttons
+                    | xinput::XIEventMask::BUTTON_PRESS
+                    | xinput::XIEventMask::BUTTON_RELEASE
+                    // Axis movement
+                    | xinput::XIEventMask::MOTION,
+                    ]
+                    .into(),
+                }
+            })
+            .collect::<Vec<_>>();
+        interest.push(xinput::EventMask {
+            deviceid: 0,
+            mask: [
+                // Barrel and tip buttons
+                // device add/remove/capabilities changed.
+                xinput::XIEventMask::HIERARCHY,
+            ]
+            .into(),
+        });
+
+        // Register with the server that we want to listen in on these events for all current devices:
+        conn.xinput_xi_select_events(window, &interest)
+            .unwrap()
+            .check()
+            .unwrap();*/
+
+        // Future note for how to access core events, if needed.
+        // "XSelectInput" is just a wrapper over this, funny!
+        // https://github.com/mirror/libX11/blob/ff8706a5eae25b8bafce300527079f68a201d27f/src/SelInput.c#L33
+        conn.change_window_attributes(
+            window,
+            &x11rb::protocol::xproto::ChangeWindowAttributesAux {
+                event_mask: Some(x11rb::protocol::xproto::EventMask::NO_EVENT),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+
+        let mut this = Self {
+            conn,
+            _xinput_minor_version: version.server_minor,
+            device_infos: std::collections::BTreeMap::new(),
+            open_devices: vec![],
+            tools: vec![],
+            dummy_tablet: crate::tablet::Tablet {
+                internal_id: super::InternalID::XInput2(0),
+                name: None,
+                usb_id: None,
+            },
+            events: vec![],
+            window,
+        };
+
+        // Poll for devices.
+        this.repopulate();
+        this
+    }
+    /// Close bound devices and enumerate server devices. Generates user-facing info structs and emits
+    /// change events accordingly.
+    #[allow(clippy::too_many_lines)]
+    fn repopulate(&mut self) {
+        // Fixme, hehe
+        self.tools.clear();
+
+        for device in self.open_devices.drain(..) {
+            self.conn
+                .xinput_close_device(device)
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        // Tools ids to bulk-enable events on.
+        let mut tool_listen_events = vec![];
+
+        // Okay, this is weird. There are two very similar functions, xi_query_device and list_input_devices.
+        // The venne diagram of the data contained within their responses is nearly a circle, however each
+        // has subtle differences such that we need to query both and join the data. >~<;
+        let device_queries = self
+            .conn
+            .xinput_xi_query_device(XI_ALL_DEVICES)
+            .unwrap()
+            .reply()
+            .unwrap();
+
+        let device_list = self
+            .conn
+            .xinput_list_input_devices()
+            .unwrap()
+            .reply()
+            .unwrap();
+
+        // We recieve axis infos in a flat list, into which the individual devices refer.
+        // (mutable slice as we'll trim it as we consume)
+        let mut flat_infos = &device_list.infos[..];
+        // We also recieve name strings in a parallel list.
+        for (name, device) in device_list
+            .names
+            .into_iter()
+            .zip(device_list.devices.into_iter())
+        {
+            let _infos = {
+                // Split off however many axes this device claims.
+                let (infos, tail_infos) = flat_infos.split_at(device.num_class_info.into());
+                flat_infos = tail_infos;
+                infos
+            };
+            // Find the query that represents this device.
+            // Query and list contain very similar info, but both have tiny extra nuggets that we
+            // need.
+            let Some(query) = device_queries
+                .infos
+                .iter()
+                .find(|qdevice| qdevice.deviceid == u16::from(device.device_id))
+            else {
+                continue;
+            };
+
+            // Query the "type" atom, which will describe what this device actually is through some heuristics.
+            // We can't use the capabilities it advertises as our detection method, since a lot of them are
+            // nonsensical (pad reporting absolute x,y, pressure, etc - but it doesn't do anything!)
+            if device.device_type == 0 {
+                // None.
+                continue;
+            }
+            let Some(device_type) = self
+                .conn
+                // This is *not* cached. Should we? We expect a small set of valid values,
+                // but on the other hand this isn't exactly a hot path.
+                .get_atom_name(device.device_type)
+                .ok()
+                // Whew!
+                .and_then(|response| response.reply().ok())
+                .and_then(|atom| String::from_utf8(atom.name).ok())
+                .and_then(|type_stirng| type_stirng.parse::<DeviceTypeOrXwayland>().ok())
+            else {
+                continue;
+            };
+
+            // UTF8 human-readable device name, which encodes some additional info sometimes.
+            let raw_name = String::from_utf8(name.name).ok();
+
+            let device_type = match device_type {
+                DeviceTypeOrXwayland::Type(t) => t,
+                // Generic xwayland type, parse the device name to find type instead.
+                DeviceTypeOrXwayland::Xwayland => {
+                    let Some(ty) = raw_name.as_deref().and_then(xwayland_type_from_name) else {
+                        // Couldn't figure out what the device is..
+                        continue;
+                    };
+                    ty
+                }
+            };
+
+            // At this point, we're pretty sure this is a tool, pad, or tablet!
+
+            if let DeviceType::Tool(tool_type) = device_type {
+                // It's a tool! Parse all relevant infos.
+
+                // Try to parse the hardware ID from the name field.
+                let name_fields = raw_name.as_deref().map(tool_id_from_name);
+
+                let mut octotablet_info = crate::tool::Tool {
+                    internal_id: super::InternalID::XInput2(device.device_id),
+                    name: name_fields.map(ToolName::name).map(ToOwned::to_owned),
+                    hardware_id: name_fields.and_then(ToolName::id),
+                    wacom_id: None,
+                    tool_type: Some(tool_type),
+                    axes: crate::axis::FullInfo::default(),
+                };
+
+                let mut x11_info = ToolInfo {
+                    pressure: None,
+                    tilt: [None, None],
+                    wheel: None,
+                };
+
+                // Look for axes!
+                for class in &query.classes {
+                    if let Some(v) = class.data.as_valuator() {
+                        if v.mode != xinput::ValuatorMode::ABSOLUTE {
+                            continue;
+                        };
+                        // Weird case, that does happen in practice. :V
+                        if v.min == v.max {
+                            continue;
+                        }
+                        let Some(label) = self
+                            .conn
+                            .get_atom_name(v.label)
+                            .ok()
+                            .and_then(|response| response.reply().ok())
+                            .and_then(|atom| String::from_utf8(atom.name).ok())
+                            .and_then(|label| label.parse::<ValuatorAxis>().ok())
+                        else {
+                            continue;
+                        };
+
+                        let min = fixed32_to_f32(v.min);
+                        let max = fixed32_to_f32(v.max);
+
+                        match label {
+                            ValuatorAxis::AbsPressure => {
+                                // Scale and bias to [0,1].
+                                x11_info.pressure = Some(AxisInfo {
+                                    index: v.number,
+                                    transform: Transform::BiasScale {
+                                        bias: -min,
+                                        scale: 1.0 / (max - min),
+                                    },
+                                });
+                                octotablet_info.axes.pressure =
+                                    Some(crate::axis::NormalizedInfo { granularity: None });
+                            }
+                            ValuatorAxis::AbsTiltX => {
+                                // Seemingly always in degrees.
+                                let deg_to_rad = 1.0f32.to_radians();
+                                x11_info.tilt[0] = Some(AxisInfo {
+                                    index: v.number,
+                                    transform: Transform::BiasScale {
+                                        bias: 0.0,
+                                        scale: deg_to_rad,
+                                    },
+                                });
+
+                                let min = min.to_radians();
+                                let max = max.to_radians();
+
+                                let new_info = crate::axis::Info {
+                                    limits: Some(crate::axis::Limits {
+                                        min: min.to_radians(),
+                                        max: max.to_radians(),
+                                    }),
+                                    granularity: None,
+                                };
+
+                                // Set the limits, or if already set take the union of the limits.
+                                match &mut octotablet_info.axes.tilt {
+                                    slot @ None => *slot = Some(new_info),
+                                    Some(v) => match &mut v.limits {
+                                        slot @ None => *slot = new_info.limits,
+                                        Some(v) => {
+                                            v.max = v.max.max(max);
+                                            v.min = v.min.min(min);
+                                        }
+                                    },
+                                }
+                            }
+                            ValuatorAxis::AbsTiltY => {
+                                // Seemingly always in degrees.
+                                let deg_to_rad = 1.0f32.to_radians();
+                                x11_info.tilt[1] = Some(AxisInfo {
+                                    index: v.number,
+                                    transform: Transform::BiasScale {
+                                        bias: 0.0,
+                                        scale: deg_to_rad,
+                                    },
+                                });
+
+                                let min = min.to_radians();
+                                let max = max.to_radians();
+
+                                let new_info = crate::axis::Info {
+                                    limits: Some(crate::axis::Limits {
+                                        min: min.to_radians(),
+                                        max: max.to_radians(),
+                                    }),
+                                    granularity: None,
+                                };
+
+                                // Set the limits, or if already set take the union of the limits.
+                                match &mut octotablet_info.axes.tilt {
+                                    slot @ None => *slot = Some(new_info),
+                                    Some(v) => match &mut v.limits {
+                                        slot @ None => *slot = new_info.limits,
+                                        Some(v) => {
+                                            v.max = v.max.max(max);
+                                            v.min = v.min.min(min);
+                                        }
+                                    },
+                                }
+                            }
+                            ValuatorAxis::AbsWheel => {
+                                // uhh, i don't know. I have no hardware to test with.
+                            }
+                        }
+
+                        // Resolution is.. meaningless, I think. xwayland is the only server I have
+                        // seen that even bothers to fill it out, and even there it's weird.
+                    }
+                }
+
+                // Request the server give us access to this device's events.
+                // Not sure what this reply data is for.
+                let _ = self
+                    .conn
+                    .xinput_open_device(device.device_id)
+                    .unwrap()
+                    .reply()
+                    .unwrap();
+                self.open_devices.push(device.device_id);
+
+                tool_listen_events.push(device.device_id);
+                self.tools.push(octotablet_info);
+                self.device_infos.insert(device.device_id, x11_info);
+            }
+        }
+
+        // Register with the server that we want to listen in on these events for all current devices:
+        let interest = tool_listen_events
+            .into_iter()
+            .map(|id| {
+                xinput::EventMask {
+                    deviceid: id.into(),
+                    mask: [
+                        // ..where is proximity?
+
+                        // Cursor entering and leaving client area (doesn't work lol)
+                        xinput::XIEventMask::ENTER
+                        | xinput::XIEventMask::LEAVE
+                        // Barrel and tip buttons
+                        | xinput::XIEventMask::BUTTON_PRESS
+                        | xinput::XIEventMask::BUTTON_RELEASE
+                        // Axis movement
+                        | xinput::XIEventMask::MOTION,
+                    ]
+                    .into(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        self.conn
+            .xinput_xi_select_events(self.window, &interest)
+            .unwrap()
+            .check()
+            .unwrap();
     }
 }
 
@@ -13,19 +774,162 @@ impl super::PlatformImpl for Manager {
     fn pads(&self) -> &[crate::pad::Pad] {
         &[]
     }
+    #[allow(clippy::too_many_lines)]
     fn pump(&mut self) -> Result<(), crate::PumpError> {
+        self.events.clear();
+        let mut has_repopulated = false;
+
+        while let Ok(Some(event)) = self.conn.poll_for_event() {
+            use x11rb::protocol::Event;
+            match event {
+                Event::XinputProximityIn(x) => {
+                    // never reported, :(
+                    println!("In");
+                }
+                Event::XinputProximityOut(x) => {
+                    println!("Out");
+                }
+                // XinputDeviceButtonPress, ButtonPress, XinputRawButtonPress are red herrings.
+                // Dear X consortium... What the fuck?
+                Event::XinputButtonPress(e) | Event::XinputButtonRelease(e) => {
+                    if e.flags
+                        .intersects(xinput::PointerEventFlags::POINTER_EMULATED)
+                    {
+                        // Key press emulation from scroll wheel.
+                        continue;
+                    }
+                    let device_id = u8::try_from(e.deviceid).unwrap();
+                    if !self.device_infos.contains_key(&device_id) {
+                        continue;
+                    };
+
+                    let button_idx = u16::try_from(e.detail).unwrap();
+
+                    // Detail gives the "button index".
+                    match button_idx {
+                        // Doesn't occur, I don't think.
+                        0 => (),
+                        // Tip button
+                        1 => {
+                            if e.event_type == xinput::BUTTON_PRESS_EVENT {
+                                self.events.push(raw::Event::Tool {
+                                    tool: device_id,
+                                    event: raw::ToolEvent::In { tablet: 0 },
+                                });
+                                self.events.push(raw::Event::Tool {
+                                    tool: device_id,
+                                    event: raw::ToolEvent::Down,
+                                });
+                            } else {
+                                self.events.push(raw::Event::Tool {
+                                    tool: device_id,
+                                    event: raw::ToolEvent::Up,
+                                });
+                                self.events.push(raw::Event::Tool {
+                                    tool: device_id,
+                                    event: raw::ToolEvent::Out,
+                                });
+                            }
+                        }
+                        // Other (barrel) button.
+                        _ => {
+                            self.events.push(raw::Event::Tool {
+                                tool: device_id,
+                                event: raw::ToolEvent::Button {
+                                    button_id: crate::platform::ButtonID::XInput2(
+                                        // Already checked != 0
+                                        button_idx.try_into().unwrap(),
+                                    ),
+                                    pressed: e.event_type == xinput::BUTTON_PRESS_EVENT,
+                                },
+                            });
+                        }
+                    }
+                }
+                // Likewise, XinputMotion is a red herring. Grrr.
+                Event::XinputMotion(m) => {
+                    let mut try_uwu = || -> Option<()> {
+                        let device_id = m.deviceid.try_into().ok()?;
+                        let info = self.device_infos.get(&device_id)?;
+
+                        let valuator_fetch = |idx: u16| -> Option<xinput::Fp3232> {
+                            // Check that it's not masked out-
+                            let word_idx = idx / u32::BITS as u16;
+                            let bit_idx = idx % u32::BITS as u16;
+                            let word = m.valuator_mask.get(usize::from(word_idx))?;
+
+                            // This valuator did not report, value is undefined.
+                            if word & (1 << bit_idx as u32) == 0 {
+                                return None;
+                            }
+
+                            // Fetch it!
+                            m.axisvalues.get(usize::from(idx)).copied()
+                        };
+                        // Access valuators, and map them to our range for the associated axis.
+                        let pressure = info
+                            .pressure
+                            .and_then(|axis| {
+                                Some(axis.transform.transform(valuator_fetch(axis.index)?))
+                            })
+                            .and_then(crate::util::NicheF32::new_some)
+                            .unwrap_or(crate::util::NicheF32::NONE);
+                        let tilt_x = info.tilt[0].and_then(|axis| {
+                            Some(axis.transform.transform(valuator_fetch(axis.index)?))
+                        });
+                        let tilt_y = info.tilt[1].and_then(|axis| {
+                            Some(axis.transform.transform(valuator_fetch(axis.index)?))
+                        });
+
+                        self.events.push(raw::Event::Tool {
+                            tool: device_id,
+                            event: raw::ToolEvent::Pose(crate::axis::Pose {
+                                // Seems to already be in logical space.
+                                position: [fixed16_to_f32(m.event_x), fixed16_to_f32(m.event_y)],
+                                distance: crate::util::NicheF32::NONE,
+                                pressure,
+                                button_pressure: crate::util::NicheF32::NONE,
+                                tilt: match (tilt_x, tilt_y) {
+                                    (Some(x), Some(y)) => Some([x, y]),
+                                    (Some(x), None) => Some([x, 0.0]),
+                                    (None, Some(y)) => Some([0.0, y]),
+                                    (None, None) => None,
+                                },
+                                roll: crate::util::NicheF32::NONE,
+                                wheel: None,
+                                slider: crate::util::NicheF32::NONE,
+                                contact_size: None,
+                            }),
+                        });
+                        Some(())
+                    };
+                    if try_uwu().is_none() {
+                        println!("failed to fetch axes.");
+                    }
+                }
+                Event::XinputHierarchy(_) => {
+                    // The event does not necessarily reflect *all* changes, the spec specifically says
+                    // that the client should probably just rescan. lol
+                    if !has_repopulated {
+                        has_repopulated = true;
+                        self.repopulate();
+                    }
+                }
+                other => println!("Other: {other:?}"),
+            }
+        }
         Ok(())
     }
     fn raw_events(&self) -> super::RawEventsIter<'_> {
-        super::RawEventsIter::XInput2([].iter())
+        super::RawEventsIter::XInput2(self.events.iter())
     }
     fn tablets(&self) -> &[crate::tablet::Tablet] {
-        &[]
+        std::slice::from_ref(&self.dummy_tablet)
     }
     fn timestamp_granularity(&self) -> Option<std::time::Duration> {
-        None
+        Some(std::time::Duration::from_millis(1))
     }
     fn tools(&self) -> &[crate::tool::Tool] {
-        &[]
+        &self.tools
     }
 }
