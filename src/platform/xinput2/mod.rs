@@ -206,6 +206,7 @@ fn fixed32_to_f32(fixed: xinput::Fp3232) -> f32 {
 /// Turn an xinput fixed-point number into a float, rounded.
 // I could probably keep them fixed for more maths, but this is easy for right now.
 fn fixed16_to_f32(fixed: i32) -> f32 {
+    // Could bit-twiddle these into place instead, likely with more precision.
     (fixed as f32) / 65536.0
 }
 
@@ -214,11 +215,13 @@ enum Transform {
     BiasScale { bias: f32, scale: f32 },
 }
 impl Transform {
-    fn transform(&self, value: xinput::Fp3232) -> f32 {
-        let value = fixed32_to_f32(value);
+    fn transform(self, value: f32) -> f32 {
         match self {
             Self::BiasScale { bias, scale } => (value + bias) * scale,
         }
+    }
+    fn transform_fixed(self, value: xinput::Fp3232) -> f32 {
+        self.transform(fixed32_to_f32(value))
     }
 }
 
@@ -235,16 +238,11 @@ struct ToolInfo {
     pressure: Option<AxisInfo>,
     tilt: [Option<AxisInfo>; 2],
     wheel: Option<AxisInfo>,
-}
-impl ToolInfo {
-    fn axis_mut(&mut self, axis: ValuatorAxis) -> &mut Option<AxisInfo> {
-        match axis {
-            ValuatorAxis::AbsPressure => &mut self.pressure,
-            ValuatorAxis::AbsTiltX => &mut self.tilt[0],
-            ValuatorAxis::AbsTiltY => &mut self.tilt[1],
-            ValuatorAxis::AbsWheel => &mut self.wheel,
-        }
-    }
+    /// The tablet this tool belongs to, based on heuristics.
+    /// When "In" is fired, this is the device to reference, because X doesn't provide
+    /// such info. If none, uses a dummy tablet.
+    /// (tool -> tablet relationship is one-to-one-or-less in xinput instead of one-to-one-or-more as we expect)
+    tablet: Option<ID>,
 }
 
 struct PadInfo {
@@ -313,9 +311,11 @@ impl Iterator for BitDifferenceIter<'_> {
 pub struct Manager {
     conn: x11rb::rust_connection::RustConnection,
     _xinput_minor_version: u16,
-    device_infos: std::collections::BTreeMap<ID, ToolInfo>,
+    tool_infos: std::collections::BTreeMap<ID, ToolInfo>,
     open_devices: Vec<ID>,
     tools: Vec<crate::tool::Tool>,
+    pad_infos: std::collections::BTreeMap<ID, PadInfo>,
+    pads: Vec<crate::pad::Pad>,
     tablets: Vec<crate::tablet::Tablet>,
     events: Vec<crate::events::raw::Event<ID>>,
     window: x11rb::protocol::xproto::Window,
@@ -486,9 +486,11 @@ impl Manager {
         let mut this = Self {
             conn,
             _xinput_minor_version: version.server_minor,
-            device_infos: std::collections::BTreeMap::new(),
+            tool_infos: std::collections::BTreeMap::new(),
+            pad_infos: std::collections::BTreeMap::new(),
             open_devices: vec![],
             tools: vec![],
+            pads: vec![],
             events: vec![],
             tablets: vec![],
             window,
@@ -508,6 +510,8 @@ impl Manager {
         // report adds/removes.
         self.tools.clear();
         self.tablets.clear();
+        self.tool_infos.clear();
+        self.pad_infos.clear();
 
         for device in self.open_devices.drain(..) {
             self.conn
@@ -620,6 +624,7 @@ impl Manager {
                         pressure: None,
                         tilt: [None, None],
                         wheel: None,
+                        tablet: None,
                     };
 
                     // Look for axes!
@@ -739,10 +744,79 @@ impl Manager {
 
                     tool_listen_events.push(device.device_id);
                     self.tools.push(octotablet_info);
-                    self.device_infos.insert(device.device_id, x11_info);
+                    self.tool_infos.insert(device.device_id, x11_info);
                 }
                 DeviceType::Pad => {
-                    continue;
+                    let mut buttons = 0;
+                    let mut ring_info = None;
+                    for class in &query.classes {
+                        match &class.data {
+                            xinput::DeviceClassData::Button(b) => {
+                                buttons = b.num_buttons();
+                            }
+                            xinput::DeviceClassData::Valuator(v) => {
+                                // Look for and bind an "Abs Wheel" which is our ring.
+                                if v.mode != xinput::ValuatorMode::ABSOLUTE {
+                                    continue;
+                                }
+                                let Some(label) = self
+                                    .conn
+                                    .get_atom_name(v.label)
+                                    .ok()
+                                    .and_then(|response| response.reply().ok())
+                                    .and_then(|atom| String::from_utf8(atom.name).ok())
+                                    .and_then(|label| label.parse::<ValuatorAxis>().ok())
+                                else {
+                                    continue;
+                                };
+                                if matches!(label, ValuatorAxis::AbsWheel) {
+                                    // Remap to [0, TAU], clockwise from logical north.
+                                    if v.min == v.max {
+                                        continue;
+                                    }
+                                    let min = fixed32_to_f32(v.min);
+                                    let max = fixed32_to_f32(v.max);
+                                    ring_info = Some(AxisInfo {
+                                        index: v.number,
+                                        transform: Transform::BiasScale {
+                                            bias: -min,
+                                            scale: std::f32::consts::TAU / (max - min),
+                                        },
+                                    });
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                    if buttons == 0 && ring_info.is_none() {
+                        // This pad has no functionality for us.
+                        continue;
+                    }
+
+                    let mut rings = vec![];
+                    if ring_info.is_some() {
+                        rings.push(crate::pad::Ring {
+                            granularity: None,
+                            internal_id: crate::platform::InternalID::XInput2(device.device_id),
+                        });
+                    };
+                    // X11 has no concept of groups (i don't .. think?)
+                    // So make a single group that owns everything.
+                    let group = crate::pad::Group {
+                        buttons: (0..buttons).map(Into::into).collect::<Vec<_>>(),
+                        feedback: None,
+                        internal_id: crate::platform::InternalID::XInput2(device.device_id),
+                        mode_count: None,
+                        rings,
+                        strips: vec![],
+                    };
+                    self.pads.push(crate::pad::Pad {
+                        internal_id: crate::platform::InternalID::XInput2(device.device_id),
+                        total_buttons: buttons.into(),
+                        groups: vec![group],
+                    });
+                    self.pad_infos
+                        .insert(device.device_id, PadInfo { ring: ring_info });
                 }
                 DeviceType::Tablet => {
                     // Tablets are of... dubious usefulness in xinput?
@@ -873,6 +947,12 @@ impl Manager {
                     xinput::InputClass::VALUATOR => {
                         enable.push((class.event_type_base, DEVICE_MOTION_NOTIFY));
                     }
+                    xinput::InputClass::KEY => {
+                        enable.extend_from_slice(&[
+                            (class.event_type_base, DEVICE_KEY_PRESS),
+                            (class.event_type_base, DEVICE_KEY_RELEASE),
+                        ]);
+                    }
                     _ => (),
                 }
             }
@@ -888,7 +968,7 @@ impl Manager {
                 .unwrap()
                 .check()
                 .unwrap();
-            let status = self
+            /*let status = self
                 .conn
                 .xinput_grab_device(
                     self.window,
@@ -904,7 +984,7 @@ impl Manager {
                 .unwrap()
                 .status;
 
-            println!("Grab {} - {:?}", device.device_id, status);
+            println!("Grab {} - {:?}", device.device_id, status);*/
         }
 
         if !self.tools.is_empty() {
@@ -967,9 +1047,6 @@ impl Manager {
 }
 
 impl super::PlatformImpl for Manager {
-    fn pads(&self) -> &[crate::pad::Pad] {
-        &[]
-    }
     #[allow(clippy::too_many_lines)]
     fn pump(&mut self) -> Result<(), crate::PumpError> {
         self.events.clear();
@@ -979,21 +1056,22 @@ impl super::PlatformImpl for Manager {
             use x11rb::protocol::Event;
             match event {
                 Event::XinputProximityIn(x) => {
-                    // x,device_id is total garbage? what did I do to deserve this fate.
+                    // x,device_id is total garbage? what did I do to deserve this fate.-
                     self.events.push(raw::Event::Tool {
-                        tool: *self.device_infos.keys().next().unwrap(),
+                        tool: *self.tool_infos.keys().next().unwrap(),
                         event: raw::ToolEvent::In { tablet: 0 },
                     });
                 }
                 Event::XinputProximityOut(x) => {
                     self.events.push(raw::Event::Tool {
-                        tool: *self.device_infos.keys().next().unwrap(),
+                        tool: *self.tool_infos.keys().next().unwrap(),
                         event: raw::ToolEvent::Out,
                     });
                 }
                 // XinputDeviceButtonPress, ButtonPress, XinputRawButtonPress are red herrings.
                 // Dear X consortium... What the fuck?
                 Event::XinputButtonPress(e) | Event::XinputButtonRelease(e) => {
+                    // Tool buttons.
                     if e.flags
                         .intersects(xinput::PointerEventFlags::POINTER_EMULATED)
                     {
@@ -1001,7 +1079,7 @@ impl super::PlatformImpl for Manager {
                         continue;
                     }
                     let device_id = u8::try_from(e.deviceid).unwrap();
-                    if !self.device_infos.contains_key(&device_id) {
+                    if !self.tool_infos.contains_key(&device_id) {
                         continue;
                     };
 
@@ -1040,11 +1118,10 @@ impl super::PlatformImpl for Manager {
                         }
                     }
                 }
-                // Likewise, XinputMotion is a red herring. Grrr.
                 Event::XinputMotion(m) => {
+                    // Tool valuators.
                     let mut try_uwu = || -> Option<()> {
                         let device_id = m.deviceid.try_into().ok()?;
-                        let info = self.device_infos.get(&device_id)?;
 
                         let valuator_fetch = |idx: u16| -> Option<xinput::Fp3232> {
                             // Check that it's not masked out-
@@ -1060,19 +1137,20 @@ impl super::PlatformImpl for Manager {
                             // Fetch it!
                             m.axisvalues.get(usize::from(idx)).copied()
                         };
+                        let tool_info = self.tool_infos.get(&device_id)?;
                         // Access valuators, and map them to our range for the associated axis.
-                        let pressure = info
+                        let pressure = tool_info
                             .pressure
                             .and_then(|axis| {
-                                Some(axis.transform.transform(valuator_fetch(axis.index)?))
+                                Some(axis.transform.transform_fixed(valuator_fetch(axis.index)?))
                             })
                             .and_then(crate::util::NicheF32::new_some)
                             .unwrap_or(crate::util::NicheF32::NONE);
-                        let tilt_x = info.tilt[0].and_then(|axis| {
-                            Some(axis.transform.transform(valuator_fetch(axis.index)?))
+                        let tilt_x = tool_info.tilt[0].and_then(|axis| {
+                            Some(axis.transform.transform_fixed(valuator_fetch(axis.index)?))
                         });
-                        let tilt_y = info.tilt[1].and_then(|axis| {
-                            Some(axis.transform.transform(valuator_fetch(axis.index)?))
+                        let tilt_y = tool_info.tilt[1].and_then(|axis| {
+                            Some(axis.transform.transform_fixed(valuator_fetch(axis.index)?))
                         });
 
                         self.events.push(raw::Event::Tool {
@@ -1101,6 +1179,82 @@ impl super::PlatformImpl for Manager {
                         println!("failed to fetch axes.");
                     }
                 }
+                Event::XinputDeviceValuator(m) => {
+                    // Pad valuators. Instead of the arbtrary number of valuators that the tools
+                    // are sent, this sends in groups of six. Ignore all of them except the packet that
+                    // contains our ring value.
+
+                    if let Some(pad_info) = self.pad_infos.get(&m.device_id) {
+                        let Some(ring_info) = pad_info.ring else {
+                            continue;
+                        };
+                        let absolute_ring_index = ring_info.index;
+                        let Some(relative_ring_indox) =
+                            absolute_ring_index.checked_sub(u16::from(m.first_valuator))
+                        else {
+                            continue;
+                        };
+                        if relative_ring_indox >= m.num_valuators.into() {
+                            continue;
+                        }
+
+                        let Some(&valuator_value) =
+                            m.valuators.get(usize::from(relative_ring_indox))
+                        else {
+                            continue;
+                        };
+
+                        if valuator_value == 0 {
+                            // On release, this is snapped back to zero, but zero is also a valid value. There does not
+                            // seem to be a method of checking when the interaction ended to avoid this.
+
+                            // Snapping back to zero makes this entirely useless for knob control (which is the primary
+                            // purpose of the ring) so we take this little loss.
+                            continue;
+                        }
+
+                        self.events.push(raw::Event::Pad {
+                            pad: m.device_id,
+                            event: raw::PadEvent::Group {
+                                group: m.device_id,
+                                event: raw::PadGroupEvent::Ring {
+                                    ring: m.device_id,
+                                    event: crate::events::TouchStripEvent::Pose(
+                                        ring_info.transform.transform(valuator_value as f32),
+                                    ),
+                                },
+                            },
+                        });
+                    }
+                }
+                Event::XinputDeviceButtonPress(e) | Event::XinputDeviceButtonRelease(e) => {
+                    // Pad buttons.
+                    let Some(pad) = self
+                        .pads
+                        .iter()
+                        .find(|pad| *pad.internal_id.unwrap_xinput2() == e.device_id)
+                    else {
+                        continue;
+                    };
+
+                    let button_idx = u32::from(e.detail);
+                    if button_idx == 0 || pad.total_buttons < button_idx {
+                        // Okay, there's a weird off-by-one here, that even throws off the `xinput` debug
+                        // utility. My Intuos Pro S reports 11 buttons, but the maximum button index is.... 11,
+                        // which is clearly invalid. Silly.
+                        // I interpret this as it actually being [1, max_button] instead of [0, max_button)
+                        continue;
+                    }
+
+                    self.events.push(raw::Event::Pad {
+                        pad: e.device_id,
+                        event: raw::PadEvent::Button {
+                            // Shift 1-based to 0-based indexing.
+                            button_idx: button_idx - 1,
+                            pressed: e.response_type == 69,
+                        },
+                    });
+                }
                 Event::XinputHierarchy(_) => {
                     // The event does not necessarily reflect *all* changes, the spec specifically says
                     // that the client should probably just rescan. lol
@@ -1110,6 +1264,7 @@ impl super::PlatformImpl for Manager {
                     }
                 }
                 other => println!("Other: {other:?}"),
+                //_ => (),
             }
         }
         Ok(())
@@ -1119,6 +1274,9 @@ impl super::PlatformImpl for Manager {
     }
     fn tablets(&self) -> &[crate::tablet::Tablet] {
         &self.tablets
+    }
+    fn pads(&self) -> &[crate::pad::Pad] {
+        &self.pads
     }
     fn timestamp_granularity(&self) -> Option<std::time::Duration> {
         Some(std::time::Duration::from_millis(1))
