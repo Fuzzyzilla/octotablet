@@ -159,6 +159,7 @@ impl Painter {
                     }
                     // Positioning data, continue drawing!
                     ToolEvent::Pose(mut pose) => {
+                        println!("{:?} - x {}", tool.name, pose.position[0]);
                         // If there's a painter, paint on it!
                         // If not, we haven't hit the `Down` event yet.
                         if let Some(painter) = self.tools.get_mut(&tool.id()) {
@@ -215,10 +216,12 @@ fn main() {
     let softbuffer = softbuffer::Context::new(window.as_ref()).expect("init softbuffer");
     let mut surface =
         softbuffer::Surface::new(&softbuffer, &window).expect("make presentation surface");
-    surface.resize(
-        window.inner_size().width.try_into().unwrap(),
-        window.inner_size().height.try_into().unwrap(),
-    );
+    surface
+        .resize(
+            window.inner_size().width.try_into().unwrap(),
+            window.inner_size().height.try_into().unwrap(),
+        )
+        .unwrap();
 
     // Fetch the tablets, using our window's handle for access.
     // Since we `Arc'd` our window, we get the safety of `build_shared`. Where this is not possible,
