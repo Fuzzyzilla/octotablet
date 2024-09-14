@@ -43,6 +43,8 @@ const EMULATED_TABLET_NAME: &str = "octotablet emulated";
 const TYPE_MOUSE: &str = "MOUSE";
 const TYPE_TOUCHSCREEN: &str = "TOUCHSCREEN";
 
+const DUMMY_TABLET_ID: u8 = 0;
+
 /// Comes from `xinput_open_device`. Some APIs use u16. Confusing!
 pub type ID = u8;
 /// Comes from datasize of "button count" field of `ButtonInfo` - button names in xinput are indices,
@@ -135,32 +137,36 @@ fn xwayland_type_from_name(device_name: &str) -> Option<DeviceType> {
 }
 
 #[derive(Copy, Clone)]
-enum ToolName<'a> {
-    NameOnly(&'a str),
-    NameAndId(&'a str, crate::tool::HardwareID),
+struct ToolName<'a> {
+    /// The friendly form of the name, minus ID code.
+    human_readable: &'a str,
+    /// The tablet name we expect to own this tool
+    maybe_associated_tablet: Option<&'a str>,
+    /// The hardware serial of the tool.
+    id: Option<crate::tool::HardwareID>,
 }
 impl<'a> ToolName<'a> {
-    fn name(self) -> &'a str {
-        match self {
-            Self::NameAndId(name, _) | Self::NameOnly(name) => name,
-        }
+    fn human_readable(self) -> &'a str {
+        self.human_readable
     }
     fn id(self) -> Option<crate::tool::HardwareID> {
-        match self {
-            Self::NameAndId(_, id) => Some(id),
-            Self::NameOnly(_) => None,
-        }
+        self.id
+    }
+    fn maybe_associated_tablet(self) -> Option<&'a str> {
+        self.maybe_associated_tablet
     }
 }
 
-/// From the user-facing Device name, try to parse a tool's hardware id.
-fn tool_id_from_name(name: &str) -> ToolName {
+/// From the user-facing Device name, try to parse several tool fields.
+fn parse_tool_name(name: &str) -> ToolName {
     // X11 seems to place tool hardware IDs within the human-readable Name of the device, and this is
     // the only place it is exposed. Predictably, as with all things X, this is not documented as far
-    // as I can tell. From experience, it consists of the name, a space, and a hex number (or zero)
-    // in parentheses - This is a hueristic and likely non-exhaustive, Bleh.
+    // as I can tell.
 
-    let try_parse = || -> Option<(&str, crate::tool::HardwareID)> {
+    // From experiments, it consists of the [tablet name]<space>[tool type string]<space>[hex number (or zero)
+    // in parentheses] - This is a hueristic and likely non-exhaustive, for example it does not apply to xwayland.
+
+    let try_parse_id = || -> Option<(&str, crate::tool::HardwareID)> {
         // Detect the range of characters within the last set of parens.
         let open_paren = name.rfind('(')?;
         let after_open_paren = open_paren + 1;
@@ -187,11 +193,35 @@ fn tool_id_from_name(name: &str) -> ToolName {
         Some((name_text, crate::tool::HardwareID(id_num)))
     };
 
-    if let Some((name, id)) = try_parse() {
-        ToolName::NameAndId(name, id)
-    } else {
-        ToolName::NameOnly(name)
+    let id_parse_result = try_parse_id();
+
+    let (human_readable, id) = match id_parse_result {
+        Some((name, id)) => (name, Some(id)),
+        None => (name, None),
+    };
+
+    let try_parse_maybe_associated_tablet = || -> Option<&str> {
+        // Hueristic, of course. These are the only two kinds of hardware I have to test with,
+        // unsure how e.g. an airbrush would register.
+        if let Some(tablet_name) = human_readable.strip_suffix(" Pen") {
+            return Some(tablet_name);
+        }
+        if let Some(tablet_name) = human_readable.strip_suffix(" Eraser") {
+            return Some(tablet_name);
+        }
+        None
+    };
+
+    ToolName {
+        human_readable,
+        maybe_associated_tablet: try_parse_maybe_associated_tablet(),
+        id,
     }
+}
+fn pad_maybe_associated_tablet(name: &str) -> Option<String> {
+    // Hueristic, of course.
+    name.strip_suffix(" Pad")
+        .map(|prefix| prefix.to_owned() + " Pen")
 }
 /// Turn an xinput fixed-point number into a float, rounded.
 // I could probably keep them fixed for more maths, but this is easy for right now.
@@ -244,7 +274,8 @@ enum Phase {
     Out,
 }
 
-/// Contains the metadata for translating a device's events to octotablet events.
+/// Contains the metadata for translating a device's events to octotablet events,
+/// as well as the x11 specific state required to emulate certain events.
 struct ToolInfo {
     pressure: Option<AxisInfo>,
     tilt: [Option<AxisInfo>; 2],
@@ -257,11 +288,19 @@ struct ToolInfo {
     phase: Phase,
     /// The master cursor. Grab this device when this cursor Enters, release it when it
     /// leaves.
-    master: u16,
+    master_pointer: u16,
+    /// The master keyboard associated with the master pointer.
+    master_keyboard: u16,
+    is_grabbed: bool,
+    // A change has occured on this pump that requires a frame event at this time.
+    // (pose, button, enter, ect)
+    frame_pending: Option<Timestamp>,
 }
 
 struct PadInfo {
     ring: Option<AxisInfo>,
+    /// The tablet this tool belongs to, based on heuristics.
+    tablet: Option<ID>,
 }
 
 struct BitDiff {
@@ -330,7 +369,6 @@ struct OpenDevice {
 
 pub struct Manager {
     conn: x11rb::rust_connection::RustConnection,
-    _xinput_minor_version: u16,
     tool_infos: std::collections::BTreeMap<ID, ToolInfo>,
     open_devices: Vec<OpenDevice>,
     tools: Vec<crate::tool::Tool>,
@@ -341,6 +379,8 @@ pub struct Manager {
     window: x11rb::protocol::xproto::Window,
     atom_usb_id: Option<std::num::NonZero<x11rb::protocol::xproto::Atom>>,
     atom_device_node: Option<std::num::NonZero<x11rb::protocol::xproto::Atom>>,
+    // What is the most recent event timecode?
+    server_time: Timestamp,
 }
 
 impl Manager {
@@ -352,15 +392,16 @@ impl Manager {
         conn.extension_information(xinput::X11_EXTENSION_NAME)
             .unwrap()
             .unwrap();
-        let version = conn
-            // What the heck is "name"? it is totally undocumented and is not part of the XLib interface.
-            // I was unable to reverse engineer it, it seems to work regardless of what data is given to it.
-            .xinput_get_extension_version(b"Fixme!")
-            .unwrap()
-            .reply()
-            .unwrap();
+        /*let version = conn
+        // What the heck is "name"? it is totally undocumented and is not part of the XLib interface.
+        // I was unable to reverse engineer it, it seems to work regardless of what data is given to it.
+        .xinput_get_extension_version(b"Fixme!")
+        .unwrap()
+        .reply()
+        .unwrap();*/
+        let version = conn.xinput_xi_query_version(2, 2).unwrap().reply().unwrap();
 
-        assert!(version.present && version.server_major >= 2);
+        assert!(version.major_version >= 2);
 
         // conn.xinput_select_extension_event(
         //     window,
@@ -390,98 +431,10 @@ impl Manager {
             .check()
             .unwrap();
 
-        // Testing with itty four button guy,
-        //   TABLET = "Wacom Intuos S Pen"
-        //   PAD = "Wacom Intuos S Pad"
-        //   STYLUS = "Wacom Intuos S Pen Pen (0x7802cf3)" (no that isn't a typo lmao)
-
-        // Fetch existing devices. It is important to do this after we requested to recieve `DEVICE_CHANGED` events,
-        // lest we run into TOCTOU bugs!
-        /*
-        let mut interest = vec![];
-        */
-
-        let devices = conn.xinput_list_input_devices().unwrap().reply().unwrap();
-        let mut flat_infos = &devices.infos[..];
-        for (name, device) in devices.names.iter().zip(devices.devices.iter()) {
-            let ty = if device.device_type != 0 {
-                let mut ty = conn
-                    .get_atom_name(device.device_type)
-                    .unwrap()
-                    .reply()
-                    .unwrap()
-                    .name;
-                ty.push(0);
-                std::ffi::CString::from_vec_with_nul(ty).ok()
-            } else {
-                None
-            };
-            if let Ok(name) = std::str::from_utf8(&name.name) {
-                println!("{} - {name}", device.device_id);
-            } else {
-                println!("<Bad name>");
-            }
-            /*if ty.as_deref() == Some(TYPE_STYLUS) || ty.as_deref() == Some(TYPE_ERASER) {
-                println!("^^ Binding ^^");
-                //let _open = conn
-                //    .xinput_open_device(device.device_id)
-                //    .unwrap()
-                //    .reply()
-                //    .unwrap();
-                //interest.push(device.device_id);
-            }*/
-            println!(" {ty:?} - {device:?}");
-            // Take the infos for this device from the list.
-            let infos = {
-                let (head, tail) = flat_infos.split_at(usize::from(device.num_class_info));
-                flat_infos = tail;
-                head
-            };
-
-            for info in infos {
-                println!(" * {info:?}");
-            }
-        }
-        /*
-        let mut interest = interest
-            .into_iter()
-            .map(|id| {
-                xinput::EventMask {
-                    deviceid: id.into(),
-                    mask: [
-                        // Cursor entering and leaving client area
-                        xinput::XIEventMask::ENTER
-                    | xinput::XIEventMask::LEAVE
-                    // Barrel and tip buttons
-                    | xinput::XIEventMask::BUTTON_PRESS
-                    | xinput::XIEventMask::BUTTON_RELEASE
-                    // Axis movement
-                    | xinput::XIEventMask::MOTION,
-                    ]
-                    .into(),
-                }
-            })
-            .collect::<Vec<_>>();
-        interest.push(xinput::EventMask {
-            deviceid: 0,
-            mask: [
-                // Barrel and tip buttons
-                // device add/remove/capabilities changed.
-                xinput::XIEventMask::HIERARCHY,
-            ]
-            .into(),
-        });
-
-        // Register with the server that we want to listen in on these events for all current devices:
-        conn.xinput_xi_select_events(window, &interest)
-            .unwrap()
-            .check()
-            .unwrap();*/
-
         // Future note for how to access core events, if needed.
         // "XSelectInput" is just a wrapper over this, funny!
         // https://github.com/mirror/libX11/blob/ff8706a5eae25b8bafce300527079f68a201d27f/src/SelInput.c#L33
-        conn.change_window_attributes(
+        /*conn.change_window_attributes(
             window,
             &x11rb::protocol::xproto::ChangeWindowAttributesAux {
                 event_mask: Some(x11rb::protocol::xproto::EventMask::NO_EVENT),
@@ -490,7 +443,7 @@ impl Manager {
         )
         .unwrap()
         .check()
-        .unwrap();
+        .unwrap();*/
 
         let atom_usb_id = conn
             .intern_atom(false, b"Device Product ID")
@@ -505,7 +458,6 @@ impl Manager {
 
         let mut this = Self {
             conn,
-            _xinput_minor_version: version.server_minor,
             tool_infos: std::collections::BTreeMap::new(),
             pad_infos: std::collections::BTreeMap::new(),
             open_devices: vec![],
@@ -516,6 +468,7 @@ impl Manager {
             window,
             atom_device_node,
             atom_usb_id,
+            server_time: 0,
         };
 
         // Poll for devices.
@@ -641,11 +594,24 @@ impl Manager {
                     }
 
                     // Try to parse the hardware ID from the name field.
-                    let name_fields = raw_name.as_deref().map(tool_id_from_name);
+                    let name_fields = raw_name.as_deref().map(parse_tool_name);
+
+                    let tablet_id = name_fields
+                        .and_then(ToolName::maybe_associated_tablet)
+                        .and_then(|expected| {
+                            // Find the device with the expected name, and return it's ID if found.
+                            let tablet_info = device_queries
+                                .infos
+                                .iter()
+                                .find(|info| info.name == expected.as_bytes())?;
+                            Some(tablet_info.deviceid.try_into().unwrap())
+                        });
 
                     let mut octotablet_info = crate::tool::Tool {
                         internal_id: super::InternalID::XInput2(device.device_id),
-                        name: name_fields.map(ToolName::name).map(ToOwned::to_owned),
+                        name: name_fields
+                            .map(ToolName::human_readable)
+                            .map(ToOwned::to_owned),
                         hardware_id: name_fields.and_then(ToolName::id),
                         wacom_id: None,
                         tool_type: Some(ty),
@@ -656,9 +622,26 @@ impl Manager {
                         pressure: None,
                         tilt: [None, None],
                         wheel: None,
-                        tablet: None,
+                        tablet: tablet_id,
                         phase: Phase::Out,
-                        master: query.attachment,
+                        master_pointer: query.attachment,
+                        master_keyboard: device_queries
+                            .infos
+                            .iter()
+                            .find_map(|q| {
+                                // Find the info for the master pointer
+                                if q.deviceid == query.attachment {
+                                    // Look at the master pointer's attachment,
+                                    // which is the associated master keyboard's ID.
+                                    Some(q.attachment)
+                                } else {
+                                    None
+                                }
+                            })
+                            // Above search should be infallible but I trust nothing at this point.
+                            .unwrap_or_default(),
+                        is_grabbed: false,
+                        frame_pending: None,
                     };
 
                     // Look for axes!
@@ -793,6 +776,8 @@ impl Manager {
                                 if v.mode != xinput::ValuatorMode::ABSOLUTE {
                                     continue;
                                 }
+                                // This fails to detect xwayland's Ring axis, since it is present but not labeled.
+                                // However, in my testing, it's borked anyways and always returns position 71.
                                 let Some(label) = self
                                     .conn
                                     .get_atom_name(v.label)
@@ -849,8 +834,27 @@ impl Manager {
                         total_buttons: buttons.into(),
                         groups: vec![group],
                     });
-                    self.pad_infos
-                        .insert(device.device_id, PadInfo { ring: ring_info });
+
+                    // Find the tablet this belongs to.
+                    let tablet = raw_name
+                        .as_deref()
+                        .and_then(pad_maybe_associated_tablet)
+                        .and_then(|expected| {
+                            // Find the device with the expected name, and return it's ID if found.
+                            let tablet_info = device_queries
+                                .infos
+                                .iter()
+                                .find(|info| info.name == expected.as_bytes())?;
+                            Some(tablet_info.deviceid.try_into().unwrap())
+                        });
+
+                    self.pad_infos.insert(
+                        device.device_id,
+                        PadInfo {
+                            ring: ring_info,
+                            tablet,
+                        },
+                    );
                 }
                 DeviceType::Tablet => {
                     // Tablets are of... dubious usefulness in xinput?
@@ -1025,7 +1029,50 @@ impl Manager {
             println!("Grab {} - {:?}", device.device_id, status);*/
         }
 
-        if !self.tools.is_empty() {
+        // True if any tablet refers to a non-existant device.
+        let mut wants_dummy_tablet = false;
+        for tool in self.tool_infos.values_mut() {
+            // Look through associated tablet ids. If any refers to a non-existant device, refer
+            // instead to a dummy device.
+            if let Some(desired_tablet) = tool.tablet {
+                if !self
+                    .tablets
+                    .iter()
+                    .any(|tablet| *tablet.internal_id.unwrap_xinput2() == desired_tablet)
+                {
+                    tool.tablet = None;
+                    wants_dummy_tablet = true;
+                }
+            } else {
+                wants_dummy_tablet = true;
+            }
+        }
+        for (id, pad) in &mut self.pad_infos {
+            // Look through associated tablet ids. If any refers to a non-existant device, refer
+            // instead to a dummy device.
+            if let Some(desired_tablet) = pad.tablet {
+                if !self
+                    .tablets
+                    .iter()
+                    .any(|tablet| *tablet.internal_id.unwrap_xinput2() == desired_tablet)
+                {
+                    pad.tablet = None;
+                    wants_dummy_tablet = true;
+                }
+            } else {
+                wants_dummy_tablet = true;
+            }
+
+            // In x11, pads cannot roam between tablets. Eagerly announce their attachment just once.
+            self.events.push(raw::Event::Pad {
+                pad: *id,
+                event: raw::PadEvent::Enter {
+                    tablet: pad.tablet.unwrap_or(DUMMY_TABLET_ID),
+                },
+            });
+        }
+
+        if wants_dummy_tablet {
             // So.... xinput doesn't have the same "Tablet owns pads and tools"
             // hierarchy as we do. When we associate tools with tablets, we need a tablet
             // to bind it to, but xinput does not necessarily provide one.
@@ -1033,7 +1080,7 @@ impl Manager {
             // Wacom tablets and the DECO-01 use a consistent naming scheme, where tools are called
             // <Tablet name> {Pen, Eraser} (hardware id), which we can use to extract such information.
             self.tablets.push(crate::tablet::Tablet {
-                internal_id: super::InternalID::XInput2(0),
+                internal_id: super::InternalID::XInput2(DUMMY_TABLET_ID),
                 name: Some(EMULATED_TABLET_NAME.to_owned()),
                 usb_id: None,
             });
@@ -1090,7 +1137,8 @@ impl Manager {
             let Some(tool) = self.tool_infos.get_mut(&device.id) else {
                 continue;
             };
-            if master != tool.master {
+            let is_child = tool.master_pointer == master || tool.master_keyboard == master;
+            if tool.is_grabbed || !is_child {
                 continue;
             }
 
@@ -1112,6 +1160,7 @@ impl Manager {
                 .unwrap()
                 .reply()
                 .unwrap();
+            tool.is_grabbed = true;
         }
     }
     fn parent_left(&mut self, master: u16, time: Timestamp) {
@@ -1119,9 +1168,27 @@ impl Manager {
             let Some(tool) = self.tool_infos.get_mut(&device.id) else {
                 continue;
             };
-            if master != tool.master {
+            let is_child = tool.master_pointer == master || tool.master_keyboard == master;
+            if !tool.is_grabbed || !is_child {
                 continue;
             }
+
+            let was_in = matches!(tool.phase, Phase::In | Phase::Down);
+
+            if was_in {
+                // Emit frame for previous events before sending more
+                if let Some(last_time) = tool.frame_pending.replace(time) {
+                    if last_time != time {
+                        self.events.push(raw::Event::Tool {
+                            tool: device.id,
+                            event: raw::ToolEvent::Frame(Some(crate::events::FrameTimestamp(
+                                std::time::Duration::from_millis(last_time.into()),
+                            ))),
+                        });
+                    }
+                }
+            }
+
             // release and out, if need be.
             if tool.phase == Phase::Down {
                 self.events.push(raw::Event::Tool {
@@ -1129,7 +1196,7 @@ impl Manager {
                     event: raw::ToolEvent::Up,
                 });
             };
-            if matches!(tool.phase, Phase::In | Phase::Down) {
+            if was_in {
                 self.events.push(raw::Event::Tool {
                     tool: device.id,
                     event: raw::ToolEvent::Out,
@@ -1142,6 +1209,7 @@ impl Manager {
                 .unwrap()
                 .check()
                 .unwrap();
+            tool.is_grabbed = false;
         }
     }
 }
@@ -1155,18 +1223,26 @@ impl super::PlatformImpl for Manager {
         while let Ok(Some(event)) = self.conn.poll_for_event() {
             use x11rb::protocol::Event;
             match event {
-                Event::XinputLeave(leave) => {
+                // xwayland fails to emit Leave/Enter when the cursor is warped to/from another window
+                // by a proximity in event. However, it emits a FocusOut/FocusIn for the associated
+                // master keyboard in that case, which we can use to emulate.
+                // On a genuine X11 server this causes the device release logic to happen twice.
+                // Could we just always rely on FocusOut, or would that add more edge cases?
+                Event::XinputLeave(leave) | Event::XinputFocusOut(leave) => {
                     // MASTER POINTER ONLY. Cursor has left the client bounds.
                     self.parent_left(leave.deviceid, leave.time);
+                    self.server_time = leave.time;
                 }
-                Event::XinputEnter(enter) => {
+                Event::XinputEnter(enter) | Event::XinputFocusIn(enter) => {
                     // MASTER POINTER ONLY. Cursor has entered client bounds.
                     self.parent_entered(enter.deviceid, enter.time);
+                    self.server_time = enter.time;
                 }
+                // Proximity (coming in and out of sense range) events.
+                // Not guaranteed to be sent, eg. if the tool comes in proximity while
+                // over a different window. We'll need to emulate the In event in such cases.
+                // Never sent on xwayland.
                 Event::XinputProximityIn(x) => {
-                    // Not guaranteed to be sent, eg. if the tool comes in proximity while
-                    // over a different window. We'll need to emulate the In event in such cases.
-
                     // wh.. why..
                     let device_id = x.device_id & 0x7f;
                     let Some(tool) = self.tool_infos.get_mut(&device_id) else {
@@ -1176,15 +1252,14 @@ impl super::PlatformImpl for Manager {
                         tool.phase = Phase::In;
                         self.events.push(raw::Event::Tool {
                             tool: device_id,
-                            event: raw::ToolEvent::In { tablet: 0 },
+                            event: raw::ToolEvent::In {
+                                tablet: tool.tablet.unwrap_or(DUMMY_TABLET_ID),
+                            },
                         });
                     }
+                    self.server_time = x.time;
                 }
                 Event::XinputProximityOut(x) => {
-                    // Not guaranteed to be sent, eg. if the tool leaves the window before going out.
-                    // We'll need to emulate the In event in such cases.
-
-                    // wh.. why..
                     let device_id = x.device_id & 0x7f;
                     let Some(tool) = self.tool_infos.get_mut(&device_id) else {
                         continue;
@@ -1196,6 +1271,7 @@ impl super::PlatformImpl for Manager {
                             event: raw::ToolEvent::Out,
                         });
                     }
+                    self.server_time = x.time;
                 }
                 // XinputDeviceButtonPress, ButtonPress, XinputRawButtonPress are red herrings.
                 // Dear X consortium... What the fuck?
@@ -1246,6 +1322,7 @@ impl super::PlatformImpl for Manager {
                             });
                         }
                     }
+                    self.server_time = e.time;
                 }
                 Event::XinputMotion(m) => {
                     // Tool valuators.
@@ -1267,11 +1344,28 @@ impl super::PlatformImpl for Manager {
                             m.axisvalues.get(usize::from(idx)).copied()
                         };
                         let tool_info = self.tool_infos.get_mut(&device_id)?;
+
+                        // About to emit events. Emit frame if the time differs.
+                        if let Some(last_time) = tool_info.frame_pending.replace(m.time) {
+                            if last_time != m.time {
+                                self.events.push(raw::Event::Tool {
+                                    tool: device_id,
+                                    event: raw::ToolEvent::Frame(Some(
+                                        crate::events::FrameTimestamp(
+                                            std::time::Duration::from_millis(last_time.into()),
+                                        ),
+                                    )),
+                                });
+                            }
+                        }
+
                         if tool_info.phase == Phase::Out {
                             tool_info.phase = Phase::In;
                             self.events.push(raw::Event::Tool {
                                 tool: device_id,
-                                event: raw::ToolEvent::In { tablet: 0 },
+                                event: raw::ToolEvent::In {
+                                    tablet: tool_info.tablet.unwrap_or(DUMMY_TABLET_ID),
+                                },
                             });
                         }
                         // Access valuators, and map them to our range for the associated axis.
@@ -1316,13 +1410,14 @@ impl super::PlatformImpl for Manager {
                     if try_uwu().is_none() {
                         //println!("failed to fetch axes.");
                     }
+                    self.server_time = m.time;
                 }
                 Event::XinputDeviceValuator(m) => {
                     // Pad valuators. Instead of the arbtrary number of valuators that the tools
                     // are sent, this sends in groups of six. Ignore all of them except the packet that
                     // contains our ring value.
 
-                    if let Some(pad_info) = self.pad_infos.get(&m.device_id) {
+                    if let Some(pad_info) = self.pad_infos.get_mut(&m.device_id) {
                         let Some(ring_info) = pad_info.ring else {
                             continue;
                         };
@@ -1351,6 +1446,7 @@ impl super::PlatformImpl for Manager {
                             continue;
                         }
 
+                        // About to emit events. Emit frame if the time differs.
                         self.events.push(raw::Event::Pad {
                             pad: m.device_id,
                             event: raw::PadEvent::Group {
@@ -1360,6 +1456,25 @@ impl super::PlatformImpl for Manager {
                                     event: crate::events::TouchStripEvent::Pose(
                                         ring_info.transform.transform(valuator_value as f32),
                                     ),
+                                },
+                            },
+                        });
+                        // Weirdly, this event is the only one without a timestamp.
+                        // So, we track the current time in all the other events, and can
+                        // guestimate based on that.
+                        self.events.push(raw::Event::Pad {
+                            pad: m.device_id,
+                            event: raw::PadEvent::Group {
+                                group: m.device_id,
+                                event: raw::PadGroupEvent::Ring {
+                                    ring: m.device_id,
+                                    event: crate::events::TouchStripEvent::Frame(Some(
+                                        crate::events::FrameTimestamp(
+                                            std::time::Duration::from_millis(
+                                                self.server_time.into(),
+                                            ),
+                                        ),
+                                    )),
                                 },
                             },
                         });
@@ -1392,18 +1507,33 @@ impl super::PlatformImpl for Manager {
                             pressed: e.response_type == 69,
                         },
                     });
+                    self.server_time = e.time;
                 }
-                Event::XinputHierarchy(_) => {
+                Event::XinputHierarchy(h) => {
                     // The event does not necessarily reflect *all* changes, the spec specifically says
                     // that the client should probably just rescan. lol
                     if !has_repopulated {
                         has_repopulated = true;
                         self.repopulate();
                     }
+                    self.server_time = h.time;
                 }
                 _ => (),
             }
         }
+
+        // Emit pending frames.
+        for (id, tool) in &mut self.tool_infos {
+            if let Some(time) = tool.frame_pending.take() {
+                self.events.push(raw::Event::Tool {
+                    tool: *id,
+                    event: raw::ToolEvent::Frame(Some(crate::events::FrameTimestamp(
+                        std::time::Duration::from_millis(time.into()),
+                    ))),
+                });
+            }
+        }
+
         Ok(())
     }
     fn raw_events(&self) -> super::RawEventsIter<'_> {
