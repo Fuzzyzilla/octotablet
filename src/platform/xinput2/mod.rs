@@ -7,9 +7,7 @@ use x11rb::{
     },
 };
 
-// Note: Device Product ID (286) property of tablets states USB vid and pid, and Device Node (285)
-// lists path. Impl that pleas. thanks Uwu
-
+// Some necessary constants not defined by x11rb:
 const XI_ALL_DEVICES: u16 = 0;
 const XI_ALL_MASTER_DEVICES: u8 = 1;
 /// Magic timestamp signalling to the server "now".
@@ -43,10 +41,6 @@ const EMULATED_TABLET_NAME: &str = "octotablet emulated";
 const TYPE_MOUSE: &str = "MOUSE";
 const TYPE_TOUCHSCREEN: &str = "TOUCHSCREEN";
 
-const DUMMY_TABLET_ID: u8 = 0;
-
-/// Comes from `xinput_open_device`. Some APIs use u16. Confusing!
-pub type ID = u8;
 /// Comes from datasize of "button count" field of `ButtonInfo` - button names in xinput are indices,
 /// with the zeroth index referring to the tool "down" state.
 pub type ButtonID = std::num::NonZero<u16>;
@@ -134,6 +128,21 @@ fn xwayland_type_from_name(device_name: &str) -> Option<DeviceType> {
         " eraser" => DeviceType::Tool(Type::Eraser),
         _ => return None,
     })
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
+pub(super) enum ID {
+    /// Special value for the emulated tablet. This is an invalid ID for tools and pads.
+    /// A bit of an API design whoopsie!
+    EmulatedTablet,
+    ID {
+        /// Xinput re-uses the IDs of removed devices.
+        /// Since we need to keep around devices for an extra frame to report added/removed,
+        /// it means a conflict can occur.
+        generation: u8,
+        /// XI1 ID. XI2 uses u16 but i'm just generally confused UwU
+        device_id: std::num::NonZero<u8>,
+    },
 }
 
 #[derive(Copy, Clone)]
@@ -282,9 +291,9 @@ struct ToolInfo {
     wheel: Option<AxisInfo>,
     /// The tablet this tool belongs to, based on heuristics.
     /// When "In" is fired, this is the device to reference, because X doesn't provide
-    /// such info. If none, uses a dummy tablet.
+    /// such info.
     /// (tool -> tablet relationship is one-to-one-or-less in xinput instead of one-to-one-or-more as we expect)
-    tablet: Option<ID>,
+    tablet: ID,
     phase: Phase,
     /// The master cursor. Grab this device when this cursor Enters, release it when it
     /// leaves.
@@ -299,72 +308,56 @@ struct ToolInfo {
 
 struct PadInfo {
     ring: Option<AxisInfo>,
-    /// The tablet this tool belongs to, based on heuristics.
-    tablet: Option<ID>,
-}
-
-struct BitDiff {
-    bit_index: usize,
-    set: bool,
-}
-
-struct BitDifferenceIter<'a> {
-    from: &'a [u32],
-    to: &'a [u32],
-    // cursor position:
-    // Which bit within the u32?
-    next_bit_idx: u32,
-    // Which word within the array?
-    cur_word: usize,
-}
-impl<'a> BitDifferenceIter<'a> {
-    fn diff(from: &'a [u32], to: &'a [u32]) -> Self {
-        Self {
-            from,
-            to,
-            next_bit_idx: 0,
-            cur_word: 0,
-        }
-    }
-}
-impl Iterator for BitDifferenceIter<'_> {
-    type Item = BitDiff;
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let to = self.to.get(self.cur_word)?;
-            let from = self.from.get(self.cur_word).copied().unwrap_or_default();
-            let diff = to ^ from;
-
-            // find the lowest set bit in the difference word.
-            let next_diff_idx = self.next_bit_idx + (diff >> self.next_bit_idx).trailing_zeros();
-
-            if next_diff_idx >= u32::BITS - 1 {
-                // Advance to the next word for next go around.
-                self.next_bit_idx = 0;
-                self.cur_word += 1;
-            } else {
-                // advance cursor regularly.
-                self.next_bit_idx = next_diff_idx + 1;
-            }
-            if next_diff_idx >= u32::BITS {
-                // No bit was set in this word, skip to next word.
-                continue;
-            }
-
-            // Check what the difference we just found was.
-            let became_set = (to >> next_diff_idx) & 1 == 1;
-
-            return Some(BitDiff {
-                bit_index: self.cur_word * u32::BITS as usize + next_diff_idx as usize,
-                set: became_set,
-            });
-        }
-    }
+    /// The tablet this tool belongs to, based on heuristics, or Dummy.
+    tablet: ID,
 }
 
 struct OpenDevice {
     mask: Vec<u32>,
-    id: ID,
+    id: u8,
+}
+
+fn tool_info_mut_from_device_id(
+    id: u8,
+    infos: &mut std::collections::BTreeMap<ID, ToolInfo>,
+    now_generation: u8,
+) -> Option<(ID, &mut ToolInfo)> {
+    let non_zero_id = std::num::NonZero::<u8>::new(id)?;
+    let id = ID::ID {
+        generation: now_generation,
+        device_id: non_zero_id,
+    };
+
+    infos.get_mut(&id).map(|info| (id, info))
+}
+fn pad_info_mut_from_device_id(
+    id: u8,
+    infos: &mut std::collections::BTreeMap<ID, PadInfo>,
+    now_generation: u8,
+) -> Option<(ID, &mut PadInfo)> {
+    let non_zero_id = std::num::NonZero::<u8>::new(id)?;
+    let id = ID::ID {
+        generation: now_generation,
+        device_id: non_zero_id,
+    };
+
+    infos.get_mut(&id).map(|info| (id, info))
+}
+fn pad_mut_from_device_id(
+    id: u8,
+    infos: &mut [crate::pad::Pad],
+    now_generation: u8,
+) -> Option<(ID, &mut crate::pad::Pad)> {
+    let non_zero_id = std::num::NonZero::<u8>::new(id)?;
+    let id = ID::ID {
+        generation: now_generation,
+        device_id: non_zero_id,
+    };
+
+    infos
+        .iter_mut()
+        .find(|pad| *pad.internal_id.unwrap_xinput2() == id)
+        .map(|info| (id, info))
 }
 
 pub struct Manager {
@@ -381,6 +374,8 @@ pub struct Manager {
     atom_device_node: Option<std::num::NonZero<x11rb::protocol::xproto::Atom>>,
     // What is the most recent event timecode?
     server_time: Timestamp,
+    /// Device ID generation. Increment when one or more devices is removed in a frame.
+    device_generation: u8,
 }
 
 impl Manager {
@@ -469,6 +464,7 @@ impl Manager {
             atom_device_node,
             atom_usb_id,
             server_time: 0,
+            device_generation: 0,
         };
 
         // Poll for devices.
@@ -483,15 +479,18 @@ impl Manager {
         // report adds/removes.
         self.tools.clear();
         self.tablets.clear();
+        self.pads.clear();
         self.tool_infos.clear();
         self.pad_infos.clear();
 
+        if !self.open_devices.is_empty() {
+            self.device_generation = self.device_generation.wrapping_add(1);
+        }
+
         for device in self.open_devices.drain(..) {
-            self.conn
-                .xinput_close_device(device.id)
-                .unwrap()
-                .check()
-                .unwrap();
+            // Don't care if the effects of closure went through, just
+            // that it's sent. Some may fail. Fixme!
+            let _ = self.conn.xinput_close_device(device.id).unwrap();
         }
         // Tools ids to bulk-enable events on.
         let mut tool_listen_events = vec![XI_ALL_MASTER_DEVICES];
@@ -525,6 +524,13 @@ impl Manager {
             .into_iter()
             .zip(device_list.devices.into_iter())
         {
+            // Zero is a special value (ALL_DEVICES), and can't be used by a device.
+            let nonzero_id = std::num::NonZero::<u8>::new(device.device_id).unwrap();
+            let octotablet_id = ID::ID {
+                generation: self.device_generation,
+                device_id: nonzero_id,
+            };
+
             let _infos = {
                 // Split off however many axes this device claims.
                 let (infos, tail_infos) = flat_infos.split_at(device.num_class_info.into());
@@ -604,11 +610,17 @@ impl Manager {
                                 .infos
                                 .iter()
                                 .find(|info| info.name == expected.as_bytes())?;
-                            Some(tablet_info.deviceid.try_into().unwrap())
+
+                            let id = u8::try_from(tablet_info.deviceid).ok()?;
+                            Some(ID::ID {
+                                generation: self.device_generation,
+                                // 0 is a special value, this is infallible.
+                                device_id: id.try_into().unwrap(),
+                            })
                         });
 
                     let mut octotablet_info = crate::tool::Tool {
-                        internal_id: super::InternalID::XInput2(device.device_id),
+                        internal_id: super::InternalID::XInput2(octotablet_id),
                         name: name_fields
                             .map(ToolName::human_readable)
                             .map(ToOwned::to_owned),
@@ -622,7 +634,7 @@ impl Manager {
                         pressure: None,
                         tilt: [None, None],
                         wheel: None,
-                        tablet: tablet_id,
+                        tablet: tablet_id.unwrap_or(ID::EmulatedTablet),
                         phase: Phase::Out,
                         master_pointer: query.attachment,
                         master_keyboard: device_queries
@@ -761,7 +773,7 @@ impl Manager {
 
                     tool_listen_events.push(device.device_id);
                     self.tools.push(octotablet_info);
-                    self.tool_infos.insert(device.device_id, x11_info);
+                    self.tool_infos.insert(octotablet_id, x11_info);
                 }
                 DeviceType::Pad => {
                     let mut buttons = 0;
@@ -816,7 +828,7 @@ impl Manager {
                     if ring_info.is_some() {
                         rings.push(crate::pad::Ring {
                             granularity: None,
-                            internal_id: crate::platform::InternalID::XInput2(device.device_id),
+                            internal_id: crate::platform::InternalID::XInput2(octotablet_id),
                         });
                     };
                     // X11 has no concept of groups (i don't .. think?)
@@ -824,13 +836,13 @@ impl Manager {
                     let group = crate::pad::Group {
                         buttons: (0..buttons).map(Into::into).collect::<Vec<_>>(),
                         feedback: None,
-                        internal_id: crate::platform::InternalID::XInput2(device.device_id),
+                        internal_id: crate::platform::InternalID::XInput2(octotablet_id),
                         mode_count: None,
                         rings,
                         strips: vec![],
                     };
                     self.pads.push(crate::pad::Pad {
-                        internal_id: crate::platform::InternalID::XInput2(device.device_id),
+                        internal_id: crate::platform::InternalID::XInput2(octotablet_id),
                         total_buttons: buttons.into(),
                         groups: vec![group],
                     });
@@ -845,14 +857,19 @@ impl Manager {
                                 .infos
                                 .iter()
                                 .find(|info| info.name == expected.as_bytes())?;
-                            Some(tablet_info.deviceid.try_into().unwrap())
+                            let id = u8::try_from(tablet_info.deviceid).ok()?;
+                            Some(ID::ID {
+                                generation: self.device_generation,
+                                // 0 is ALL_DEVICES, this is infallible.
+                                device_id: id.try_into().unwrap(),
+                            })
                         });
 
                     self.pad_infos.insert(
-                        device.device_id,
+                        octotablet_id,
                         PadInfo {
                             ring: ring_info,
-                            tablet,
+                            tablet: tablet.unwrap_or(ID::EmulatedTablet),
                         },
                     );
                 }
@@ -896,7 +913,7 @@ impl Manager {
                     // We can also fetch device path here.
 
                     let tablet = crate::tablet::Tablet {
-                        internal_id: super::InternalID::XInput2(device.device_id),
+                        internal_id: super::InternalID::XInput2(octotablet_id),
                         name: raw_name,
                         usb_id,
                     };
@@ -1034,41 +1051,56 @@ impl Manager {
         for tool in self.tool_infos.values_mut() {
             // Look through associated tablet ids. If any refers to a non-existant device, refer
             // instead to a dummy device.
-            if let Some(desired_tablet) = tool.tablet {
+            if let ID::ID {
+                device_id: desired_tablet,
+                ..
+            } = tool.tablet
+            {
                 if !self
                     .tablets
                     .iter()
-                    .any(|tablet| *tablet.internal_id.unwrap_xinput2() == desired_tablet)
+                    .any(|tablet| match *tablet.internal_id.unwrap_xinput2() {
+                        ID::ID { device_id, .. } => device_id == desired_tablet,
+                        _ => false,
+                    })
                 {
-                    tool.tablet = None;
-                    wants_dummy_tablet = true;
+                    tool.tablet = ID::EmulatedTablet;
                 }
-            } else {
+            }
+
+            if tool.tablet == ID::EmulatedTablet {
                 wants_dummy_tablet = true;
             }
         }
         for (id, pad) in &mut self.pad_infos {
             // Look through associated tablet ids. If any refers to a non-existant device, refer
             // instead to a dummy device.
-            if let Some(desired_tablet) = pad.tablet {
+            if let ID::ID {
+                device_id: desired_tablet,
+                ..
+            } = pad.tablet
+            {
                 if !self
                     .tablets
                     .iter()
-                    .any(|tablet| *tablet.internal_id.unwrap_xinput2() == desired_tablet)
+                    .any(|tablet| match *tablet.internal_id.unwrap_xinput2() {
+                        ID::ID { device_id, .. } => device_id == desired_tablet,
+                        _ => false,
+                    })
                 {
-                    pad.tablet = None;
                     wants_dummy_tablet = true;
                 }
-            } else {
+            }
+
+            if pad.tablet == ID::EmulatedTablet {
                 wants_dummy_tablet = true;
             }
 
             // In x11, pads cannot roam between tablets. Eagerly announce their attachment just once.
+            // FIXME: on initial device enumeration these are lost due to `events.clear()` in `pump`.
             self.events.push(raw::Event::Pad {
                 pad: *id,
-                event: raw::PadEvent::Enter {
-                    tablet: pad.tablet.unwrap_or(DUMMY_TABLET_ID),
-                },
+                event: raw::PadEvent::Enter { tablet: pad.tablet },
             });
         }
 
@@ -1080,7 +1112,7 @@ impl Manager {
             // Wacom tablets and the DECO-01 use a consistent naming scheme, where tools are called
             // <Tablet name> {Pen, Eraser} (hardware id), which we can use to extract such information.
             self.tablets.push(crate::tablet::Tablet {
-                internal_id: super::InternalID::XInput2(DUMMY_TABLET_ID),
+                internal_id: super::InternalID::XInput2(ID::EmulatedTablet),
                 name: Some(EMULATED_TABLET_NAME.to_owned()),
                 usb_id: None,
             });
@@ -1118,7 +1150,7 @@ impl Manager {
                         // | xinput::XIEventMask::PROPERTY
                         // Sent when a master device is bound, and the device controlling it
                         // changes (thus presenting a master with different classes)
-                        // We don't care about master devices, though!
+                        // We don't listen for valuators nor buttons on master devices, though!
                         // | xinput::XIEventMask::DEVICE_CHANGED
                     ]
                     .into(),
@@ -1134,7 +1166,11 @@ impl Manager {
     }
     fn parent_entered(&mut self, master: u16, time: Timestamp) {
         for device in &self.open_devices {
-            let Some(tool) = self.tool_infos.get_mut(&device.id) else {
+            let Some((_, tool)) = tool_info_mut_from_device_id(
+                device.id,
+                &mut self.tool_infos,
+                self.device_generation,
+            ) else {
                 continue;
             };
             let is_child = tool.master_pointer == master || tool.master_keyboard == master;
@@ -1165,7 +1201,11 @@ impl Manager {
     }
     fn parent_left(&mut self, master: u16, time: Timestamp) {
         for device in &self.open_devices {
-            let Some(tool) = self.tool_infos.get_mut(&device.id) else {
+            let Some((id, tool)) = tool_info_mut_from_device_id(
+                device.id,
+                &mut self.tool_infos,
+                self.device_generation,
+            ) else {
                 continue;
             };
             let is_child = tool.master_pointer == master || tool.master_keyboard == master;
@@ -1180,7 +1220,7 @@ impl Manager {
                 if let Some(last_time) = tool.frame_pending.replace(time) {
                     if last_time != time {
                         self.events.push(raw::Event::Tool {
-                            tool: device.id,
+                            tool: id,
                             event: raw::ToolEvent::Frame(Some(crate::events::FrameTimestamp(
                                 std::time::Duration::from_millis(last_time.into()),
                             ))),
@@ -1192,13 +1232,13 @@ impl Manager {
             // release and out, if need be.
             if tool.phase == Phase::Down {
                 self.events.push(raw::Event::Tool {
-                    tool: device.id,
+                    tool: id,
                     event: raw::ToolEvent::Up,
                 });
             };
             if was_in {
                 self.events.push(raw::Event::Tool {
-                    tool: device.id,
+                    tool: id,
                     event: raw::ToolEvent::Out,
                 });
             };
@@ -1245,15 +1285,19 @@ impl super::PlatformImpl for Manager {
                 Event::XinputProximityIn(x) => {
                     // wh.. why..
                     let device_id = x.device_id & 0x7f;
-                    let Some(tool) = self.tool_infos.get_mut(&device_id) else {
+                    let Some((id, tool)) = tool_info_mut_from_device_id(
+                        device_id,
+                        &mut self.tool_infos,
+                        self.device_generation,
+                    ) else {
                         continue;
                     };
                     if tool.phase == Phase::Out {
                         tool.phase = Phase::In;
                         self.events.push(raw::Event::Tool {
-                            tool: device_id,
+                            tool: id,
                             event: raw::ToolEvent::In {
-                                tablet: tool.tablet.unwrap_or(DUMMY_TABLET_ID),
+                                tablet: tool.tablet,
                             },
                         });
                     }
@@ -1261,13 +1305,24 @@ impl super::PlatformImpl for Manager {
                 }
                 Event::XinputProximityOut(x) => {
                     let device_id = x.device_id & 0x7f;
-                    let Some(tool) = self.tool_infos.get_mut(&device_id) else {
+                    let Some((id, tool)) = tool_info_mut_from_device_id(
+                        device_id,
+                        &mut self.tool_infos,
+                        self.device_generation,
+                    ) else {
                         continue;
                     };
+                    // Emulate Up before out if need be.
+                    if tool.phase == Phase::Down {
+                        self.events.push(raw::Event::Tool {
+                            tool: id,
+                            event: raw::ToolEvent::Up,
+                        });
+                    }
                     if tool.phase != Phase::Out {
                         tool.phase = Phase::Out;
                         self.events.push(raw::Event::Tool {
-                            tool: device_id,
+                            tool: id,
                             event: raw::ToolEvent::Out,
                         });
                     }
@@ -1284,11 +1339,26 @@ impl super::PlatformImpl for Manager {
                         continue;
                     }
                     let device_id = u8::try_from(e.deviceid).unwrap();
-                    if !self.tool_infos.contains_key(&device_id) {
+                    let Some((id, tool)) = tool_info_mut_from_device_id(
+                        device_id,
+                        &mut self.tool_infos,
+                        self.device_generation,
+                    ) else {
                         continue;
                     };
 
                     let button_idx = u16::try_from(e.detail).unwrap();
+
+                    // Emulate In event if currently out.
+                    if tool.phase == Phase::Out {
+                        self.events.push(raw::Event::Tool {
+                            tool: id,
+                            event: raw::ToolEvent::In {
+                                tablet: tool.tablet,
+                            },
+                        });
+                        tool.phase = Phase::Up;
+                    }
 
                     // Detail gives the "button index".
                     match button_idx {
@@ -1297,13 +1367,21 @@ impl super::PlatformImpl for Manager {
                         // Tip button
                         1 => {
                             if e.event_type == xinput::BUTTON_PRESS_EVENT {
+                                if tool.phase == Phase::Down {
+                                    continue;
+                                }
+                                tool.phase = Phase::Down;
                                 self.events.push(raw::Event::Tool {
-                                    tool: device_id,
+                                    tool: id,
                                     event: raw::ToolEvent::Down,
                                 });
                             } else {
+                                if tool.phase == Phase::Up {
+                                    continue;
+                                }
+                                tool.phase = Phase::Up;
                                 self.events.push(raw::Event::Tool {
-                                    tool: device_id,
+                                    tool: id,
                                     event: raw::ToolEvent::Up,
                                 });
                             }
@@ -1311,7 +1389,7 @@ impl super::PlatformImpl for Manager {
                         // Other (barrel) button.
                         _ => {
                             self.events.push(raw::Event::Tool {
-                                tool: device_id,
+                                tool: id,
                                 event: raw::ToolEvent::Button {
                                     button_id: crate::platform::ButtonID::XInput2(
                                         // Already checked != 0
@@ -1327,8 +1405,6 @@ impl super::PlatformImpl for Manager {
                 Event::XinputMotion(m) => {
                     // Tool valuators.
                     let mut try_uwu = || -> Option<()> {
-                        let device_id = m.deviceid.try_into().ok()?;
-
                         let valuator_fetch = |idx: u16| -> Option<xinput::Fp3232> {
                             // Check that it's not masked out-
                             let word_idx = idx / u32::BITS as u16;
@@ -1343,13 +1419,19 @@ impl super::PlatformImpl for Manager {
                             // Fetch it!
                             m.axisvalues.get(usize::from(idx)).copied()
                         };
-                        let tool_info = self.tool_infos.get_mut(&device_id)?;
+
+                        let device_id = m.deviceid.try_into().ok()?;
+                        let (id, tool) = tool_info_mut_from_device_id(
+                            device_id,
+                            &mut self.tool_infos,
+                            self.device_generation,
+                        )?;
 
                         // About to emit events. Emit frame if the time differs.
-                        if let Some(last_time) = tool_info.frame_pending.replace(m.time) {
+                        if let Some(last_time) = tool.frame_pending.replace(m.time) {
                             if last_time != m.time {
                                 self.events.push(raw::Event::Tool {
-                                    tool: device_id,
+                                    tool: id,
                                     event: raw::ToolEvent::Frame(Some(
                                         crate::events::FrameTimestamp(
                                             std::time::Duration::from_millis(last_time.into()),
@@ -1359,32 +1441,32 @@ impl super::PlatformImpl for Manager {
                             }
                         }
 
-                        if tool_info.phase == Phase::Out {
-                            tool_info.phase = Phase::In;
+                        if tool.phase == Phase::Out {
+                            tool.phase = Phase::In;
                             self.events.push(raw::Event::Tool {
-                                tool: device_id,
+                                tool: id,
                                 event: raw::ToolEvent::In {
-                                    tablet: tool_info.tablet.unwrap_or(DUMMY_TABLET_ID),
+                                    tablet: tool.tablet,
                                 },
                             });
                         }
                         // Access valuators, and map them to our range for the associated axis.
-                        let pressure = tool_info
+                        let pressure = tool
                             .pressure
                             .and_then(|axis| {
                                 Some(axis.transform.transform_fixed(valuator_fetch(axis.index)?))
                             })
                             .and_then(crate::util::NicheF32::new_some)
                             .unwrap_or(crate::util::NicheF32::NONE);
-                        let tilt_x = tool_info.tilt[0].and_then(|axis| {
+                        let tilt_x = tool.tilt[0].and_then(|axis| {
                             Some(axis.transform.transform_fixed(valuator_fetch(axis.index)?))
                         });
-                        let tilt_y = tool_info.tilt[1].and_then(|axis| {
+                        let tilt_y = tool.tilt[1].and_then(|axis| {
                             Some(axis.transform.transform_fixed(valuator_fetch(axis.index)?))
                         });
 
                         self.events.push(raw::Event::Tool {
-                            tool: device_id,
+                            tool: id,
                             event: raw::ToolEvent::Pose(crate::axis::Pose {
                                 // Seems to already be in logical space.
                                 // Using this seems to be the "wrong" solution. It's the master's position,
@@ -1417,81 +1499,81 @@ impl super::PlatformImpl for Manager {
                     // are sent, this sends in groups of six. Ignore all of them except the packet that
                     // contains our ring value.
 
-                    if let Some(pad_info) = self.pad_infos.get_mut(&m.device_id) {
-                        let Some(ring_info) = pad_info.ring else {
-                            continue;
-                        };
-                        let absolute_ring_index = ring_info.index;
-                        let Some(relative_ring_indox) =
-                            absolute_ring_index.checked_sub(u16::from(m.first_valuator))
-                        else {
-                            continue;
-                        };
-                        if relative_ring_indox >= m.num_valuators.into() {
-                            continue;
-                        }
-
-                        let Some(&valuator_value) =
-                            m.valuators.get(usize::from(relative_ring_indox))
-                        else {
-                            continue;
-                        };
-
-                        if valuator_value == 0 {
-                            // On release, this is snapped back to zero, but zero is also a valid value. There does not
-                            // seem to be a method of checking when the interaction ended to avoid this.
-
-                            // Snapping back to zero makes this entirely useless for knob control (which is the primary
-                            // purpose of the ring) so we take this little loss.
-                            continue;
-                        }
-
-                        // About to emit events. Emit frame if the time differs.
-                        self.events.push(raw::Event::Pad {
-                            pad: m.device_id,
-                            event: raw::PadEvent::Group {
-                                group: m.device_id,
-                                event: raw::PadGroupEvent::Ring {
-                                    ring: m.device_id,
-                                    event: crate::events::TouchStripEvent::Pose(
-                                        ring_info.transform.transform(valuator_value as f32),
-                                    ),
-                                },
-                            },
-                        });
-                        // Weirdly, this event is the only one without a timestamp.
-                        // So, we track the current time in all the other events, and can
-                        // guestimate based on that.
-                        self.events.push(raw::Event::Pad {
-                            pad: m.device_id,
-                            event: raw::PadEvent::Group {
-                                group: m.device_id,
-                                event: raw::PadGroupEvent::Ring {
-                                    ring: m.device_id,
-                                    event: crate::events::TouchStripEvent::Frame(Some(
-                                        crate::events::FrameTimestamp(
-                                            std::time::Duration::from_millis(
-                                                self.server_time.into(),
-                                            ),
-                                        ),
-                                    )),
-                                },
-                            },
-                        });
+                    let Some((id, pad_info)) = pad_info_mut_from_device_id(
+                        m.device_id,
+                        &mut self.pad_infos,
+                        self.device_generation,
+                    ) else {
+                        continue;
+                    };
+                    let Some(ring_info) = pad_info.ring else {
+                        continue;
+                    };
+                    let absolute_ring_index = ring_info.index;
+                    let Some(relative_ring_indox) =
+                        absolute_ring_index.checked_sub(u16::from(m.first_valuator))
+                    else {
+                        continue;
+                    };
+                    if relative_ring_indox >= m.num_valuators.into() {
+                        continue;
                     }
+
+                    let Some(&valuator_value) = m.valuators.get(usize::from(relative_ring_indox))
+                    else {
+                        continue;
+                    };
+
+                    if valuator_value == 0 {
+                        // On release, this is snapped back to zero, but zero is also a valid value. There does not
+                        // seem to be a method of checking when the interaction ended to avoid this.
+
+                        // Snapping back to zero makes this entirely useless for knob control (which is the primary
+                        // purpose of the ring) so we take this little loss.
+                        continue;
+                    }
+
+                    // About to emit events. Emit frame if the time differs.
+                    self.events.push(raw::Event::Pad {
+                        pad: id,
+                        event: raw::PadEvent::Group {
+                            group: id,
+                            event: raw::PadGroupEvent::Ring {
+                                ring: id,
+                                event: crate::events::TouchStripEvent::Pose(
+                                    ring_info.transform.transform(valuator_value as f32),
+                                ),
+                            },
+                        },
+                    });
+                    // Weirdly, this event is the only one without a timestamp.
+                    // So, we track the current time in all the other events, and can
+                    // guestimate based on that.
+                    self.events.push(raw::Event::Pad {
+                        pad: id,
+                        event: raw::PadEvent::Group {
+                            group: id,
+                            event: raw::PadGroupEvent::Ring {
+                                ring: id,
+                                event: crate::events::TouchStripEvent::Frame(Some(
+                                    crate::events::FrameTimestamp(
+                                        std::time::Duration::from_millis(self.server_time.into()),
+                                    ),
+                                )),
+                            },
+                        },
+                    });
                 }
                 Event::XinputDeviceButtonPress(e) | Event::XinputDeviceButtonRelease(e) => {
                     // Pad buttons.
-                    let Some(pad) = self
-                        .pads
-                        .iter()
-                        .find(|pad| *pad.internal_id.unwrap_xinput2() == e.device_id)
+                    let Some((id, pad_info)) =
+                        pad_mut_from_device_id(e.device_id, &mut self.pads, self.device_generation)
                     else {
                         continue;
                     };
 
                     let button_idx = u32::from(e.detail);
-                    if button_idx == 0 || button_idx > pad.total_buttons {
+                    if button_idx == 0 || button_idx > pad_info.total_buttons {
                         // Okay, there's a weird off-by-one here, that even throws off the `xinput` debug
                         // utility. My Intuos Pro S reports 11 buttons, but the maximum button index is.... 11,
                         // which is clearly invalid. Silly.
@@ -1500,7 +1582,7 @@ impl super::PlatformImpl for Manager {
                     }
 
                     self.events.push(raw::Event::Pad {
-                        pad: e.device_id,
+                        pad: id,
                         event: raw::PadEvent::Button {
                             // Shift 1-based to 0-based indexing.
                             button_idx: button_idx - 1,
