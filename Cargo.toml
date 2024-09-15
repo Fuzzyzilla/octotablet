@@ -36,7 +36,6 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 # Common deps.
 bitflags = "2.4.2"
-enum_dispatch = "0.3.12"
 raw-window-handle = "0.6.0"
 strum = { version = "0.26.2", features = ["derive"] }
 thiserror = "1.0.58"

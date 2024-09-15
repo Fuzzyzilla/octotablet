@@ -7,6 +7,10 @@ use x11rb::{
     },
 };
 
+/// If this many milliseconds since last ring interaction, emit an Out event.
+const RING_TIMEOUT_MS: Timestamp = 200;
+/// If this many milliseconds since last tool interaction, emit an Out event.
+const TOOL_TIMEOUT_MS: Timestamp = 500;
 // Some necessary constants not defined by x11rb:
 const XI_ALL_DEVICES: u16 = 0;
 const XI_ALL_MASTER_DEVICES: u8 = 1;
@@ -275,11 +279,10 @@ struct AxisInfo {
     transform: Transform,
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Eq, PartialEq, Clone, Copy)]
 enum Phase {
     In,
     Down,
-    Up,
     Out,
 }
 
@@ -304,10 +307,107 @@ struct ToolInfo {
     // A change has occured on this pump that requires a frame event at this time.
     // (pose, button, enter, ect)
     frame_pending: Option<Timestamp>,
+    last_interaction: Option<Timestamp>,
+}
+impl ToolInfo {
+    fn take_timeout(&mut self, now: Timestamp) -> bool {
+        let Some(interaction) = self.last_interaction else {
+            return false;
+        };
+
+        if interaction > now {
+            return false;
+        }
+
+        let diff = now - interaction;
+
+        if diff >= TOOL_TIMEOUT_MS {
+            self.last_interaction = None;
+            true
+        } else {
+            false
+        }
+    }
+    /// Set the current phase of interaction, emitting any needed events to get to that state.
+    fn set_phase(&mut self, self_id: ID, phase: Phase, events: &mut Vec<raw::Event<ID>>) {
+        enum Transition {
+            In,
+            Down,
+            Out,
+            Up,
+        }
+        // Find the transitions that need to occur, in order.
+        #[allow(clippy::match_same_arms)]
+        let changes: &[_] = match (self.phase, phase) {
+            (Phase::Down, Phase::Out) => &[Transition::Up, Transition::Out],
+            (Phase::Down, Phase::In) => &[Transition::Up],
+            (Phase::Down, Phase::Down) => &[],
+            (Phase::In, Phase::Out) => &[Transition::Out],
+            (Phase::In, Phase::In) => &[],
+            (Phase::In, Phase::Down) => &[Transition::Down],
+            (Phase::Out, Phase::Out) => &[],
+            (Phase::Out, Phase::In) => &[Transition::In],
+            (Phase::Out, Phase::Down) => &[Transition::In, Transition::Down],
+        };
+        self.phase = phase;
+
+        for change in changes {
+            events.push(raw::Event::Tool {
+                tool: self_id,
+                event: match change {
+                    Transition::In => raw::ToolEvent::In {
+                        tablet: self.tablet,
+                    },
+                    Transition::Out => raw::ToolEvent::Out,
+                    Transition::Down => raw::ToolEvent::Down,
+                    Transition::Up => raw::ToolEvent::Up,
+                },
+            });
+        }
+    }
+    /// If the tool is Out, move it In. no effect if down or in already.
+    fn ensure_in(&mut self, self_id: ID, events: &mut Vec<raw::Event<ID>>) {
+        if self.phase == Phase::Out {
+            self.phase = Phase::In;
+
+            events.push(raw::Event::Tool {
+                tool: self_id,
+                event: raw::ToolEvent::In {
+                    tablet: self.tablet,
+                },
+            });
+        }
+    }
 }
 
+struct RingInfo {
+    axis: AxisInfo,
+    last_interaction: Option<Timestamp>,
+}
+impl RingInfo {
+    /// Returns true if the ring was interacted but the interaction timed out.
+    /// When true, emit an Out event.
+    fn take_timeout(&mut self, now: Timestamp) -> bool {
+        let Some(interaction) = self.last_interaction else {
+            return false;
+        };
+
+        if interaction > now {
+            return false;
+        }
+
+        let diff = now - interaction;
+
+        if diff >= RING_TIMEOUT_MS {
+            self.last_interaction = None;
+            true
+        } else {
+            false
+        }
+    }
+}
 struct PadInfo {
-    ring: Option<AxisInfo>,
+    ring: Option<RingInfo>,
     /// The tablet this tool belongs to, based on heuristics, or Dummy.
     tablet: ID,
 }
@@ -371,7 +471,6 @@ pub struct Manager {
     events: Vec<crate::events::raw::Event<ID>>,
     window: x11rb::protocol::xproto::Window,
     atom_usb_id: Option<std::num::NonZero<x11rb::protocol::xproto::Atom>>,
-    atom_device_node: Option<std::num::NonZero<x11rb::protocol::xproto::Atom>>,
     // What is the most recent event timecode?
     server_time: Timestamp,
     /// Device ID generation. Increment when one or more devices is removed in a frame.
@@ -394,7 +493,7 @@ impl Manager {
         .unwrap()
         .reply()
         .unwrap();*/
-        let version = conn.xinput_xi_query_version(2, 2).unwrap().reply().unwrap();
+        let version = conn.xinput_xi_query_version(2, 4).unwrap().reply().unwrap();
 
         assert!(version.major_version >= 2);
 
@@ -445,11 +544,6 @@ impl Manager {
             .ok()
             .and_then(|resp| resp.reply().ok())
             .and_then(|reply| reply.atom.try_into().ok());
-        let atom_device_node = conn
-            .intern_atom(false, b"Device Node")
-            .ok()
-            .and_then(|resp| resp.reply().ok())
-            .and_then(|reply| reply.atom.try_into().ok());
 
         let mut this = Self {
             conn,
@@ -461,7 +555,6 @@ impl Manager {
             events: vec![],
             tablets: vec![],
             window,
-            atom_device_node,
             atom_usb_id,
             server_time: 0,
             device_generation: 0,
@@ -654,6 +747,7 @@ impl Manager {
                             .unwrap_or_default(),
                         is_grabbed: false,
                         frame_pending: None,
+                        last_interaction: None,
                     };
 
                     // Look for axes!
@@ -777,7 +871,7 @@ impl Manager {
                 }
                 DeviceType::Pad => {
                     let mut buttons = 0;
-                    let mut ring_info = None;
+                    let mut ring_axis = None;
                     for class in &query.classes {
                         match &class.data {
                             xinput::DeviceClassData::Button(b) => {
@@ -807,7 +901,7 @@ impl Manager {
                                     }
                                     let min = fixed32_to_f32(v.min);
                                     let max = fixed32_to_f32(v.max);
-                                    ring_info = Some(AxisInfo {
+                                    ring_axis = Some(AxisInfo {
                                         index: v.number,
                                         transform: Transform::BiasScale {
                                             bias: -min,
@@ -819,13 +913,13 @@ impl Manager {
                             _ => (),
                         }
                     }
-                    if buttons == 0 && ring_info.is_none() {
+                    if buttons == 0 && ring_axis.is_none() {
                         // This pad has no functionality for us.
                         continue;
                     }
 
                     let mut rings = vec![];
-                    if ring_info.is_some() {
+                    if ring_axis.is_some() {
                         rings.push(crate::pad::Ring {
                             granularity: None,
                             internal_id: crate::platform::InternalID::XInput2(octotablet_id),
@@ -868,7 +962,10 @@ impl Manager {
                     self.pad_infos.insert(
                         octotablet_id,
                         PadInfo {
-                            ring: ring_info,
+                            ring: ring_axis.map(|ring_axis| RingInfo {
+                                axis: ring_axis,
+                                last_interaction: None,
+                            }),
                             tablet: tablet.unwrap_or(ID::EmulatedTablet),
                         },
                     );
@@ -1143,15 +1240,14 @@ impl Manager {
                         | xinput::XIEventMask::BARRIER_HIT
                         | xinput::XIEventMask::BARRIER_LEAVE
                         // Axis movement
-                        | xinput::XIEventMask::MOTION,
+                        | xinput::XIEventMask::MOTION
                         // Proximity is implicit, i guess. I'm losing my mind.
 
                         // property change. The only properties we look at are static.
                         // | xinput::XIEventMask::PROPERTY
-                        // Sent when a master device is bound, and the device controlling it
-                        // changes (thus presenting a master with different classes)
-                        // We don't listen for valuators nor buttons on master devices, though!
-                        // | xinput::XIEventMask::DEVICE_CHANGED
+                        // Sent when a different device is controlling a master (dont care)
+                        // or when a physical device changes it's properties (do care)
+                        | xinput::XIEventMask::DEVICE_CHANGED,
                     ]
                     .into(),
                 }
@@ -1229,20 +1325,8 @@ impl Manager {
                 }
             }
 
-            // release and out, if need be.
-            if tool.phase == Phase::Down {
-                self.events.push(raw::Event::Tool {
-                    tool: id,
-                    event: raw::ToolEvent::Up,
-                });
-            };
-            if was_in {
-                self.events.push(raw::Event::Tool {
-                    tool: id,
-                    event: raw::ToolEvent::Out,
-                });
-            };
-            tool.phase = Phase::Out;
+            tool.set_phase(id, Phase::Out, &mut self.events);
+
             // Don't care if it succeeded or failed.
             self.conn
                 .xinput_ungrab_device(time, device.id)
@@ -1252,37 +1336,105 @@ impl Manager {
             tool.is_grabbed = false;
         }
     }
+    fn pre_frame_cleanup(&mut self) {
+        self.events.clear();
+    }
+    fn post_frame_cleanup(&mut self) {
+        // Emit emulated ring outs.
+        for (&id, pad) in &mut self.pad_infos {
+            if let Some(ring) = &mut pad.ring {
+                if ring.take_timeout(self.server_time) {
+                    self.events.push(raw::Event::Pad {
+                        pad: id,
+                        event: raw::PadEvent::Group {
+                            group: id,
+                            event: raw::PadGroupEvent::Ring {
+                                ring: id,
+                                event: crate::events::TouchStripEvent::Up,
+                            },
+                        },
+                    });
+                }
+            }
+        }
+        // Emit pending tool frames and emulate Out from timeout.
+        for (&id, tool) in &mut self.tool_infos {
+            if let Some(time) = tool.frame_pending.take() {
+                self.events.push(raw::Event::Tool {
+                    tool: id,
+                    event: raw::ToolEvent::Frame(Some(crate::events::FrameTimestamp(
+                        std::time::Duration::from_millis(time.into()),
+                    ))),
+                });
+            }
+            if tool.take_timeout(self.server_time) {
+                tool.set_phase(id, Phase::Out, &mut self.events);
+            }
+        }
+    }
 }
 
 impl super::PlatformImpl for Manager {
     #[allow(clippy::too_many_lines)]
     fn pump(&mut self) -> Result<(), crate::PumpError> {
-        self.events.clear();
+        self.pre_frame_cleanup();
         let mut has_repopulated = false;
 
         while let Ok(Some(event)) = self.conn.poll_for_event() {
             use x11rb::protocol::Event;
             match event {
+                // Devices added, removed, reassigned, etc.
+                Event::XinputHierarchy(h) => {
+                    self.server_time = h.time;
+                    // for device in h.infos {
+                    // let Ok(device_id) = u8::try_from(device.deviceid) else {
+                    //    continue;
+                    //};
+                    // if let Some((id, info)) = tool_info_mut_from_device_id(
+                    //     device_id,
+                    //     &mut self.tool_infos,
+                    //     self.device_generation,
+                    // ) {}
+                    // if let Some((id, info)) = pad_info_mut_from_device_id(
+                    //     device_id,
+                    //     &mut self.tool_infos,
+                    //     self.device_generation,
+                    // ) {}
+                    // }
+                    // The event does not necessarily reflect *all* changes, the spec specifically says
+                    // that the client should probably just rescan. lol
+                    if !has_repopulated {
+                        has_repopulated = true;
+                        self.repopulate();
+                    }
+                }
+                Event::XinputDeviceChanged(c) => {
+                    // We only care if a physical device's capabilities changed.
+                    if c.reason != xinput::ChangeReason::DEVICE_CHANGE {
+                        continue;
+                    }
+                }
                 // xwayland fails to emit Leave/Enter when the cursor is warped to/from another window
                 // by a proximity in event. However, it emits a FocusOut/FocusIn for the associated
                 // master keyboard in that case, which we can use to emulate.
                 // On a genuine X11 server this causes the device release logic to happen twice.
                 // Could we just always rely on FocusOut, or would that add more edge cases?
                 Event::XinputLeave(leave) | Event::XinputFocusOut(leave) => {
+                    self.server_time = leave.time;
                     // MASTER POINTER ONLY. Cursor has left the client bounds.
                     self.parent_left(leave.deviceid, leave.time);
-                    self.server_time = leave.time;
                 }
                 Event::XinputEnter(enter) | Event::XinputFocusIn(enter) => {
+                    self.server_time = enter.time;
                     // MASTER POINTER ONLY. Cursor has entered client bounds.
                     self.parent_entered(enter.deviceid, enter.time);
-                    self.server_time = enter.time;
                 }
                 // Proximity (coming in and out of sense range) events.
                 // Not guaranteed to be sent, eg. if the tool comes in proximity while
                 // over a different window. We'll need to emulate the In event in such cases.
                 // Never sent on xwayland.
                 Event::XinputProximityIn(x) => {
+                    self.server_time = x.time;
                     // wh.. why..
                     let device_id = x.device_id & 0x7f;
                     let Some((id, tool)) = tool_info_mut_from_device_id(
@@ -1292,18 +1444,10 @@ impl super::PlatformImpl for Manager {
                     ) else {
                         continue;
                     };
-                    if tool.phase == Phase::Out {
-                        tool.phase = Phase::In;
-                        self.events.push(raw::Event::Tool {
-                            tool: id,
-                            event: raw::ToolEvent::In {
-                                tablet: tool.tablet,
-                            },
-                        });
-                    }
-                    self.server_time = x.time;
+                    tool.ensure_in(id, &mut self.events);
                 }
                 Event::XinputProximityOut(x) => {
+                    self.server_time = x.time;
                     let device_id = x.device_id & 0x7f;
                     let Some((id, tool)) = tool_info_mut_from_device_id(
                         device_id,
@@ -1312,26 +1456,14 @@ impl super::PlatformImpl for Manager {
                     ) else {
                         continue;
                     };
-                    // Emulate Up before out if need be.
-                    if tool.phase == Phase::Down {
-                        self.events.push(raw::Event::Tool {
-                            tool: id,
-                            event: raw::ToolEvent::Up,
-                        });
-                    }
-                    if tool.phase != Phase::Out {
-                        tool.phase = Phase::Out;
-                        self.events.push(raw::Event::Tool {
-                            tool: id,
-                            event: raw::ToolEvent::Out,
-                        });
-                    }
-                    self.server_time = x.time;
+
+                    tool.set_phase(id, Phase::Out, &mut self.events);
                 }
                 // XinputDeviceButtonPress, ButtonPress, XinputRawButtonPress are red herrings.
                 // Dear X consortium... What the fuck?
                 Event::XinputButtonPress(e) | Event::XinputButtonRelease(e) => {
                     // Tool buttons.
+                    self.server_time = e.time;
                     if e.flags
                         .intersects(xinput::PointerEventFlags::POINTER_EMULATED)
                     {
@@ -1350,15 +1482,9 @@ impl super::PlatformImpl for Manager {
                     let button_idx = u16::try_from(e.detail).unwrap();
 
                     // Emulate In event if currently out.
-                    if tool.phase == Phase::Out {
-                        self.events.push(raw::Event::Tool {
-                            tool: id,
-                            event: raw::ToolEvent::In {
-                                tablet: tool.tablet,
-                            },
-                        });
-                        tool.phase = Phase::Up;
-                    }
+                    tool.ensure_in(id, &mut self.events);
+
+                    let pressed = e.event_type == xinput::BUTTON_PRESS_EVENT;
 
                     // Detail gives the "button index".
                     match button_idx {
@@ -1366,25 +1492,11 @@ impl super::PlatformImpl for Manager {
                         0 => (),
                         // Tip button
                         1 => {
-                            if e.event_type == xinput::BUTTON_PRESS_EVENT {
-                                if tool.phase == Phase::Down {
-                                    continue;
-                                }
-                                tool.phase = Phase::Down;
-                                self.events.push(raw::Event::Tool {
-                                    tool: id,
-                                    event: raw::ToolEvent::Down,
-                                });
-                            } else {
-                                if tool.phase == Phase::Up {
-                                    continue;
-                                }
-                                tool.phase = Phase::Up;
-                                self.events.push(raw::Event::Tool {
-                                    tool: id,
-                                    event: raw::ToolEvent::Up,
-                                });
-                            }
+                            tool.set_phase(
+                                id,
+                                if pressed { Phase::Down } else { Phase::In },
+                                &mut self.events,
+                            );
                         }
                         // Other (barrel) button.
                         _ => {
@@ -1395,14 +1507,14 @@ impl super::PlatformImpl for Manager {
                                         // Already checked != 0
                                         button_idx.try_into().unwrap(),
                                     ),
-                                    pressed: e.event_type == xinput::BUTTON_PRESS_EVENT,
+                                    pressed,
                                 },
                             });
                         }
                     }
-                    self.server_time = e.time;
                 }
                 Event::XinputMotion(m) => {
+                    self.server_time = m.time;
                     // Tool valuators.
                     let mut try_uwu = || -> Option<()> {
                         let valuator_fetch = |idx: u16| -> Option<xinput::Fp3232> {
@@ -1441,15 +1553,8 @@ impl super::PlatformImpl for Manager {
                             }
                         }
 
-                        if tool.phase == Phase::Out {
-                            tool.phase = Phase::In;
-                            self.events.push(raw::Event::Tool {
-                                tool: id,
-                                event: raw::ToolEvent::In {
-                                    tablet: tool.tablet,
-                                },
-                            });
-                        }
+                        tool.ensure_in(id, &mut self.events);
+
                         // Access valuators, and map them to our range for the associated axis.
                         let pressure = tool
                             .pressure
@@ -1492,7 +1597,6 @@ impl super::PlatformImpl for Manager {
                     if try_uwu().is_none() {
                         //println!("failed to fetch axes.");
                     }
-                    self.server_time = m.time;
                 }
                 Event::XinputDeviceValuator(m) => {
                     // Pad valuators. Instead of the arbtrary number of valuators that the tools
@@ -1506,10 +1610,10 @@ impl super::PlatformImpl for Manager {
                     ) else {
                         continue;
                     };
-                    let Some(ring_info) = pad_info.ring else {
+                    let Some(ring_info) = &mut pad_info.ring else {
                         continue;
                     };
-                    let absolute_ring_index = ring_info.index;
+                    let absolute_ring_index = ring_info.axis.index;
                     let Some(relative_ring_indox) =
                         absolute_ring_index.checked_sub(u16::from(m.first_valuator))
                     else {
@@ -1524,9 +1628,27 @@ impl super::PlatformImpl for Manager {
                         continue;
                     };
 
+                    // If the last interaction timed out, emit an Up.
+                    // This isn't always handled by the end frame logic, since
+                    // the time doesn't update if no x11 events occur.
+                    // A bit of a hole here. since this event doesn't update server time,
+                    // timeouts don't work if no other event type occured in the meantime :V
+                    // THERE's ONLY SO MUCH I CAN DO lol
+                    if ring_info.take_timeout(self.server_time) {
+                        self.events.push(raw::Event::Pad {
+                            pad: id,
+                            event: raw::PadEvent::Group {
+                                group: id,
+                                event: raw::PadGroupEvent::Ring {
+                                    ring: id,
+                                    event: crate::events::TouchStripEvent::Up,
+                                },
+                            },
+                        });
+                    }
+
                     if valuator_value == 0 {
-                        // On release, this is snapped back to zero, but zero is also a valid value. There does not
-                        // seem to be a method of checking when the interaction ended to avoid this.
+                        // On release, this is snapped back to zero, but zero is also a valid value.
 
                         // Snapping back to zero makes this entirely useless for knob control (which is the primary
                         // purpose of the ring) so we take this little loss.
@@ -1541,7 +1663,7 @@ impl super::PlatformImpl for Manager {
                             event: raw::PadGroupEvent::Ring {
                                 ring: id,
                                 event: crate::events::TouchStripEvent::Pose(
-                                    ring_info.transform.transform(valuator_value as f32),
+                                    ring_info.axis.transform.transform(valuator_value as f32),
                                 ),
                             },
                         },
@@ -1563,8 +1685,11 @@ impl super::PlatformImpl for Manager {
                             },
                         },
                     });
+
+                    ring_info.last_interaction = Some(self.server_time);
                 }
                 Event::XinputDeviceButtonPress(e) | Event::XinputDeviceButtonRelease(e) => {
+                    self.server_time = e.time;
                     // Pad buttons.
                     let Some((id, pad_info)) =
                         pad_mut_from_device_id(e.device_id, &mut self.pads, self.device_generation)
@@ -1586,35 +1711,16 @@ impl super::PlatformImpl for Manager {
                         event: raw::PadEvent::Button {
                             // Shift 1-based to 0-based indexing.
                             button_idx: button_idx - 1,
+                            // "Pressed" event code.
                             pressed: e.response_type == 69,
                         },
                     });
-                    self.server_time = e.time;
-                }
-                Event::XinputHierarchy(h) => {
-                    // The event does not necessarily reflect *all* changes, the spec specifically says
-                    // that the client should probably just rescan. lol
-                    if !has_repopulated {
-                        has_repopulated = true;
-                        self.repopulate();
-                    }
-                    self.server_time = h.time;
                 }
                 _ => (),
             }
         }
 
-        // Emit pending frames.
-        for (id, tool) in &mut self.tool_infos {
-            if let Some(time) = tool.frame_pending.take() {
-                self.events.push(raw::Event::Tool {
-                    tool: *id,
-                    event: raw::ToolEvent::Frame(Some(crate::events::FrameTimestamp(
-                        std::time::Duration::from_millis(time.into()),
-                    ))),
-                });
-            }
-        }
+        self.post_frame_cleanup();
 
         Ok(())
     }
