@@ -302,7 +302,6 @@ struct ToolInfo {
     master_pointer: u16,
     /// The master keyboard associated with the master pointer.
     master_keyboard: u16,
-    grabbed: bool,
     // A change has occured on this pump that requires a frame event at this time.
     // (pose, button, enter, ect)
     frame_pending: Option<Timestamp>,
@@ -409,9 +408,6 @@ struct PadInfo {
     ring: Option<RingInfo>,
     /// The tablet this tool belongs to, based on heuristics, or Dummy.
     tablet: ID,
-    master_pointer: u16,
-    master_keyboard: u16,
-    grabbed: bool,
 }
 
 fn tool_info_mut_from_device_id(
@@ -736,7 +732,6 @@ impl Manager {
                             })
                             // Above search should be infallible but I trust nothing at this point.
                             .unwrap_or_default(),
-                        grabbed: false,
                         frame_pending: None,
                         last_interaction: None,
                     };
@@ -955,32 +950,6 @@ impl Manager {
                                 device_id: tablet_info.deviceid.try_into().unwrap(),
                             })
                         });
-                    let primary_master = query.attachment;
-                    let other_master = device_queries
-                        .infos
-                        .iter()
-                        .find_map(|q| {
-                            // Find the info for the master pointer
-                            if q.deviceid == primary_master {
-                                // Look at the master pointer's attachment,
-                                // which is the associated master keyboard's ID.
-                                Some(q.attachment)
-                            } else {
-                                None
-                            }
-                        })
-                        // Above search should be infallible but I trust nothing at this point.
-                        .unwrap_or_default();
-
-                    // Depending on what flavor of device we are, the master is pointer or keyboard.
-                    let (master_pointer, master_keyboard) = if matches!(
-                        query.type_,
-                        xinput::DeviceType::MASTER_KEYBOARD | xinput::DeviceType::SLAVE_KEYBOARD
-                    ) {
-                        (primary_master, other_master)
-                    } else {
-                        (other_master, primary_master)
-                    };
 
                     self.pad_infos.insert(
                         octotablet_id,
@@ -989,10 +958,7 @@ impl Manager {
                                 axis: ring_axis,
                                 last_interaction: None,
                             }),
-                            master_pointer,
-                            master_keyboard,
                             tablet: tablet.unwrap_or(ID::EmulatedTablet),
-                            grabbed: false,
                         },
                     );
                 }
@@ -1133,12 +1099,10 @@ impl Manager {
                         // Barrel and tip buttons
                         xinput::XIEventMask::BUTTON_PRESS
                         | xinput::XIEventMask::BUTTON_RELEASE
-                        // Cursor entering and leaving client area. Doesn't work.
-                        | xinput::XIEventMask::ENTER
-                        | xinput::XIEventMask::LEAVE
-                        // Also enter and leave? Doesn't work.
-                        | xinput::XIEventMask::FOCUS_IN
-                        | xinput::XIEventMask::FOCUS_OUT
+                        // Cursor entering and leaving client area. Doesn't work,
+                        // perhaps it's for master pointers only.
+                        // | xinput::XIEventMask::ENTER
+                        // | xinput::XIEventMask::LEAVE
                         // Touches user-defined pointer barrier
                         // | xinput::XIEventMask::BARRIER_HIT
                         // | xinput::XIEventMask::BARRIER_LEAVE
@@ -1146,7 +1110,6 @@ impl Manager {
                         // since XI2.4, RAW_MOTION should work here, and give us events regardless
                         // of grab state. it does not work. COol i love this API
                         | xinput::XIEventMask::MOTION
-                        // Proximity is implicit, i guess. I'm losing my mind.
 
                         // property change. The only properties we look at are static.
                         // | xinput::XIEventMask::PROPERTY
@@ -1199,87 +1162,11 @@ impl Manager {
             .check()
             .unwrap();
     }
-    fn parent_entered(&mut self, master: u16, time: Timestamp) {
-        // Grab tools.
-        for (&id, tool) in &mut self.tool_infos {
-            let is_child = tool.master_pointer == master || tool.master_keyboard == master;
-            if tool.grabbed || !is_child {
-                continue;
-            }
-
-            println!("Grabbed Uwu");
-            // Don't care if it succeeded or failed.
-            let status = self
-                .conn
-                .xinput_xi_grab_device(
-                    self.window,
-                    time,
-                    // don't override visual cursor.
-                    0,
-                    match id {
-                        ID::ID { device_id, .. } => device_id.get(),
-                        ID::EmulatedTablet => unreachable!(),
-                    },
-                    // Allow the device to continue sending events
-                    x11rb::protocol::xproto::GrabMode::ASYNC,
-                    // Allow other devices to continue sending events.
-                    // There's some reason to use SYNC here, meaning the master won't update,
-                    // as then Winit won't send pointer events in addition to octotablet's events.
-                    x11rb::protocol::xproto::GrabMode::ASYNC,
-                    // Grab the events we already asked for.
-                    xinput::GrabOwner::OWNER,
-                    &[],
-                )
-                .unwrap()
-                .reply()
-                .unwrap()
-                .status;
-            if status == x11rb::protocol::xproto::GrabStatus::SUCCESS {
-                tool.grabbed = true;
-            }
-        }
-        // Grab pads.
-        for (id, pad) in &mut self.pad_infos {
-            let is_child = pad.master_pointer == master || pad.master_keyboard == master;
-            if pad.grabbed || !is_child {
-                continue;
-            }
-            let status = self
-                .conn
-                .xinput_xi_grab_device(
-                    self.window,
-                    time,
-                    // don't override visual cursor.
-                    0,
-                    match id {
-                        ID::ID { device_id, .. } => device_id.get(),
-                        ID::EmulatedTablet => unreachable!(),
-                    },
-                    // Allow the device to continue sending events
-                    x11rb::protocol::xproto::GrabMode::ASYNC,
-                    // Allow other devices to continue sending events.
-                    // There's some reason to use SYNC here, meaning the master won't update,
-                    // as then Winit won't send pointer events in addition to octotablet's events.
-                    x11rb::protocol::xproto::GrabMode::ASYNC,
-                    // Grab the events we already asked for.
-                    xinput::GrabOwner::OWNER,
-                    &[],
-                )
-                .unwrap()
-                .reply()
-                .unwrap()
-                .status;
-
-            if status == x11rb::protocol::xproto::GrabStatus::SUCCESS {
-                pad.grabbed = true;
-            }
-        }
-    }
     fn parent_left(&mut self, master: u16, time: Timestamp) {
         // Release tools.
         for (&id, tool) in &mut self.tool_infos {
             let is_child = tool.master_pointer == master || tool.master_keyboard == master;
-            if !tool.grabbed || !is_child {
+            if !is_child {
                 continue;
             }
 
@@ -1299,48 +1186,7 @@ impl Manager {
                 }
             }
 
-            println!("Released uwU");
             tool.set_phase(id, Phase::Out, &mut self.events);
-
-            let succeeded = self
-                .conn
-                .xinput_xi_ungrab_device(
-                    time,
-                    match id {
-                        ID::ID { device_id, .. } => device_id.get(),
-                        ID::EmulatedTablet => unreachable!(),
-                    },
-                )
-                .unwrap()
-                .check()
-                .is_ok();
-            if succeeded {
-                tool.grabbed = false;
-            }
-        }
-        // Release pads.
-        for (&id, pad) in &mut self.pad_infos {
-            let is_child = pad.master_pointer == master || pad.master_keyboard == master;
-            if !pad.grabbed || !is_child {
-                continue;
-            }
-
-            // Don't care if it succeeded or failed.
-            let succeeded = self
-                .conn
-                .xinput_xi_ungrab_device(
-                    time,
-                    match id {
-                        ID::ID { device_id, .. } => device_id.get(),
-                        ID::EmulatedTablet => unreachable!(),
-                    },
-                )
-                .unwrap()
-                .check()
-                .is_ok();
-            if succeeded {
-                pad.grabbed = false;
-            }
         }
     }
     fn pre_frame_cleanup(&mut self) {
@@ -1434,7 +1280,6 @@ impl super::PlatformImpl for Manager {
                 Event::XinputEnter(enter) | Event::XinputFocusIn(enter) => {
                     self.server_time = enter.time;
                     // MASTER POINTER ONLY. Cursor has entered client bounds.
-                    self.parent_entered(enter.deviceid, enter.time);
                 }
                 Event::XinputButtonPress(e) | Event::XinputButtonRelease(e) => {
                     // Tool buttons.
@@ -1607,7 +1452,6 @@ impl super::PlatformImpl for Manager {
                             self.device_generation,
                         )?;
                         let ring_info = pad.ring.as_mut()?;
-                        println!("Looking for {}", ring_info.axis.index);
                         let raw_valuator_value = valuator_fetch(ring_info.axis.index)?;
                         let transformed_valuator_value =
                             ring_info.axis.transform.transform_fixed(raw_valuator_value);
