@@ -196,11 +196,12 @@ impl From<ink::ButtonID> for ButtonID {
 pub(crate) enum RawEventsIter<'a> {
     #[cfg(wl_tablet)]
     Wayland(std::slice::Iter<'a, crate::events::raw::Event<wl::ID>>),
-    #[cfg(wl_tablet)]
+    #[cfg(xinput2)]
     XInput2(std::slice::Iter<'a, crate::events::raw::Event<xinput2::ID>>),
     #[cfg(ink_rts)]
     Ink(std::slice::Iter<'a, crate::events::raw::Event<ink::ID>>),
-    // Prevent error when no backends are available.
+    // Prevent unused lifetime error when no backends are available.
+    #[allow(dead_code)]
     Uninhabited(&'a std::convert::Infallible),
 }
 impl Iterator for RawEventsIter<'_> {
