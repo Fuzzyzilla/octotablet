@@ -59,6 +59,7 @@ where
     let prop_pad_button_groups = intern(libinput::PROP_PAD_BUTTON_GROUPS)?;
     let prop_pad_strip_groups = intern(libinput::PROP_PAD_STRIP_GROUPS)?;
     let prop_pad_ring_groups = intern(libinput::PROP_PAD_RING_GROUPS)?;
+    let prop_heartbeat = intern(libinput::PROP_HEARTBEAT)?;
 
     // xi
     let prop_product_id = intern(xi::PROP_PRODUCT_ID)?;
@@ -103,6 +104,8 @@ where
             prop_pad_button_groups: parse_reply(prop_pad_button_groups)?,
             prop_pad_strip_groups: parse_reply(prop_pad_strip_groups)?,
             prop_pad_ring_groups: parse_reply(prop_pad_ring_groups)?,
+
+            prop_heartbeat: parse_reply(prop_heartbeat)?,
         },
         xi: xi::Atoms {
             prop_product_id: parse_reply(prop_product_id)?,
@@ -178,6 +181,10 @@ pub mod libinput {
     /// INT8[num strips], associated group for each ring, or -1 if no association.
     pub const PROP_PAD_RING_GROUPS: &str = "libinput Pad Mode Group Rings";
 
+    /// Something defined for all libinput devices, dont care about the meaning.
+    pub const PROP_HEARTBEAT: &str = "libinput Send Events Mode Enabled Default";
+
+    #[allow(clippy::struct_field_names)]
     pub struct Atoms {
         pub prop_tool_serial: super::Atom,
         pub prop_tool_id: super::Atom,
@@ -186,6 +193,8 @@ pub mod libinput {
         pub prop_pad_button_groups: super::Atom,
         pub prop_pad_strip_groups: super::Atom,
         pub prop_pad_ring_groups: super::Atom,
+
+        pub prop_heartbeat: super::Atom,
     }
 }
 

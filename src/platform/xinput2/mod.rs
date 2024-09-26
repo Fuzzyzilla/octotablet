@@ -15,9 +15,12 @@ mod strings;
 const RING_TIMEOUT_MS: Timestamp = 200;
 const XI_ANY_PROPERTY_TYPE: u32 = 0;
 
-/// Maximum number of groups to try and query from libinput devices.
-/// I'm unaware of devices with >2 but a larger number does not hurt.
-const MAX_GROUPS: u32 = 4;
+/// Maximum number of aspects to try and query from libinput devices.
+/// I don't think there's a downside to making these almost arbitrarily large..?
+const LIBINPUT_MAX_GROUPS: u32 = 4;
+const LIBINPUT_MAX_STRIPS: u32 = 4;
+const LIBINPUT_MAX_RINGS: u32 = 4;
+const LIBINPUT_MAX_BUTTONS: u32 = 32;
 
 /// If this many milliseconds since last tool interaction, emit an Out event.
 const TOOL_TIMEOUT_MS: Timestamp = 500;
@@ -87,14 +90,15 @@ fn match_valuator_label(
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 enum DeviceType {
-    Tool(crate::tool::Type),
+    Tool(Option<crate::tool::Type>),
     Pad,
 }
 
+#[derive(Debug)]
 struct XWaylandDeviceInfo {
-    ty: DeviceType,
+    device_type: DeviceType,
     // opaque seat ident. given that wayland identifies seats by string name, the exact
     // interpretation of an integer id is unknown to me and i gave up reading the xwayland
     // implementation lol.
@@ -117,14 +121,17 @@ fn parse_xwayland_from_name(device_name: &str) -> Option<XWaylandDeviceInfo> {
 
     let class = match class {
         xwayland::NAME_PAD_SUFFIX => DeviceType::Pad,
-        xwayland::NAME_STYLUS_SUFFIX => DeviceType::Tool(Type::Pen),
-        xwayland::NAME_ERASER_SUFFIX => DeviceType::Tool(Type::Eraser),
+        xwayland::NAME_STYLUS_SUFFIX => DeviceType::Tool(Some(Type::Pen)),
+        xwayland::NAME_ERASER_SUFFIX => DeviceType::Tool(Some(Type::Eraser)),
         // Lenses and mice get coerced to this same xwayland ident.. darn.
-        xwayland::NAME_MOUSE_LENS_SUFFIX => DeviceType::Tool(Type::Mouse),
+        xwayland::NAME_MOUSE_LENS_SUFFIX => DeviceType::Tool(Some(Type::Mouse)),
         _ => return None,
     };
 
-    Some(XWaylandDeviceInfo { ty: class, seat })
+    Some(XWaylandDeviceInfo {
+        device_type: class,
+        seat,
+    })
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
@@ -141,31 +148,32 @@ pub enum ID {
     },
 }
 
-#[derive(Clone)]
-struct ToolName<'a> {
-    /// The tablet name we expect to own this tool
-    maybe_associated_tablet: Option<std::borrow::Cow<'a, str>>,
-    /// The hardware serial of the tool.
-    id: Option<crate::tool::HardwareID>,
-    /// The expected type of the device
-    device_type: Option<DeviceType>,
-    /// The xwayland seat associated with the device.
-    xwayland_seat: Option<u32>,
+#[derive(Debug)]
+enum ToolNameFields<'a> {
+    Xwayland(XWaylandDeviceInfo),
+    Generic {
+        /// The tablet name we expect to own this tool or pad
+        maybe_associated_tablet: Option<std::borrow::Cow<'a, str>>,
+        /// The hardware serial of the tool.
+        id: Option<crate::tool::HardwareID>,
+        /// The expected type of the device
+        device_type: Option<DeviceType>,
+    },
 }
-impl<'a> ToolName<'a> {
-    fn id(&self) -> Option<crate::tool::HardwareID> {
-        self.id
-    }
-    fn maybe_associated_tablet(&self) -> Option<&str> {
-        self.maybe_associated_tablet.as_deref()
+impl ToolNameFields<'_> {
+    fn device_type(&self) -> Option<DeviceType> {
+        match self {
+            Self::Xwayland(XWaylandDeviceInfo { device_type, .. }) => Some(*device_type),
+            Self::Generic { device_type, .. } => *device_type,
+        }
     }
 }
-
 /// From the user-facing Device name, try to parse several tool fields.
-fn guess_from_name(name: &str) -> ToolName {
-    // soem drivers place tool hardware IDs within the human-readable Name of the device, and this is
+fn guess_from_name(mut name: &str) -> ToolNameFields {
+    // some drivers place tool hardware IDs within the human-readable Name of the device, and this is
     // the only place it is exposed. Predictably, as with all things X, this is not documented as far
     // as I can tell.
+    // https://gitlab.freedesktop.org/xorg/driver/xf86-input-libinput/-/blob/master/src/xf86libinput.c?ref_type=heads#2429
 
     // Some drivers, input-wacom and input-libinput, also expose this through device properties.
 
@@ -174,68 +182,87 @@ fn guess_from_name(name: &str) -> ToolName {
 
     // xwayland has a fixed format, check for that before we get all hueristic-y.
     if let Some(xwayland) = parse_xwayland_from_name(name) {
-        return ToolName {
-            device_type: Some(xwayland.ty),
-            id: None,
-            maybe_associated_tablet: None,
-            xwayland_seat: Some(xwayland.seat),
-        };
+        return ToolNameFields::Xwayland(xwayland);
     }
 
-    // Get the numeric ID, plus the string minus that id.
-    let try_parse_id = || -> Option<(&str, crate::tool::HardwareID)> {
+    // Get the numeric ID, along with the string minus that id.
+    // This seems to go back to prehistoric versions of xf86-input-libinput.
+    let mut try_take_id = || -> Option<crate::tool::HardwareID> {
         // Detect the range of characters within the last set of parens.
         let open_paren = name.rfind('(')?;
         let after_open_paren = open_paren + 1;
         // Find the close paren after the last open paren (weird change-of-base-address thing)
         let close_paren = after_open_paren + name.get(after_open_paren..)?.find(')')?;
 
-        // Find the human-readable name content, minus the id field.
-        let name_text = name[..open_paren].trim_ascii_end();
+        // Update the name to this if we determine that it had an ID field.
+        let name_minus_id = name[..open_paren].trim_ascii_end();
 
         // Find the id field.
         // id_text is literal '0', or a hexadecimal number prefixed by literal '0x'
         let id_text = &name[after_open_paren..close_paren];
 
-        let id_num = if id_text == "0" {
+        if id_text == "0" {
             // Should this be considered "None"? The XP-PEN DECO-01 reports this value, despite (afaik)
             // lacking a genuine hardware ID capability.
-            0
+            // Answer: Yes! https://gitlab.freedesktop.org/xorg/driver/xf86-input-libinput/-/blob/master/include/libinput-properties.h?ref_type=heads#L251
+            // This is only for libinput-backed devices, though, hmst.
+            // The fact that this is "0" and not "0x0" comes from POSIX [sn]printf.
+            name = name_minus_id;
+            None
         } else if let Some(id_text) = id_text.strip_prefix("0x") {
-            u64::from_str_radix(id_text, 16).ok()?
+            u64::from_str_radix(id_text, 16).ok().map(|id| {
+                // map with side effects? i will be ostrisized for my actions.
+                name = name_minus_id;
+                crate::tool::HardwareID(id)
+            })
         } else {
-            return None;
-        };
-
-        Some((name_text, crate::tool::HardwareID(id_num)))
+            // Nothing found, don't trim.
+            None
+        }
     };
 
     // May be none. this is not a failure.
-    let id_parse_result = try_parse_id();
-
-    // Take the string part minus id, if any.
-    let (text_part, id) = match id_parse_result {
-        Some((name, id)) => (name, Some(id)),
-        None => (name, None),
-    };
+    let id = try_take_id();
 
     // .. and try to parse remaining two properties.
+    // Two forms we need to worry about, visible on input-wacom and input-libinput
+    // [tablet name] + [tool string]
+    // [tablet name] - " Pen" + " Pad [Pp]ad"
+    // :V oof
     let try_parse_tablet_name_and_ty = || -> Option<(std::borrow::Cow<'_, str>, DeviceType)> {
+        use crate::tool::Type;
+        // Funny special case, from libinput
+        if let Some(tablet) = name.strip_suffix(" unknown tool") {
+            return Some((tablet.into(), DeviceType::Tool(None)));
+        }
         // Tend to be named "tablet name" + "tool type"
-        let last_space = text_part.rfind(' ')?;
-        let last_word = text_part.get(last_space.checked_add(1)?..)?;
-        let mut tablet_name = std::borrow::Cow::Borrowed(&text_part[..last_space]);
+        let last_space = name.rfind(' ')?;
+        let last_word = name.get(last_space.checked_add(1)?..)?;
+        let mut tablet_name = std::borrow::Cow::Borrowed(&name[..last_space]);
 
         let ty = match last_word {
             // this can totally be a false positive! Eg, my intuos is called
             // "Intuos S Pen" and the stylus is called "Intuos S Pen Pen (0xblahblah)".
-            "pen" | "Pen" | "stylus" | "Stylus" => DeviceType::Tool(crate::tool::Type::Pen),
-            "eraser" | "Eraser" => DeviceType::Tool(crate::tool::Type::Eraser),
-            // Mouse or Lens device get coerced to this same label.
-            "cursor" | "Cursor" => DeviceType::Tool(crate::tool::Type::Mouse),
+            "pen" | "Pen" | "stylus" | "Stylus" => DeviceType::Tool(Some(Type::Pen)),
+            "brush" | "Brush" => DeviceType::Tool(Some(Type::Brush)),
+            "pencil" | "Pencil" => DeviceType::Tool(Some(Type::Pencil)),
+            "airbrush" | "Airbrush" => DeviceType::Tool(Some(Type::Airbrush)),
+            "eraser" | "Eraser" => DeviceType::Tool(Some(Type::Eraser)),
+            // Sometimes Mouse amd Lens devices get coerced to the "Cursor" label.
+            // "Mouse" obviously falsly identifies random mice as tools, so we filter for
+            // Mouse devices with RZ axis (libinput source code says all tablet pointers have it!)
+            "cursor" | "Cursor" | "mouse" | "Mouse" => DeviceType::Tool(Some(Type::Mouse)),
+            "lens" | "Lens" => DeviceType::Tool(Some(Type::Lens)),
             "pad" | "Pad" => {
                 // Pads break the pattern of suffix removal, weirdly.
-                tablet_name = std::borrow::Cow::Owned(tablet_name.into_owned() + " Pen");
+                // Try to convert it to "<Model Name> Pen" which is used everywhere else.
+                // There's no real fallback here, it's hueristic anywayyy
+                if let Some(name_minus_pad) = tablet_name
+                    .strip_suffix("Pad")
+                    .or_else(|| tablet_name.strip_suffix("pad"))
+                {
+                    tablet_name = std::borrow::Cow::Owned(name_minus_pad.to_owned() + "Pen");
+                }
                 DeviceType::Pad
             }
             // "Finger" | "finger" => todo!(),
@@ -248,10 +275,9 @@ fn guess_from_name(name: &str) -> ToolName {
 
     let (tablet_name, ty) = try_parse_tablet_name_and_ty().unzip();
 
-    ToolName {
+    ToolNameFields::Generic {
         maybe_associated_tablet: tablet_name,
         device_type: ty,
-        xwayland_seat: None,
         id,
     }
 }
@@ -277,11 +303,86 @@ fn fixed16_to_f32(fixed: xinput::Fp1616) -> f32 {
     (fixed as f32) / 65536.0
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 struct WacomIDs {
     hardware_serial: u32,
     hardware_id: u32,
     tablet_id: u32,
+    // This info is fetched, but unfortunately it's subject to TOCTOU bugs.
+    // is_in: bool,
+}
+#[derive(Copy, Clone, Debug)]
+enum WacomInfo {
+    Tool {
+        ty: crate::tool::Type,
+        ids: Option<WacomIDs>,
+    },
+    Pad {
+        ids: Option<WacomIDs>,
+    },
+    // Does not report tablets. Does report opaque tablet IDs for the other two hw types,
+    // which can kinda be used to hallucinate what the tablet might've been lol.
+}
+impl WacomInfo {
+    /// Get the corresponding device type.
+    fn device_type(self) -> DeviceType {
+        match self {
+            Self::Tool { ty, .. } => DeviceType::Tool(Some(ty)),
+            Self::Pad { .. } => DeviceType::Pad,
+        }
+    }
+    fn ids(self) -> Option<WacomIDs> {
+        match self {
+            Self::Pad { ids } | Self::Tool { ids, .. } => ids,
+        }
+    }
+    fn hardware_serial(self) -> Option<u32> {
+        self.ids().map(|ids| ids.hardware_serial)
+    }
+    fn hardware_id(self) -> Option<u32> {
+        self.ids().map(|ids| ids.hardware_id)
+    }
+}
+#[derive(Copy, Clone, Debug)]
+struct LibinputToolInfo {
+    hardware_serial: Option<std::num::NonZero<u32>>,
+    hardware_id: Option<u32>,
+}
+#[derive(Clone, Debug)]
+struct LibinputGroupfulPadInfo {
+    /// Len < 128. As if, lol.
+    groups: Vec<LibinputGroupInfo>,
+    strip_associations: Vec<Option<u8>>,
+    ring_associations: Vec<Option<u8>>,
+    /// Okay sooooo...  we have no mapping from xinput button idx to
+    /// hardware idx, so these cannot be used. Unfortunate.
+    /// They do not line up. xinput lists 11 buttons with all seven spanning
+    /// the range seemingly randomly, whereas this lists seven.
+    button_associations: Vec<Option<u8>>,
+}
+#[derive(Copy, Clone, Debug)]
+struct LibinputGroupInfo {
+    num_modes: u8,
+    /// Beware, subject to TOCTOU bugs.
+    current_mode: u8,
+}
+#[derive(Clone, Debug)]
+enum LibinputInfo {
+    Tool(LibinputToolInfo),
+    GroupfulPad(LibinputGroupfulPadInfo),
+    /// *Something* libinput, Mouse or keyboard or groupless pad or tablet or...
+    /// Libinput provides no concrete way to distinguish :<
+    SomethingElse,
+}
+impl LibinputInfo {
+    /// Get the corresponding device type, or None if not known.
+    fn device_type(&self) -> Option<DeviceType> {
+        match self {
+            Self::Tool(_) => Some(DeviceType::Tool(None)),
+            Self::GroupfulPad(_) => Some(DeviceType::Pad),
+            Self::SomethingElse => None,
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -296,6 +397,13 @@ impl Transform {
     }
     fn transform_fixed(self, value: xinput::Fp3232) -> f32 {
         self.transform(fixed32_to_f32(value))
+    }
+    /// Create a transform that projects `[min, max]` onto `[0.0, new_max]`
+    fn normalized(min: f32, max: f32, new_max: f32) -> Self {
+        Self::BiasScale {
+            bias: -min,
+            scale: new_max / (max - min),
+        }
     }
 }
 
@@ -607,112 +715,58 @@ impl Manager {
             .infos;
 
         for device in &device_infos {
+            // Only look at enabled, non-master devices.
+            if !device.enabled
+                || matches!(
+                    device.type_,
+                    xinput::DeviceType::MASTER_KEYBOARD | xinput::DeviceType::MASTER_POINTER
+                )
+            {
+                continue;
+            }
+
             // Zero is a special value (ALL_DEVICES), and can't be used by a device.
-            let nonzero_id = std::num::NonZero::new(device.deviceid).unwrap();
+            let Some(nonzero_id) = std::num::NonZero::new(device.deviceid) else {
+                continue;
+            };
             let octotablet_id = ID::ID {
                 generation: self.device_generation,
                 device_id: nonzero_id,
             };
-            // Only look at enabled pointer devices.
-            // Pads tend to list as pointers under several drivers, hmm.
-            // Tablets are keyboards
-            if !device.enabled || !matches!(device.type_, xinput::DeviceType::SLAVE_POINTER) {
-                continue;
-            }
 
-            // Try to pase xf86-input-wacom driver-specific fields.
-            // First is device type (used to be standard in XI 1 but
-            // 2 removed it without a replacement?!?)
-            let wacom_type = self
-                .conn
-                .xinput_xi_get_property(
-                    device.deviceid,
-                    false,
-                    self.atoms.wacom.prop_tool_type.get(),
-                    XI_ANY_PROPERTY_TYPE,
-                    0,
-                    1,
-                )
-                .unwrap()
-                .reply()
-                .ok()
-                .and_then(|repl| {
-                    let card32 = *repl.items.as_data32()?.first()?;
-                    let ty = std::num::NonZero::new(card32)?;
-                    let wacom = &self.atoms.wacom;
-
-                    if ty == wacom.type_stylus {
-                        Some(DeviceType::Tool(crate::tool::Type::Pen))
-                    } else if ty == wacom.type_eraser {
-                        Some(DeviceType::Tool(crate::tool::Type::Eraser))
-                    } else if ty == wacom.type_pad {
-                        Some(DeviceType::Pad)
-                    } else if ty == wacom.type_cursor {
-                        Some(DeviceType::Tool(crate::tool::Type::Mouse))
-                    } else {
-                        None
-                    }
-                });
-            // Then hardware id and tablet association. For other drivers we will parse this
-            // from name, but wacom driver gives an actual solution lol.
-            let wacom_ids = if let Some(
-                &[tablet_id, old_serial, old_hardware_id, _new_serial, _new_hardware_id],
-            ) = self
-                .conn
-                .xinput_xi_get_property(
-                    device.deviceid,
-                    false,
-                    self.atoms.wacom.prop_serial_ids.get(),
-                    XI_ANY_PROPERTY_TYPE,
-                    0,
-                    5,
-                )
-                .unwrap()
-                .reply()
-                .ok()
-                .as_ref()
-                .and_then(|repl| repl.items.as_data32())
-                // as_deref doesn't work here?? lol
-                .map(Vec::as_slice)
-            {
-                // Tablet_id is an opaque identifier, not comparable with xinput's deviceid.
-                // However, since xf86-input-wacom removes tablet devices from the listing, it
-                // still may be valuable to divide into several emulated tablet devices.
-
-                // old_serial is the tool's serial identifier, if applicable. matches with
-                // wayland tablet_v2 serial~! I am unsure the difference between old and new serial,
-                // other than that the new_* values are zeroed when the tool is out of proximity.
-
-                Some(WacomIDs {
-                    tablet_id,
-                    hardware_serial: old_serial,
-                    hardware_id: old_hardware_id,
-                })
+            // Wacom driver provides a very definitive yes or no to whether that driver is in use.
+            let wacom = self.try_query_wacom(device.deviceid);
+            // Libinput is much more fuzzy. Don't bother if wacom was found.
+            // Technically this is better expressed through Option<Either<wacom, libinput>> but ehhhh
+            let libinput = if wacom.is_none() {
+                self.try_query_libinput(device.deviceid)
             } else {
                 None
             };
 
+            // Otherwise, we don't immediately fail. other versions of the drivers or other drivers
+            // entirely (digimend, udev, old libinput) might still be available.
+            // Fields from above are authoritative, but the information may be gathered by less clean
+            // means uwu
+
             // UTF8 human-readable device name, which encodes some additional info sometimes.
             let raw_name = String::from_utf8_lossy(&device.name);
-            // Apply heaps of heuristics to figure out what the heck this device is all about
+            // Apply heaps of heuristics to figure out what the heck this device is all about.
             let name_fields = guess_from_name(&raw_name);
 
-            // Combine our knowledge. Trust the wacom driver type over guessed type.
+            println!("===={raw_name}====\n Wacom - {wacom:#?}\n Libinput - {libinput:#?}\n Heuristic - {name_fields:#?}");
+
+            // Combine our knowledge. Trusting drivers over guessed.
             // If we couldn't determine, then we can't use the device.
-            // todo: determine from Classes.
-            let Some(device_type) = wacom_type.or(name_fields.device_type) else {
+            // todo: determine from Classes, which is 10x more unreliable....
+            let Some(device_type) = wacom
+                .map(WacomInfo::device_type)
+                // None from libinput could still be a groupless pad, fixme.
+                .or(libinput.as_ref().and_then(LibinputInfo::device_type))
+                .or(name_fields.device_type())
+            else {
                 continue;
             };
-
-            let hardware_id = wacom_ids
-                .map(|ids| crate::tool::HardwareID(ids.hardware_serial.into()))
-                .or(name_fields.id);
-
-            // If we cant find an xi device for the tablet, this is useful to differentiate
-            // the tablets.
-            let opaque_tablet_id = wacom_ids
-                .map(|ids| ids.tablet_id)
-                .or(name_fields.xwayland_seat);
 
             // At this point, we're pretty sure this is a tool, pad, or tablet!
 
@@ -720,17 +774,34 @@ impl Manager {
                 DeviceType::Tool(ty) => {
                     // It's a tool! Parse all relevant infos.
 
+                    // There are many false posiives, namely mice being detected as tablet pointers and
+                    // tablets being detected as pens. These are filtered based on valuator hueristics.
+
                     // We can only handle tools which have a parent.
                     // (and obviously they shouldn't be a keyboard.)
                     // Technically, a floating pointer can work for our needs,
-                    // but it behaves weird when not grabbed and it's not easy to know
-                    // when to grab/release a floating device.
-                    // (We could manually implement a hit test? yikes)
+                    // but we aren't provided with enough info to project Abs X/Abs Y to client logical pixels,
+                    // so rely on the Master's x/y.
                     if device.type_ != xinput::DeviceType::SLAVE_POINTER {
                         continue;
                     }
 
-                    let tablet_id = name_fields.maybe_associated_tablet().and_then(|expected| {
+                    // These both need a rename at the crate level.
+                    let hardware_id = wacom
+                        .and_then(WacomInfo::hardware_serial)
+                        .or(libinput.as_ref().and_then(|libinput| match libinput {
+                            LibinputInfo::Tool(t) => Some(t.hardware_serial?.get()),
+                            _ => None,
+                        }))
+                        .map(|val| crate::tool::HardwareID(val.into()));
+                    let wacom_id = wacom.and_then(WacomInfo::hardware_id).or(libinput
+                        .as_ref()
+                        .and_then(|libinput| match libinput {
+                            LibinputInfo::Tool(t) => t.hardware_id,
+                            _ => None,
+                        }));
+
+                    /*let tablet_id = name_fields.maybe_associated_tablet().and_then(|expected| {
                         // Find the device with the expected name, and return it's ID if found.
                         let tablet_info = device_infos
                             .iter()
@@ -741,14 +812,14 @@ impl Manager {
                             // 0 is a special value, this is infallible.
                             device_id: tablet_info.deviceid.try_into().unwrap(),
                         })
-                    });
+                    });*/
 
                     let mut octotablet_info = crate::tool::Tool {
                         internal_id: super::InternalID::XInput2(octotablet_id),
                         name: Some(raw_name.clone().into_owned()),
                         hardware_id,
-                        wacom_id: wacom_ids.map(|ids| ids.hardware_id.into()),
-                        tool_type: Some(ty),
+                        wacom_id: wacom_id.map(Into::into),
+                        tool_type: ty,
                         axes: crate::axis::FullInfo::default(),
                     };
 
@@ -758,7 +829,7 @@ impl Manager {
                         roll: None,
                         tilt: [None, None],
                         wheel: None,
-                        tablet: tablet_id.unwrap_or(ID::EmulatedTablet),
+                        tablet: ID::EmulatedTablet, //tablet_id.unwrap_or(ID::EmulatedTablet),
                         phase: Phase::Out,
                         master_pointer: device.attachment,
                         master_keyboard: device_infos
@@ -779,6 +850,13 @@ impl Manager {
                         last_interaction: None,
                     };
 
+                    // If it is definitively a tool, start as true.
+                    // Otherwise, look for tool-ish aspects. If false at the end, reject.
+                    let mut looks_toolish = wacom
+                        .is_some_and(|wacom| matches!(wacom, WacomInfo::Tool { .. }))
+                        || libinput
+                            .is_some_and(|libinput| matches!(libinput, LibinputInfo::Tool(_)));
+
                     // Look for axes!
                     for class in &device.classes {
                         if let Some(v) = class.data.as_valuator() {
@@ -798,16 +876,18 @@ impl Manager {
                             let min = fixed32_to_f32(v.min);
                             let max = fixed32_to_f32(v.max);
 
+                            // Any absolute valuators.
+                            // This excludes relative styluses with no additional features...
+                            // ..pen-shaped-mice? are those a thing? hm.
+                            looks_toolish = true;
+
                             match label {
                                 ValuatorAxis::AbsX | ValuatorAxis::AbsY => (),
                                 ValuatorAxis::AbsPressure => {
                                     // Scale and bias to [0,1].
                                     x11_info.pressure = Some(AxisInfo {
                                         index: v.number,
-                                        transform: Transform::BiasScale {
-                                            bias: -min,
-                                            scale: 1.0 / (max - min),
-                                        },
+                                        transform: Transform::normalized(min, max, 1.0),
                                     });
                                     octotablet_info.axes.pressure =
                                         Some(crate::axis::NormalizedInfo { granularity: None });
@@ -816,10 +896,7 @@ impl Manager {
                                     // Scale and bias to [0,1].
                                     x11_info.distance = Some(AxisInfo {
                                         index: v.number,
-                                        transform: Transform::BiasScale {
-                                            bias: -min,
-                                            scale: 1.0 / (max - min),
-                                        },
+                                        transform: Transform::normalized(min, max, 1.0),
                                     });
                                     octotablet_info.axes.distance =
                                         Some(crate::axis::LengthInfo::Normalized(
@@ -832,10 +909,11 @@ impl Manager {
                                     // doesn't make hard guarantees about it anyway.
                                     x11_info.roll = Some(AxisInfo {
                                         index: v.number,
-                                        transform: Transform::BiasScale {
-                                            bias: -min,
-                                            scale: std::f32::consts::TAU / (max - min),
-                                        },
+                                        transform: Transform::normalized(
+                                            min,
+                                            max,
+                                            std::f32::consts::TAU,
+                                        ),
                                     });
                                     octotablet_info.axes.roll =
                                         Some(crate::axis::CircularInfo { granularity: None });
@@ -913,9 +991,21 @@ impl Manager {
                                 }
                             }
 
-                            // Resolution is.. meaningless, I think. xwayland is the only server I have
+                            // Resolution field is.. meaningless, I think. xwayland is the only server I have
                             // seen that even bothers to fill it out, and even there it's weird.
                         }
+                    }
+                    // Picked up on name heuristics, but doesn't have anything that looks like a tool.
+                    if !looks_toolish {
+                        continue;
+                    }
+
+                    // Tablet mice always have rotation axis. This filters out standard mice which
+                    // got wrongly picked up by our name hueristics.
+                    if matches!(octotablet_info.tool_type, Some(crate::tool::Type::Mouse))
+                        && x11_info.roll.is_none()
+                    {
+                        continue;
                     }
 
                     tool_listen_events.push(device.deviceid);
@@ -923,10 +1013,16 @@ impl Manager {
                     self.tool_infos.insert(octotablet_id, x11_info);
                 }
                 DeviceType::Pad => {
-                    if device.type_ == xinput::DeviceType::FLOATING_SLAVE {
-                        // We need master attachments in order to grab.
-                        continue;
-                    }
+                    let libinput = libinput.as_ref().and_then(|libinput| match libinput {
+                        LibinputInfo::GroupfulPad(groupful) => Some(groupful),
+                        _ => None,
+                    });
+
+                    // Second ring has no label. really stupid. So, the only way to know if there is two is
+                    // if libinput says there is through nonstandard means. :V
+                    let is_dual_ring =
+                        libinput.is_some_and(|info| info.ring_associations.len() >= 2);
+
                     let mut buttons = 0;
                     let mut ring_axis = None;
                     for class in &device.classes {
@@ -955,10 +1051,11 @@ impl Manager {
                                     let max = fixed32_to_f32(v.max);
                                     ring_axis = Some(AxisInfo {
                                         index: v.number,
-                                        transform: Transform::BiasScale {
-                                            bias: -min,
-                                            scale: std::f32::consts::TAU / (max - min),
-                                        },
+                                        transform: Transform::normalized(
+                                            min,
+                                            max,
+                                            std::f32::consts::TAU,
+                                        ),
                                     });
                                 }
                             }
@@ -983,7 +1080,10 @@ impl Manager {
                         buttons: (0..buttons).map(Into::into).collect::<Vec<_>>(),
                         feedback: None,
                         internal_id: crate::platform::InternalID::XInput2(octotablet_id),
-                        mode_count: None,
+                        mode_count: libinput
+                            .and_then(|info| Some(info.groups.first()?.num_modes))
+                            .map(u32::from)
+                            .and_then(std::num::NonZero::new),
                         rings,
                         strips: vec![],
                     };
@@ -996,7 +1096,7 @@ impl Manager {
                     pad_listen_events.push(device.deviceid);
 
                     // Find the tablet this belongs to.
-                    let tablet = name_fields.maybe_associated_tablet().and_then(|expected| {
+                    /*let tablet = name_fields.maybe_associated_tablet().and_then(|expected| {
                         // Find the device with the expected name, and return it's ID if found.
                         let tablet_info = device_infos
                             .iter()
@@ -1007,7 +1107,7 @@ impl Manager {
                             // 0 is ALL_DEVICES, this is infallible.
                             device_id: tablet_info.deviceid.try_into().unwrap(),
                         })
-                    });
+                    });*/
 
                     self.pad_infos.insert(
                         octotablet_id,
@@ -1016,48 +1116,10 @@ impl Manager {
                                 axis: ring_axis,
                                 last_interaction: None,
                             }),
-                            tablet: tablet.unwrap_or(ID::EmulatedTablet),
+                            tablet: ID::EmulatedTablet, //tablet.unwrap_or(ID::EmulatedTablet),
                         },
                     );
-                } /*
-                  DeviceType::Tablet => {
-                      // Tablets are of... dubious usefulness in xinput?
-                      // They do not follow the paradigms needed by octotablet.
-                      // Alas, we can still fetch some useful information!
-                      let usb_id = self
-                          .conn
-                          // USBID consists of two 32 bit integers, [vid, pid].
-                          .xinput_xi_get_property(
-                              device.deviceid,
-                              false,
-                              self.atoms.xi.prop_product_id.get(),
-                              XI_ANY_PROPERTY_TYPE,
-                              0,
-                              2,
-                          )
-                          .ok()
-                          .and_then(|resp| resp.reply().ok())
-                          .and_then(|property| {
-                              let Some(&[vid, pid]) = property.items.as_data32().map(Vec::as_slice)
-                              else {
-                                  return None;
-                              };
-                              Some(crate::tablet::UsbId {
-                                  vid: (vid).try_into().ok()?,
-                                  pid: (pid).try_into().ok()?,
-                              })
-                          });
-
-                      // We can also fetch device path here.
-
-                      let tablet = crate::tablet::Tablet {
-                          internal_id: super::InternalID::XInput2(octotablet_id),
-                          name: Some(raw_name.into_owned()),
-                          usb_id,
-                      };
-
-                      self.tablets.push(tablet);
-                  }*/
+                }
             }
         }
 
@@ -1211,6 +1273,257 @@ impl Manager {
             .check()
             .unwrap();
     }
+    fn try_query_wacom(&self, deviceid: u16) -> Option<WacomInfo> {
+        use crate::tool::Type;
+        let atoms = &self.atoms.wacom;
+        // We assume that if this property is missing or malformed then it's not wacom.
+        let ty = {
+            let type_atom = self
+                .conn
+                .xinput_xi_get_property(
+                    deviceid,
+                    false,
+                    atoms.prop_tool_type.get(),
+                    XI_ANY_PROPERTY_TYPE,
+                    0,
+                    1,
+                )
+                .unwrap()
+                .reply()
+                .ok()?;
+            let type_atom = *type_atom.items.as_data32()?.first()?;
+            let ty = std::num::NonZero::new(type_atom)?;
+
+            if ty == atoms.type_stylus {
+                DeviceType::Tool(Some(Type::Pen))
+            } else if ty == atoms.type_eraser {
+                DeviceType::Tool(Some(Type::Eraser))
+            } else if ty == atoms.type_pad {
+                DeviceType::Pad
+            } else if ty == atoms.type_cursor {
+                DeviceType::Tool(Some(Type::Mouse))
+            } else {
+                return None;
+            }
+        };
+
+        // This one however, we leave optional.
+        let try_fetch_ids = || -> Option<WacomIDs> {
+            let &[
+                tablet_id,
+                old_serial,
+                old_hardware_id,
+                /*_new_serial, _new_hardware_id*/
+                ..
+            ] = self
+                .conn
+                .xinput_xi_get_property(
+                    deviceid,
+                    false,
+                    atoms.prop_serial_ids.get(),
+                    XI_ANY_PROPERTY_TYPE,
+                    0,
+                    3,
+                )
+                .unwrap()
+                .reply()
+                .ok()?
+                .items
+                .as_data32()?
+                .as_slice()
+            else {
+                return None;
+            };
+
+            Some(WacomIDs {
+                tablet_id,
+                hardware_id: old_hardware_id,
+                hardware_serial: old_serial,
+            })
+        };
+
+        let ids = try_fetch_ids();
+
+        Some(match ty {
+            DeviceType::Pad => WacomInfo::Pad { ids },
+            DeviceType::Tool(Some(ty)) => WacomInfo::Tool { ty, ids },
+            // None tool type is never generated.
+            _ => unreachable!(),
+        })
+    }
+    fn try_query_libinput(&self, deviceid: u16) -> Option<LibinputInfo> {
+        let atoms = &self.atoms.libinput;
+
+        Some(if let Some(tool) = self.try_query_libinput_tool(deviceid) {
+            LibinputInfo::Tool(tool)
+        } else if let Some(groupful_pad) = self.try_query_libinput_groupful_pad(deviceid) {
+            LibinputInfo::GroupfulPad(groupful_pad)
+        } else {
+            // Check an always-present property to see if this is even a libinput device.
+            let is_libinput = self
+                .conn
+                .xinput_xi_get_property(
+                    deviceid,
+                    false,
+                    atoms.prop_heartbeat.get(),
+                    XI_ANY_PROPERTY_TYPE,
+                    0,
+                    0,
+                )
+                .unwrap()
+                .reply()
+                .ok()?
+                .type_
+                // if Type == None atom, property doesn't exist.
+                != 0;
+
+            if is_libinput {
+                LibinputInfo::SomethingElse
+            } else {
+                return None;
+            }
+        })
+    }
+    fn try_query_libinput_tool(&self, deviceid: u16) -> Option<LibinputToolInfo> {
+        let atoms = &self.atoms.libinput;
+
+        // ALWAYS present when a libinput tablet tool, thank goodness! Peter Hutterer you have saved me.
+        // This requires a fairly recent version of the driver, but hopefully fallback device detection will
+        // make it work still. (namely, the stringified field as part of the name is much much older)
+        // https://gitlab.freedesktop.org/xorg/driver/xf86-input-libinput/-/blob/master/src/xf86libinput.c?ref_type=heads#L6640
+        let hardware_serial = *self
+            .conn
+            .xinput_xi_get_property(
+                deviceid,
+                false,
+                atoms.prop_tool_serial.get(),
+                XI_ANY_PROPERTY_TYPE,
+                0,
+                1,
+            )
+            .unwrap()
+            .reply()
+            .ok()?
+            .items
+            .as_data32()?
+            .first()?;
+
+        // This one is optional, however.
+        let hardware_id = self
+            .conn
+            .xinput_xi_get_property(
+                deviceid,
+                false,
+                atoms.prop_tool_id.get(),
+                XI_ANY_PROPERTY_TYPE,
+                0,
+                1,
+            )
+            .unwrap()
+            .reply()
+            .ok()
+            .and_then(|repl| repl.items.as_data32()?.first().copied());
+
+        Some(LibinputToolInfo {
+            // Zero is special None value.
+            hardware_serial: hardware_serial.try_into().ok(),
+            hardware_id,
+        })
+    }
+    fn try_query_libinput_groupful_pad(&self, deviceid: u16) -> Option<LibinputGroupfulPadInfo> {
+        let atoms = &self.atoms.libinput;
+
+        let groups = {
+            let group_modes_available_reply = self
+                .conn
+                .xinput_xi_get_property(
+                    deviceid,
+                    false,
+                    atoms.prop_pad_group_modes_available.get(),
+                    XI_ANY_PROPERTY_TYPE,
+                    0,
+                    // Len, in 4-byte units.
+                    LIBINPUT_MAX_GROUPS.div_ceil(4),
+                )
+                .unwrap()
+                .reply()
+                .ok()?;
+            let num_groups = group_modes_available_reply.num_items;
+            let group_modes_available = group_modes_available_reply.items.as_data8()?;
+            let group_current_mode_reply = self
+                .conn
+                .xinput_xi_get_property(
+                    deviceid,
+                    false,
+                    atoms.prop_pad_group_current_modes.get(),
+                    XI_ANY_PROPERTY_TYPE,
+                    0,
+                    // Len, in 4-byte units.
+                    num_groups.div_ceil(4),
+                )
+                .unwrap()
+                .reply()
+                .ok()?;
+            let group_current_mode = group_current_mode_reply.items.as_data8()?;
+
+            group_modes_available
+                .iter()
+                // poor behavior if lengths mismatched. That's invalid anyway.
+                .zip(group_current_mode)
+                .map(|(&avail, &cur)| LibinputGroupInfo {
+                    current_mode: cur,
+                    num_modes: avail,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Fetch associations from the given property name and max item count.
+        let fetch_associations = |prop: strings::Atom, max: u32| -> Vec<Option<u8>> {
+            self.conn
+                .xinput_xi_get_property(
+                    deviceid,
+                    false,
+                    prop.get(),
+                    XI_ANY_PROPERTY_TYPE,
+                    0,
+                    // Len, in 4-byte units.
+                    max.div_ceil(4),
+                )
+                .unwrap()
+                .reply()
+                .ok()
+                .as_ref()
+                .and_then(|repl| repl.items.as_data8().map(Vec::as_slice))
+                // If not found, empty slice.
+                .unwrap_or_default()
+                .iter()
+                .map(|&association| {
+                    // Signedness is not reported by the reply type system.
+                    // note that association is actually i8, but negatives are None.
+                    #[allow(clippy::cast_possible_wrap)]
+                    if (association as i8).is_negative() || usize::from(association) > groups.len()
+                    {
+                        None
+                    } else {
+                        Some(association)
+                    }
+                })
+                .collect()
+        };
+
+        let ring_associations = fetch_associations(atoms.prop_pad_ring_groups, LIBINPUT_MAX_RINGS);
+        let strip_associations =
+            fetch_associations(atoms.prop_pad_strip_groups, LIBINPUT_MAX_STRIPS);
+        let button_associations =
+            fetch_associations(atoms.prop_pad_button_groups, LIBINPUT_MAX_BUTTONS);
+
+        Some(LibinputGroupfulPadInfo {
+            groups,
+            strip_associations,
+            ring_associations,
+            button_associations,
+        })
+    }
     fn parent_left(&mut self, master: u16, time: Timestamp) {
         // Release tools.
         for (&id, tool) in &mut self.tool_infos {
@@ -1315,6 +1628,11 @@ impl super::PlatformImpl for Manager {
                     if c.reason != xinput::ChangeReason::DEVICE_CHANGE {
                         continue;
                     }
+                }
+                Event::XinputProperty(wawa) => {
+                    // Listen to this to determine when an input-wacom tool goes in and out of prox
+                    // (through "new serial/hw id" becoming zeroed)
+                    // and for input-libinput pad mode switch.
                 }
                 // xwayland fails to emit Leave/Enter when the cursor is warped to/from another window
                 // by a proximity in event. However, it emits a FocusOut/FocusIn for the associated
