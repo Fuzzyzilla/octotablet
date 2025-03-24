@@ -659,23 +659,26 @@ impl Manager {
             // statically disbatch to it.
             // The marshal impl and this bit of code adapted from here:
             // https://github.com/microsoft/windows-rs/issues/753
-            // This was a whole thing to get working. I think i'm doing it right, but its all so
-            // undocumented how can I ever be sure D:
+            // Thank you tana-gh for the help!
             let marshaler: com::Marshal::IMarshal = {
                 use core::Interface;
 
-                let marshaler = com::CoCreateFreeThreadedMarshaler(&plugin)?;
-                let unknown: core::IUnknown = std::mem::transmute_copy(&marshaler);
+                // Create a marshaler, returns abstract IUnknown.
+                let unknown = com::CoCreateFreeThreadedMarshaler(&plugin)?;
 
+                // Get a pointer to it's marshaler implementation, and adds one to it's refcount.
                 let mut marshaler = std::ptr::null_mut();
                 (unknown.vtable().QueryInterface)(
+                    // `this` pointer.
                     std::mem::transmute_copy(&unknown),
                     &com::Marshal::IMarshal::IID,
                     &mut marshaler,
                 )
                 // *Should* be infallible, but this is a safety condition so just make really extra sure.
                 .unwrap();
-                std::mem::transmute_copy(&marshaler)
+                // QueryInterface succeeded, tells us this is an IMarshaler.
+                std::mem::transmute(marshaler)
+                // `unknown` drops and decreases refcount, but that's fine since `marshaler` keeps it alive at refcount 1.
             };
 
             // Infallible, this is the only instance of set being called.
