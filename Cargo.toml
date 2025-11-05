@@ -47,7 +47,7 @@ smallvec = "1.13.1"
 [target.'cfg(any(docsrs, all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_os = "ios", target_os = "macos")))))'.dependencies]
 wayland-backend = { version = "0.3.3", features = ["client_system"], optional = true }
 wayland-client = { version = "0.31.2", optional = true }
-wayland-protocols = { version = "0.31.2", features = ["client", "unstable"], optional = true }
+wayland-protocols = { version = "0.32.9", features = ["client", "unstable"], optional = true }
 
 # Windows Ink `RealTimeStylus`
 [target.'cfg(any(docsrs, target_os = "windows"))'.dependencies.windows]
